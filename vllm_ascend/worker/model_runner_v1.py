@@ -111,7 +111,7 @@ from vllm_ascend.ops.weight_prefetch import WeightPrefetchMethod
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.sample.logits_processor import build_logitsprocs
-from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
+# from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
@@ -214,19 +214,6 @@ class NPUModelRunner(GPUModelRunner):
             self.pcp_size = 1
             self.pcp_rank = 0
         max_buffer_num_tokens = self.max_num_tokens
-        if self.pcp_size > 1:
-            max_buffer_num_tokens = (self.max_num_tokens +
-                                     self.max_num_reqs * 2 * self.pcp_size)
-            self.pcp_manager = PCPManager(
-                self.pcp_size,
-                self.pcp_rank,
-                self.dcp_size,
-                self.dcp_rank,
-                max_buffer_num_tokens,
-                self.max_num_reqs,
-                self.device,
-                self.pin_memory,
-            )
         # TODO(zhenwenqi) after https://github.com/vllm-project/vllm/pull/28988 is merged, we can delete thie
         self.input_ids = self._make_buffer(max_buffer_num_tokens,
                                            dtype=torch.int32)
@@ -295,9 +282,25 @@ class NPUModelRunner(GPUModelRunner):
                                 self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
 
+        ## TODO: Check whether we can move decode_threshold to PCP_Manager
         self.decode_threshold = 1 + (
             self.speculative_config.num_speculative_tokens
             if self.speculative_config else 0)
+
+        max_buffer_num_tokens = (self.max_num_tokens +
+                                    self.max_num_reqs * 2 * self.pcp_size)
+        self.pcp_manager = PCPManager(
+            self.pcp_size,
+            self.pcp_rank,
+            self.dcp_size,
+            self.dcp_rank,
+            max_buffer_num_tokens,
+            self.max_num_reqs,
+            self.speculative_config,
+            self.device,
+            vllm_config,
+            self.pin_memory,
+        )
 
         self.use_aclgraph = self._use_aclgraph()
 
@@ -549,6 +552,10 @@ class NPUModelRunner(GPUModelRunner):
             req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(
             total_num_scheduled_tokens)
+
+        cu_num_tokens, _ = self._get_cumsum_and_arange(
+            num_scheduled_tokens)
+            
         if self.pcp_size > 1:
             if not self.vllm_config.model_config.use_mla:
                 self.pcp_manager.generate_kv_idx(scheduler_output)
@@ -564,8 +571,8 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens = total_num_scheduled_tokens
             req_indices = np.repeat(self.arange_np[:num_reqs],
                                     num_scheduled_tokens)
-            cu_num_tokens, _ = self._get_cumsum_and_arange(
-                num_scheduled_tokens)
+            # cu_num_tokens, _ = self._get_cumsum_and_arange(
+            #     num_scheduled_tokens)
             positions_np = self.positions.np[:total_num_scheduled_tokens]
             np.add(
                 self.input_batch.num_computed_tokens_cpu[req_indices],
@@ -744,7 +751,7 @@ class NPUModelRunner(GPUModelRunner):
             discard_requests_mask = self.seq_lens.np[:num_reqs] < num_tokens_np
 
         discard_request_indices = np.nonzero(
-            discard_requests_mask.np[:num_reqs])[0]
+            discard_requests_mask[:num_reqs])[0]
         self.num_discarded_requests = len(discard_request_indices)
         self.discard_request_indices.np[:self.num_discarded_requests] = (
             discard_request_indices)
@@ -900,7 +907,9 @@ class NPUModelRunner(GPUModelRunner):
                 self.arange_np)
 
         long_seq_metadata = self.pcp_manager.generate_pcp_metadata(
-            total_num_scheduled_tokens, self.input_batch, num_reqs)
+            total_num_scheduled_tokens, self.query_lens, 
+            self.attn_mask, self.input_batch)
+
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
@@ -928,6 +937,7 @@ class NPUModelRunner(GPUModelRunner):
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
                 blk_table_tensor = blk_table.get_device_tensor()
                 slot_mapping = blk_table.slot_mapping.gpu
+                print(f"blk_table.slot_mapping.gpu type: {blk_table.slot_mapping.gpu.dtype}")
                 if self.pcp_size > 1:
                     slot_mapping = self.pcp_manager.get_padded_slot_mapping(
                         num_tokens,
@@ -1146,7 +1156,7 @@ class NPUModelRunner(GPUModelRunner):
                               self.pcp_size], 0)
             hidden_states = torch.index_select(
                 hidden_states, 0,
-                self.pcp_allgather_restore_idx[:hidden_states.shape[0]])
+                self.pcp_manager.pcp_allgather_restore_idx.gpu[:hidden_states.shape[0]])
         return hidden_states
 
     def _build_attn_state(self, num_reqs, num_scheduled_tokens,
@@ -1879,6 +1889,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.cp_kv_recover_idx = torch.zeros(self.max_num_tokens,
                                                      dtype=torch.int32,
                                                      device=self.device)
+                #TODO: Fix this
                 long_seq_metadata = self.pcp_manager.generate_pcp_metadata(
                     num_tokens, num_reqs)
                 if long_seq_metadata is not None:

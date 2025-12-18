@@ -31,16 +31,15 @@ import numpy as np
 import torch_npu  # noqa: F401
 from packaging.version import InvalidVersion, Version
 from torch_npu.npu.streams import Event
-from vllm.distributed.parallel_state import get_pcp_group
+# from vllm.distributed.parallel_state import get_pcp_group
 from vllm.utils.math_utils import cdiv
-from vllm.config import VllmConfig
+# from vllm.config import VllmConfig
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.logger import logger
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.worker.npu_input_batch import InputBatch
-from vllm_ascend.attention.utils import AscendPrefillContextParallelMetadata
+# from vllm_ascend.worker.npu_input_batch import InputBatch
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -1087,7 +1086,7 @@ class PCPManager:
         dcp_rank: int,
         max_buffer_num_tokens: int,
         max_num_reqs: int,
-        decode_threshold: int,
+        speculative_config,
         device: torch.device,
         vllm_config: VllmConfig,
         pin_memory: bool = False,
@@ -1097,7 +1096,10 @@ class PCPManager:
         self.pcp_world_rank = pcp_rank
         self.dcp_world_size = dcp_world_size
         self.dcp_world_rank = dcp_rank
-        self.decode_threshold = decode_threshold
+        self.speculative_config = speculative_config
+        self.decode_threshold = 1 + (
+            self.speculative_config.num_speculative_tokens
+            if self.speculative_config else 0)
         self.vllm_config = vllm_config
         self.max_num_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
@@ -1110,7 +1112,7 @@ class PCPManager:
         )
         self.pcp_padded_slot_mapping = torch.empty(
             (max_buffer_num_tokens,),
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=device,
         )
         self.num_pcp_pads_cpu_tensor = torch.zeros(
@@ -1349,17 +1351,18 @@ class PCPManager:
             - self.num_pcp_pads_cpu[:num_reqs]
         ) < num_tokens_np
 
-    def get_padded_slot_mapping(self, num_tokens: int, slot_mapping: torch.Tensor):
+    def get_padded_slot_mapping(self, num_tokens: list, slot_mapping: torch.Tensor):
         # After pcp allgather and restore, there are padded tokens in kv,
         # so we need pad slotmapping for alignment.
+        print(f"num_actual_tokens_pcp_padded: {self.num_actual_tokens_pcp_padded}")
         pcp_padded_slot_mapping = self.pcp_padded_slot_mapping[
-            : num_tokens * self.pcp_world_size
+            : self.num_actual_tokens_pcp_padded
         ]
-        cp_unpad_mask = self.pcp_unpad_mask_cpu_tensor[
-            : num_tokens * self.pcp_world_size
+        pcp_unpad_mask = self.pcp_unpad_mask_cpu_tensor[
+            : self.num_actual_tokens_pcp_padded
         ]
         pcp_padded_slot_mapping.fill_(-1)
-        pcp_padded_slot_mapping[cp_unpad_mask] = slot_mapping
+        pcp_padded_slot_mapping[pcp_unpad_mask] = slot_mapping
         return pcp_padded_slot_mapping
 
     def get_restore_hidden_states(
@@ -1367,6 +1370,7 @@ class PCPManager:
     ):
         # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
         # ignores the padding from CUDA Graph.
+        from vllm.distributed.parallel_state import get_pcp_group
         hidden_states = get_pcp_group().all_gather(
             hidden_states[:num_tokens_unpadded],
             0,
@@ -1383,7 +1387,7 @@ class PCPManager:
         num_reqs: int,
         total_num_scheduled_tokens: int,
         num_scheduled_tokens: dict[str, int],
-        input_batch: InputBatch,
+        input_batch,
         arange_np: np.ndarray,
     ):
         """
@@ -1496,7 +1500,9 @@ class PCPManager:
         self.cp_kv_recover_idx_for_chunk = cp_kv_recover_idx_for_chunk.to(
             torch.float32).argsort().to(torch.int32)
 
-    def generate_pcp_metadata(self, total_num_scheduled_tokens, input_batch, num_reqs):
+    def generate_pcp_metadata(self, total_num_scheduled_tokens, query_lens, attn_mask, input_batch):
+        from vllm_ascend.attention.utils import AscendPrefillContextParallelMetadata
+        num_reqs = input_batch.num_reqs or self.query_lens.size(0)
         num_decodes = sum(input_batch.num_computed_tokens_cpu[:num_reqs]
                             >= input_batch.num_prompt_tokens[:num_reqs])
         num_actual_tokens_pcp_padded = total_num_scheduled_tokens * self.pcp_world_size
@@ -1540,7 +1546,7 @@ class PCPManager:
                 kv_req_offset = 0
                 q_head_chunk_id = self.pcp_world_rank
                 q_tail_chunk_id = self.pcp_world_size * 2 - 1 - self.pcp_world_rank
-                for i, seq_len in enumerate(self.query_lens):
+                for i, seq_len in enumerate(query_lens):
                     if i < num_decodes:
                         continue
                     chunk_len = seq_len // 2
@@ -1619,7 +1625,7 @@ class PCPManager:
                 tail_attn_nomask_seqlens = torch.tensor(
                     [chunk_seqlens, kv_with_q_tail_nomask_seqlens],
                     dtype=torch.int32)
-                pcp_prefill_mask = self.attn_mask
+                pcp_prefill_mask = attn_mask
 
                 self.extra_long_seq_kwargs = {
                     'attn_mask_seqlens': attn_mask_seqlens,
@@ -1627,7 +1633,7 @@ class PCPManager:
                     'tail_attn_nomask_seqlens': tail_attn_nomask_seqlens,
                     'pcp_prefill_mask': pcp_prefill_mask
                 }
-                long_seq_metadata.pcp_allgather_restore_idx = self.pcp_allgather_restore_idx[:
+                long_seq_metadata.pcp_allgather_restore_idx = self.pcp_allgather_restore_idx.gpu[:
                                                                                                 num_actual_tokens_pcp_padded]
                 long_seq_metadata.cp_kv_recover_idx_for_chunk = self.cp_kv_recover_idx_for_chunk
                 long_seq_metadata.q_head_idx_tensor = self.q_head_idx_tensor
