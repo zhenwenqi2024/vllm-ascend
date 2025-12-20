@@ -919,6 +919,12 @@ class NPUModelRunner(GPUModelRunner):
                 total_num_scheduled_tokens if self.pcp_size == 1 else
                 total_num_scheduled_tokens * self.pcp_size -
                 sum(self.pcp_manager.num_pcp_pads_cpu[:num_reqs]))
+
+            slot_mapping_size = (total_num_scheduled_tokens
+                        if self.pcp_size == 1 else
+                        total_num_scheduled_tokens * self.pcp_size -
+                        sum(self.pcp_manager.num_pcp_pads_cpu))
+
             if isinstance(kv_cache_group_spec.kv_cache_spec,
                           EncoderOnlyAttentionSpec):
                 # Encoder-only layers do not have KV cache, so we need to
@@ -936,12 +942,11 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
                 blk_table_tensor = blk_table.get_device_tensor()
-                slot_mapping = blk_table.slot_mapping.gpu
-                print(f"blk_table.slot_mapping.gpu type: {blk_table.slot_mapping.gpu.dtype}")
+                blk_table.slot_mapping.gpu[slot_mapping_size:].fill_(0)
                 if self.pcp_size > 1:
                     slot_mapping = self.pcp_manager.get_padded_slot_mapping(
-                        num_tokens,
-                        slot_mapping,
+                        slot_mapping_size,
+                        blk_table,
                     )
 
             # NOTE: This is a temporary hack, now in GPUModelRunner, this prepare_inputs
@@ -1889,7 +1894,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.cp_kv_recover_idx = torch.zeros(self.max_num_tokens,
                                                      dtype=torch.int32,
                                                      device=self.device)
-                #TODO: Fix this
                 long_seq_metadata = self.pcp_manager.generate_pcp_metadata(
                     num_tokens, num_reqs)
                 if long_seq_metadata is not None:

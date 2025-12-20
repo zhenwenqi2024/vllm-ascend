@@ -1351,19 +1351,25 @@ class PCPManager:
             - self.num_pcp_pads_cpu[:num_reqs]
         ) < num_tokens_np
 
-    def get_padded_slot_mapping(self, num_tokens: list, slot_mapping: torch.Tensor):
+    def get_padded_slot_mapping(self, slot_mapping_size: int, blk_table):
         # After pcp allgather and restore, there are padded tokens in kv,
         # so we need pad slotmapping for alignment.
-        print(f"num_actual_tokens_pcp_padded: {self.num_actual_tokens_pcp_padded}")
-        pcp_padded_slot_mapping = self.pcp_padded_slot_mapping[
-            : self.num_actual_tokens_pcp_padded
-        ]
+
+        slot_mapping_for_pcp = blk_table.slot_mapping.gpu[:self.long_seq_metadata.num_actual_tokens_pcp_padded]
+        slot_mapping_for_pcp[slot_mapping_size:].fill_(-1)
+        
         pcp_unpad_mask = self.pcp_unpad_mask_cpu_tensor[
             : self.num_actual_tokens_pcp_padded
         ]
+
+        pcp_padded_slot_mapping = self.pcp_padded_slot_mapping[:pcp_unpad_mask.shape[0]]
         pcp_padded_slot_mapping.fill_(-1)
-        pcp_padded_slot_mapping[pcp_unpad_mask] = slot_mapping
-        return pcp_padded_slot_mapping
+        pcp_padded_slot_mapping[pcp_unpad_mask] = slot_mapping_for_pcp[:slot_mapping_size]
+        slot_mapping_for_pcp[:self.long_seq_metadata.num_actual_tokens_pcp_padded] = pcp_padded_slot_mapping
+        blk_table.slot_mapping.gpu[:self.long_seq_metadata.num_actual_tokens_pcp_padded] = slot_mapping_for_pcp
+        slot_mapping = blk_table.slot_mapping.gpu
+        
+        return slot_mapping
 
     def get_restore_hidden_states(
         self, hidden_states: torch.Tensor, num_tokens_unpadded: int
