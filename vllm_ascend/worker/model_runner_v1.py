@@ -287,8 +287,10 @@ class NPUModelRunner(GPUModelRunner):
             self.speculative_config.num_speculative_tokens
             if self.speculative_config else 0)
 
-        max_buffer_num_tokens = (self.max_num_tokens +
-                                    self.max_num_reqs * 2 * self.pcp_size)
+        if self.pcp_size > 1:
+            max_buffer_num_tokens = (self.max_num_tokens +
+                                        self.max_num_reqs * 2 * self.pcp_size)
+            
         self.pcp_manager = PCPManager(
             self.pcp_size,
             self.pcp_rank,
@@ -631,6 +633,22 @@ class NPUModelRunner(GPUModelRunner):
         if self.lora_config:
             self.set_active_loras(self.input_batch, num_scheduled_tokens)
 
+        req_indices = np.repeat(self.arange_np[:num_reqs],
+                                num_scheduled_tokens)
+
+        # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
+        # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        cu_num_tokens, arange = self._get_cumsum_and_arange(
+            num_scheduled_tokens)
+
+        if self.pcp_size > 1:
+            positions_np = self.positions.np[:total_num_scheduled_tokens]
+            np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
+                   position_pcp[:total_num_scheduled_tokens],
+                   out=positions_np)
+        else:
+            self.positions.np[:total_num_scheduled_tokens] = positions_np
+
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -948,7 +966,7 @@ class NPUModelRunner(GPUModelRunner):
                         slot_mapping_size,
                         blk_table,
                     )
-
+                slot_mapping = blk_table.slot_mapping.gpu
             # NOTE: This is a temporary hack, now in GPUModelRunner, this prepare_inputs
             # has been split to multiple parts, and there are 3 parts that is related to this
             # `num_reqs`, we'll take `query_start_loc` as an example:
