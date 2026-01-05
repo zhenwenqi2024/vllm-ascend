@@ -24,9 +24,9 @@ if __name__ == "__main__":
 
     prompts = [
         "The capital of France is",
-        "Hello, my name is Tom, I am",
-        "The president of United States is",
-        "AI future is"
+        # "Hello, my name is Tom, I am",
+        # "The president of United States is",
+        # "AI future is"
     ]
 
     sampling_params = SamplingParams(temperature = 0.8, top_p = 0.95, max_tokens=args.output_len)
