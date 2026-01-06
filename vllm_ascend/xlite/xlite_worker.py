@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from vllm.v1.worker.workspace import init_workspace_manager
+
 from vllm_ascend.worker.worker import NPUWorker
 from vllm_ascend.xlite.xlite_model_runner import XliteModelRunner
 
