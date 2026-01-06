@@ -200,6 +200,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         metadata_cls: type[AscendMLAMetadata] | None = None,
         supports_dcp_with_varlen: bool = False,
     ):
+        self.pcp_size = 1
         self.metadata_cls = (metadata_cls if metadata_cls is not None else
                              AscendMLAMetadata)
         self.vllm_config = vllm_config
@@ -437,7 +438,16 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         if self.num_decodes > 0:
             decode_metadata = self.build_decode_metadata(
                 common_prefix_len, common_attn_metadata)
-
+        if self.num_prefills == 0:
+            self.slot_mapping[:self.
+                              num_decode_tokens] = self.slot_mapping[:self.
+                                                                     num_decode_tokens
+                                                                     * self.
+                                                                     pcp_size:
+                                                                     self.
+                                                                     pcp_size]
+            self.slot_mapping[self.num_decode_tokens:self.num_decode_tokens *
+                              self.pcp_size].fill_(-1)
         return self.metadata_cls(  # type: ignore
             num_actual_tokens_pcp_padded=self.num_actual_tokens,
             num_input_tokens=common_attn_metadata.num_input_tokens,
@@ -1330,7 +1340,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             self.W_UK_T,
             decode_k_nope,
             decode_k_pe,
-            attn_metadata.slot_mapping[:bsz].flatten(),
+            attn_metadata.slot_mapping[:bsz],
             quant_scale0=self.quant_scale0,
             quant_offset0=self.quant_offset0,
             bias0=self.quant_bias_qkv,
