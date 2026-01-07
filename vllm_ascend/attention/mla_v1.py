@@ -438,7 +438,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         if self.num_decodes > 0:
             decode_metadata = self.build_decode_metadata(
                 common_prefix_len, common_attn_metadata)
-        if self.num_prefills == 0:
+        if self.num_prefills == 0 and self.pcp_size > 1:
             self.slot_mapping[:self.
                               num_decode_tokens] = self.slot_mapping[:self.
                                                                      num_decode_tokens
