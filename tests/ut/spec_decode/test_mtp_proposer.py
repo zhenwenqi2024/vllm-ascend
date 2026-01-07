@@ -278,7 +278,7 @@ class TestMtpProposer:
             [0, 8, 16, 24], dtype=torch.int32)
         mock_common_attn_metadata.seq_lens = torch.tensor([8, 8, 8],
                                                           dtype=torch.int32)
-        mock_common_attn_metadata.num_actual_tokens =24
+        mock_common_attn_metadata.num_actual_tokens = 24
         mock_common_attn_metadata.num_reqs = 3
         mock_common_attn_metadata.num_computed_tokens_cpu = torch.tensor(
             [5, 6, 7], dtype=torch.int32)
