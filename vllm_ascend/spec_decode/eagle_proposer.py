@@ -662,7 +662,7 @@ class EagleProposer(VllmEagleProposer):
             num_computed_tokens_cpu=common_attn_metadata.
             num_computed_tokens_cpu,
             num_reqs=common_attn_metadata.num_reqs,
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            num_actual_tokens=total_num_tokens,
             num_input_tokens=common_attn_metadata.num_input_tokens,
             max_query_len=new_query_len_per_req.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
