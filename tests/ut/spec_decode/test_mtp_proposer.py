@@ -294,10 +294,12 @@ class TestMtpProposer:
         mock_runner.actual_seq_lengths_q = MagicMock()
         mock_runner.attn_state = MagicMock()
         mock_runner.graph_pad_size = 0
+        mock_runner.pcp_size = 1
         mock_runner.decode_token_per_req = MagicMock()
 
         proposer = MagicMock(spec=MtpProposer)
         proposer.runner = mock_runner
+        proposer.pcp_size = 1
         proposer.arange = torch.arange(100, dtype=torch.int32)
         proposer.prepare_inputs_padded = MtpProposer.prepare_inputs_padded.__get__(
             proposer)
