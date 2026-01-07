@@ -653,7 +653,7 @@ class EagleProposer(VllmEagleProposer):
         # NOTE: Currently positions and seq_lens are not used in attn forward
         # so we do not need to fixed them. But if they are used in the future,
         # we should fixed them.
-        spec_common_attn_metadata = AscendCommonAttentionMetadata(
+        spec_common_attn_metadata = AscendCommonAttentionMetadata( 
             query_start_loc=new_query_start_loc_cpu.to(device,
                                                        non_blocking=True),
             query_start_loc_cpu=new_query_start_loc_cpu,
