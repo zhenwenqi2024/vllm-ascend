@@ -240,7 +240,7 @@ class NPUModelRunner(GPUModelRunner):
             self.positions = self._make_buffer(max_buffer_num_tokens,
                                                dtype=torch.int64)
         self.sampler = AscendSampler()
-        self.attn_state = None
+        self.attn_state = AscendAttentionState | None
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -1904,11 +1904,11 @@ class NPUModelRunner(GPUModelRunner):
     def _model_forward(
         self,
         maybe_padded_num_tokens: int,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        **model_kwargs: dict[str, Any],
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors,
+        inputs_embeds,
+        **model_kwargs,
     ):
         assert self.model is not None
         if vllm_version_is('0.13.0'):
@@ -2057,7 +2057,7 @@ class NPUModelRunner(GPUModelRunner):
         force_has_lora: bool | None = None,
         num_encoder_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, UBatchSlices | None,
-               torch.Tensor | None]:
+               torch.Tensor | None, CUDAGraphStat | None,]:
 
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         uniform_decode = (
