@@ -2056,8 +2056,13 @@ class NPUModelRunner(GPUModelRunner):
         force_uniform_decode: bool | None = None,
         force_has_lora: bool | None = None,
         num_encoder_reqs: int = 0,
-    ) -> tuple[CUDAGraphMode, BatchDescriptor, UBatchSlices | None,
-               torch.Tensor | None, CUDAGraphStat | None,]:
+    ) -> tuple[
+            CUDAGraphMode,
+            BatchDescriptor,
+            UBatchSlices | None,
+            torch.Tensor | None,
+            CUDAGraphStat | None,
+    ]:
 
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         uniform_decode = (
