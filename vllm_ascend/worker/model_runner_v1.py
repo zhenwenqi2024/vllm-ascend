@@ -240,7 +240,7 @@ class NPUModelRunner(GPUModelRunner):
             self.positions = self._make_buffer(max_buffer_num_tokens,
                                                dtype=torch.int64)
         self.sampler = AscendSampler()
-        self.attn_state = AscendAttentionState | None
+        self.attn_state = None
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -2230,14 +2230,14 @@ class NPUModelRunner(GPUModelRunner):
             0)
 
         if for_cudagraph_capture:
-            self.attn_state = AscendAttentionState.DecodeOnly
+            attn_state = AscendAttentionState.DecodeOnly
             if self.speculative_config and \
                     self.speculative_config.method == "mtp":
                 # `AscendAttentionState.SpecDecoding` is only designed for mla
                 if self.vllm_config.model_config.use_mla:
-                    self.attn_state = AscendAttentionState.SpecDecoding
+                    attn_state = AscendAttentionState.SpecDecoding
                 else:
-                    self.attn_state = AscendAttentionState.ChunkedPrefill
+                    attn_state = AscendAttentionState.ChunkedPrefill
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[:num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[:num_reqs_padded + 1],
@@ -2257,7 +2257,7 @@ class NPUModelRunner(GPUModelRunner):
             num_input_tokens=num_tokens_padded,
             actual_seq_lengths_q=self.actual_seq_lengths_q,
             positions=self.positions.gpu,
-            attn_state=self.attn_state,
+            attn_state=attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=_get_pcp_metadata(num_tokens),
         )
