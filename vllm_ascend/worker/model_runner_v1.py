@@ -2029,7 +2029,7 @@ class NPUModelRunner(GPUModelRunner):
         # use cpu_group to avoid cpu synchronization issue.
         # it can be overlapped with main moell execution on npu.
         dist.all_reduce(tensor, group=get_dp_group().cpu_group)
-        should_dp_pad = bool(torch.all(tensor[2] == 1).item())
+        should_dp_pad = bool(torch.all(tensor[1] == 1).item())
         # DP ranks should all have the same value for should_attempt_dp_padding.
         assert allow_dp_padding == should_dp_pad
         # Pad all DP ranks up to the maximum token count across ranks if
