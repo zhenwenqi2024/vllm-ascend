@@ -1967,6 +1967,14 @@ class NPUModelRunner(GPUModelRunner):
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
 
+    def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
+        """
+        Synchronize cudagraph_mode across DP ranks by taking the minimum.
+        If any rank has NONE (0), all ranks use NONE.
+        This ensures all ranks send consistent values (all padded or all unpadded).
+        """
+        return int(tensor[2, :].min().item())
+
     def _sync_metadata_across_dp1(
         self,
         num_tokens_unpadded: int,
@@ -2039,7 +2047,7 @@ class NPUModelRunner(GPUModelRunner):
             should_dp_pad,
         )
         # Synchronize cudagraph_mode across ranks (take min)
-        synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
+        synced_cudagraph_mode = self._post_process_cudagraph_mode(tensor)
         return False, num_tokens_after_padding, synced_cudagraph_mode
 
     def _determine_batch_execution_and_padding(
