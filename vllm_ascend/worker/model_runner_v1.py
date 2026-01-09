@@ -1967,7 +1967,7 @@ class NPUModelRunner(GPUModelRunner):
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
 
-    def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
+    def _post_process_cudagraph_mode(self, tensor: torch.Tensor) -> int:
         """
         Synchronize cudagraph_mode across DP ranks by taking the minimum.
         If any rank has NONE (0), all ranks use NONE.
