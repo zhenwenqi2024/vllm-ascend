@@ -76,8 +76,6 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.worker.dp_utils import (_post_process_cudagraph_mode,
-                                     _post_process_dp_padding)
 from vllm.v1.worker.gpu_model_runner import (AsyncGPUModelRunnerOutput,
                                              GPUModelRunner)
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
@@ -1975,6 +1973,21 @@ class NPUModelRunner(GPUModelRunner):
         """
         return int(tensor[2, :].min().item())
 
+    def _post_process_dp_padding(self, tensor: torch.Tensor,
+                                 should_dp_pad: bool) -> int:
+        num_tokens_across_dp = tensor[0, :]
+        if should_dp_pad:
+            # If DP padding is enabled, ensure that each rank is processing the same number
+            # of tokens
+            max_num_tokens = int(num_tokens_across_dp.max().item())
+            return torch.tensor(
+                [max_num_tokens] * len(num_tokens_across_dp),
+                device="cpu",
+                dtype=torch.int32,
+            )
+        else:
+            return num_tokens_across_dp.cpu()
+
     def _sync_metadata_across_dp1(
         self,
         num_tokens_unpadded: int,
@@ -2042,7 +2055,7 @@ class NPUModelRunner(GPUModelRunner):
         assert allow_dp_padding == should_dp_pad
         # Pad all DP ranks up to the maximum token count across ranks if
         # should_dp_pad is True
-        num_tokens_after_padding = _post_process_dp_padding(
+        num_tokens_after_padding = self._post_process_dp_padding(
             tensor,
             should_dp_pad,
         )
