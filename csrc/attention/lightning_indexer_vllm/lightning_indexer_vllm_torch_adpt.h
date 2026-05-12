@@ -22,7 +22,8 @@ at::Tensor npu_lightning_indexer(
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
     const c10::optional<at::Tensor> &actual_seq_lengths_key,
     const c10::optional<at::Tensor> &block_table, c10::string_view layout_query,
-    c10::string_view layout_key, int64_t sparse_count, int64_t sparse_mode)
+    c10::string_view layout_key, int64_t sparse_count, int64_t sparse_mode, int64_t pre_tokens,
+    int64_t next_tokens, bool return_value)
 {
     // npu tensor max size
     constexpr int32_t SIZE = 8;
@@ -51,9 +52,13 @@ at::Tensor npu_lightning_indexer(
         output_size = {query.size(DIM_0), key.size(n_dim_index), sparse_count};
     }
     at::Tensor lightning_indexer_output = at::empty(output_size, query.options().dtype(at::kInt));
+    at::Tensor sparse_values_out = at::empty(output_size, query.options().dtype());
     // convert str
     char *query_layout_ptr = const_cast<char *>(query_layout_str.c_str());
     char *key_layout_ptr = const_cast<char *>(key_layout_str.c_str());
+    int64_t pre_tokens = 9223372036854775807;
+    int64_t next_tokens = 9223372036854775807;
+    bool return_value = true;
     EXEC_NPU_CMD(
         aclnnLightningIndexerVllm,
         query,
@@ -66,7 +71,11 @@ at::Tensor npu_lightning_indexer(
         key_layout_ptr,
         sparse_count,
         sparse_mode,
-        lightning_indexer_output);
+        pre_tokens,
+        next_tokens,
+        return_value,
+        lightning_indexer_output,
+        sparse_values_out);
     return lightning_indexer_output;
 }
 }

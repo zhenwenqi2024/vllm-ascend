@@ -1222,7 +1222,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_lightning_indexer(Tensor query, Tensor key, Tensor weights, *,"
         "                      Tensor? actual_seq_lengths_query=None, Tensor? actual_seq_lengths_key=None,"
         "                      Tensor? block_table=None, str layout_query='BSND', str layout_key='BSND',"
-        "                      int sparse_count=2048, int sparse_mode=3) -> Tensor"
+        "                      int sparse_count=2048, int sparse_mode=3, int pre_tokens=9223372036854775807, int next_tokens=9223372036854775807, bool return_value=true) -> Tensor"
     );
     ops.impl("npu_lightning_indexer", torch::kPrivateUse1, &vllm_ascend::npu_lightning_indexer);
 

@@ -1,12 +1,12 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This file is a part of the CANN Open Software.
- * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+  */
 
 /*!
  * \file lightning_indexer_vector.h
@@ -44,6 +44,7 @@ __aicore__ inline void CopyIn(LocalTensor<float> &mmOutUb, LocalTensor<T> &weigh
                               GlobalTensor<T> &weightScaleGm, int64_t MMout_gmoffset, int64_t weights_gmoffset,
                               int64_t groupInner, int64_t s2Inner, int64_t mmUbStride)
 {
+    // 将MMout_gmoffset copy到UB上
     AscendC::DataCopyPadExtParams<float> padParams{false, 0, 0, 0};
     AscendC::DataCopyExtParams dataCopymMoutParams;
     dataCopymMoutParams.blockCount = groupInner;
@@ -53,6 +54,7 @@ __aicore__ inline void CopyIn(LocalTensor<float> &mmOutUb, LocalTensor<T> &weigh
     dataCopymMoutParams.rsv = 0;
     AscendC::DataCopyPad(mmOutUb, mMoutGm[MMout_gmoffset], dataCopymMoutParams, padParams);
 
+    // 将weights_gmoffset copy到UB
     AscendC::DataCopyPadExtParams<T> padTParams{false, 0, 0, 0};
     AscendC::DataCopyExtParams dataCopyweightParams;
     dataCopyweightParams.blockCount = 1;
@@ -118,12 +120,13 @@ __aicore__ inline uint64_t FindNearestPower2(uint64_t value)
     if (value <= CONST_TWO) {
         return value;
     } else {
-        const uint64_t pow = 63 - clz(value);
+        const uint64_t pow = 63 - AscendC::ScalarCountLeadingZero(value); // 返回前导0的个数，对于64位整数，最大有效位位置 = 63 - 前导0个数
         return (1 << pow);
     }
 }
 
 
+// dstTensor 需要初始化0
 __aicore__ inline void DoReduce(const LocalTensor<float> &srcTensor, LocalTensor<float> &dstTensor, int32_t rNum,
                                 int32_t aNum)
 {
@@ -149,6 +152,11 @@ __aicore__ inline void DoReduce(const LocalTensor<float> &srcTensor, LocalTensor
     AscendC::PipeBarrier<PIPE_V>();
 }
 
+
+/**
+  src: 传入的初始化空间
+  eleNum: 需要初始化的元素个数需为64整数倍，元素将被初始化为交错排布的-inf，-1
+ */
 __aicore__ inline void InitSortOutBuf(const LocalTensor<float> &src, int64_t eleNum)
 {
     uint64_t mask1[2] = {0x5555555555555555, 0};
@@ -159,18 +167,26 @@ __aicore__ inline void InitSortOutBuf(const LocalTensor<float> &src, int64_t ele
     for (int i = 0; i < forLoop; i++) {
         AscendC::Duplicate(src.template ReinterpretCast<int32_t>(), NEG_INF, mask1, VEC_REPEAT_MAX, 1,
                            B32_VEC_REPEAT_STRIDE);
+        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Duplicate(src.template ReinterpretCast<int32_t>(), INVALID_INDEX, mask0, VEC_REPEAT_MAX, 1,
                            B32_VEC_REPEAT_STRIDE);
     }
     if (forRemain > 0) {
         AscendC::Duplicate(src.template ReinterpretCast<int32_t>()[forLoop * VEC_REPEAT_MAX * B32_VEC_ELM_NUM], NEG_INF,
                            mask1, forRemain, 1, B32_VEC_REPEAT_STRIDE);
+        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Duplicate(src.template ReinterpretCast<int32_t>()[forLoop * VEC_REPEAT_MAX * B32_VEC_ELM_NUM],
                            INVALID_INDEX, mask0, forRemain, 1, B32_VEC_REPEAT_STRIDE);
     }
     AscendC::PipeBarrier<PIPE_V>();
 }
 
+
+/**
+  src: logits和索引，前logitsNum为logits，后logitsNum为索引
+  tmp: 计算使用到的临时空间，大小与src一致
+  logitsNum: 排序的元素个数, 暂只支持[128,256,384,512,1024,2048]
+ */
 __aicore__ inline void SortAll(LocalTensor<float> &src, LocalTensor<float> &tmp, int64_t logitsNum)
 {
     int64_t sort32Repeats = logitsNum / BLOCK_BYTES;
@@ -216,6 +232,7 @@ __aicore__ inline void SortAll(LocalTensor<float> &src, LocalTensor<float> &tmp,
             }
             AscendC::MrgSort<float>(dstTensor, srcList, params);
             i += 1;
+            AscendC::PipeBarrier<PIPE_V>();
             break;
         } else {
             params.repeatTimes = mrgGroups / MRG_BLOCK_4;
@@ -232,6 +249,14 @@ __aicore__ inline void SortAll(LocalTensor<float> &src, LocalTensor<float> &tmp,
     }
 }
 
+
+/**
+  dst: 输出全排序的结果，排布方式为value，index
+  srcValue：输入的待排序浮点数
+  srcIndex：浮点数的索引
+  tmp: 计算使用到的临时空间，大小为srcValue+srcIndex
+  logitsNum: 排序的元素个数
+ */
 __aicore__ inline void SortAll(LocalTensor<float> &dst, LocalTensor<float> &srcValue, LocalTensor<uint32_t> &srcIndex,
                                LocalTensor<float> &tmpTensor, int64_t logitsNum)
 {
@@ -240,35 +265,81 @@ __aicore__ inline void SortAll(LocalTensor<float> &dst, LocalTensor<float> &srcV
     AscendC::PipeBarrier<PIPE_V>();
 }
 
+
+/**
+  mrgDst: 合并进的Tensor
+  mrgSrc: 待合并的Tensor
+  tmpTensor：空间为mrgDst+mrgSrc
+ */
 __aicore__ inline void MergeSort(const LocalTensor<float> &mrgDst, int32_t mrgDstNum, LocalTensor<float> &mrgSrc,
                                  int32_t mrgSrcNum, LocalTensor<float> &tmpTensor)
 {
-    AscendC::MrgSort4Info params;
-    params.elementLengths[0] = mrgDstNum;
-    params.elementLengths[1] = mrgSrcNum;
-    params.ifExhaustedSuspension = false;
-    params.validBit = 0b0011;
-    params.repeatTimes = 1;
+    if (mrgDstNum <= 3072) { // 3072: threshold of data size for different processing strategy
+        AscendC::MrgSort4Info params;
+        params.elementLengths[MRG_QUE_0] = mrgSrcNum;
+        params.elementLengths[MRG_QUE_1] = mrgDstNum;
+        params.ifExhaustedSuspension = false;
+        params.validBit = 0b0011;
+        params.repeatTimes = 1;
 
-    AscendC::MrgSortSrcList<float> srcList;
-    srcList.src1 = mrgDst;
-    srcList.src2 = mrgSrc;
+        AscendC::MrgSortSrcList<float> srcList;
+        srcList.src1 = mrgSrc;
+        srcList.src2 = mrgDst;
 
-    AscendC::MrgSort<float>(tmpTensor, srcList, params);
-    AscendC::PipeBarrier<PIPE_V>();
-    AscendC::DataCopy(mrgDst, tmpTensor, mrgDstNum * VALUE_AND_INDEX_NUM);
-    AscendC::PipeBarrier<PIPE_V>();
+        AscendC::MrgSort<float>(tmpTensor, srcList, params);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::DataCopy(mrgDst, tmpTensor, mrgDstNum * VALUE_AND_INDEX_NUM);
+        AscendC::PipeBarrier<PIPE_V>();
+    } else {
+        int64_t unitElements = 1024;
+        int64_t segNum = mrgDstNum / unitElements;
+        int64_t mrgQuelen_1 = (segNum + 2) / 3;
+        int64_t mrgQuelen_2 = ((segNum - mrgQuelen_1) + 1) / 2;
+        int64_t mrgQuelen_3 = segNum - mrgQuelen_1 - mrgQuelen_2;
+
+        AscendC::MrgSort4Info params;
+        params.elementLengths[MRG_QUE_0] = mrgQuelen_1 * unitElements;
+        params.elementLengths[MRG_QUE_1] = mrgQuelen_2 * unitElements;
+        params.elementLengths[MRG_QUE_2] = mrgQuelen_3 * unitElements;
+        params.elementLengths[MRG_QUE_3] = mrgSrcNum;
+
+        params.ifExhaustedSuspension = false;
+        params.validBit = 0b1111;
+        params.repeatTimes = 1;
+
+        AscendC::MrgSortSrcList<float> srcList;
+        srcList.src1 = mrgDst[0];
+        srcList.src2 = mrgDst[mrgQuelen_1 * VALUE_AND_INDEX_NUM * unitElements];
+        srcList.src3 = mrgDst[(mrgQuelen_1 + mrgQuelen_2) * VALUE_AND_INDEX_NUM * unitElements];
+        srcList.src4 = mrgSrc;
+
+        AscendC::MrgSort<float>(tmpTensor, srcList, params);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::DataCopy(mrgDst, tmpTensor, mrgDstNum * VALUE_AND_INDEX_NUM);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
 }
 
+
+/**
+ * @brief 合并基础块函数
+ * @param dst 归并后的输出, 大小为blockNum * basicBlockSize * 2 * sizeof(float)
+ * @param src 基本块输入
+ * @param blockNum 基本块的数量
+ * @param basicBlockSize 基础块的大小
+ * @return 无
+ */
 __aicore__ inline void MrgBasicBlock(const LocalTensor<float> &dst, const LocalTensor<float> &src, int64_t blockNum,
                                      int64_t basicBlockSize)
 {
+    // 初始化合并排序参数
     AscendC::MrgSort4Info params;
     params.elementLengths[MRG_QUE_0] = basicBlockSize;
     params.elementLengths[MRG_QUE_1] = basicBlockSize;
     params.elementLengths[MRG_QUE_2] = basicBlockSize;
     params.elementLengths[MRG_QUE_3] = basicBlockSize;
     params.ifExhaustedSuspension = false;
+    // 根据块的数量设置有效位
     if (blockNum == MRG_BLOCK_2) {
         params.validBit = 0b0011;
     } else if (blockNum == MRG_BLOCK_3) {
@@ -279,31 +350,49 @@ __aicore__ inline void MrgBasicBlock(const LocalTensor<float> &dst, const LocalT
         AscendC::DataCopy(dst, src, basicBlockSize * VALUE_AND_INDEX_NUM);
         return;
     }
+    // 初始化源列表
     AscendC::MrgSortSrcList<float> srcList;
     srcList.src1 = src[0];
     srcList.src2 = src[basicBlockSize * VALUE_AND_INDEX_NUM * MRG_QUE_1];
     srcList.src3 = src[basicBlockSize * VALUE_AND_INDEX_NUM * MRG_QUE_2];
     srcList.src4 = src[basicBlockSize * VALUE_AND_INDEX_NUM * MRG_QUE_3];
+    // 执行合并排序
     AscendC::MrgSort<float>(dst, srcList, params);
 }
 
+
+/**
+ * @brief 从两个队列中选择topk
+ * @param dst 已经归并好的topk数据
+ * @param needsMerging 需要合并的有序数据
+ * @param tmp 临时空间
+ * @param topk topk的元素个数
+ * @param mergSize 待合并的元素个数
+ * @return 无
+ */
 template <bool needMrg = true>
 __aicore__ inline void SparseTopK(const LocalTensor<float> &dst, const LocalTensor<float> &needsMerging,
                                   const LocalTensor<float> &tmp, int64_t topk, int64_t mergSize)
 {
+    // 如果不需要合并，则直接复制数据
     if (!needMrg) {
         AscendC::DataCopy(dst, needsMerging, mergSize * VALUE_AND_INDEX_NUM);
         return;
     }
+    // 初始化合并排序参数
     AscendC::MrgSort4Info params;
     params.elementLengths[0] = topk;
     params.elementLengths[1] = mergSize;
     params.ifExhaustedSuspension = (topk == mergSize);
     params.validBit = 0b0011;
+    // 初始化源列表
     AscendC::MrgSortSrcList<float> srcList;
     srcList.src1 = dst;
     srcList.src2 = needsMerging;
+    // 执行合并排序
     AscendC::MrgSort<float>(tmp, srcList, params);
+    AscendC::PipeBarrier<PIPE_V>();
+    // 将结果复制到目标张量
     AscendC::DataCopy(dst, tmp, topk * VALUE_AND_INDEX_NUM);
 }
 
@@ -316,8 +405,8 @@ __aicore__ inline void ExtractIndex(const LocalTensor<uint32_t> &idxULocal, cons
     gatherMaskParams.src0BlockStride = 1;
     gatherMaskParams.src0RepeatStride = B32_VEC_REPEAT_STRIDE;
     gatherMaskParams.src1RepeatStride = 0;
-    uint64_t rsvdCnt = 0;
-    uint8_t src1Pattern = 2;
+    uint64_t rsvdCnt = 0;    // 用于保存筛选后保留下来的元素个数
+    uint8_t src1Pattern = 2; // 固定模式2,表示筛选出奇数索引的数
     AscendC::GatherMask(idxULocal, sortLocal, src1Pattern, false, static_cast<uint32_t>(0), gatherMaskParams, rsvdCnt);
     AscendC::PipeBarrier<PIPE_V>();
 }

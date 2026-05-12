@@ -205,12 +205,13 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine_meta(
     return {out, expert_token_nums};
 }
 
-at::Tensor npu_lightning_indexer_meta(
+std::tuple<at::Tensor, at::Tensor> npu_lightning_indexer_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
     const c10::optional<at::Tensor> &actual_seq_lengths_key,
     const c10::optional<at::Tensor> &block_table, c10::string_view layout_query,
-    c10::string_view layout_key, int64_t sparse_count, int64_t sparse_mode)
+    c10::string_view layout_key, int64_t sparse_count, int64_t sparse_mode,
+    int64_t pre_tokens,int64_t next_tokens,bool return_value)
 {
     // npu tensor max size
     constexpr int32_t SIZE = 8;
@@ -240,7 +241,8 @@ at::Tensor npu_lightning_indexer_meta(
     }
     // construct the output tensor
     at::Tensor lightning_indexer_output = at::empty(output_size, query.options().dtype(at::kInt));
-    return lightning_indexer_output;
+    at::Tensor lightning_indexer_value = at::empty(output_size, query.options().dtype(at::kInt));
+    return lightning_indexer_output, lightning_indexer_value;
 }
 
 at::Tensor npu_sparse_flash_attention_meta(

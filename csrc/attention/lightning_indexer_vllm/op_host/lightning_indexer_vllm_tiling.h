@@ -1,12 +1,12 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This file is a part of the CANN Open Software.
- * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
 /*!
  * \file lightning_indexer_tiling.h
@@ -21,11 +21,11 @@
 #include "register/op_def_registry.h"
 #include "register/tilingdata_base.h"
 #include "tiling/tiling_api.h"
-#include "error/ops_error.h"
+#include "err/ops_err.h"
 #include "platform/platform_info.h"
 
 namespace optiling {
-
+// ------------------公共定义--------------------------
 struct TilingRequiredParaInfo {
     const gert::CompileTimeTensorDesc *desc;
     const gert::StorageShape *shape;
@@ -42,6 +42,7 @@ enum class DataLayout : uint32_t {
     BnBsND = 2
 };
 
+// ------------------算子原型索引常量定义----------------
 // Inputs Index
 constexpr uint32_t QUERY_INDEX = 0;
 constexpr uint32_t KEY_INDEX = 1;
@@ -49,12 +50,17 @@ constexpr uint32_t WEIGTHS_INDEX = 2;
 constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 3;
 constexpr uint32_t ACTUAL_SEQ_K_INDEX = 4;
 constexpr uint32_t BLOCK_TABLE_INDEX = 5;
+//Outputs Index
 constexpr uint32_t LIGHTNING_INDEXER = 0;
+constexpr uint32_t LIGHTNING_VALUES = 1;
 // Attributes Index
 constexpr uint32_t ATTR_QUERY_LAYOUT_INDEX = 0;
 constexpr uint32_t ATTR_KEY_LAYOUT_INDEX = 1;
 constexpr uint32_t ATTR_SPARSE_COUNT_INDEX = 2;
 constexpr uint32_t ATTR_SPARSE_MODE_INDEX = 3;
+constexpr uint32_t ATTR_PRE_TOKENS_INDEX = 4;
+constexpr uint32_t ATTR_NEXT_TOKENS_INDEX = 5;
+constexpr uint32_t ATTR_RETURN_VALUE_INDEX = 6;
 // Dim Index
 constexpr uint32_t DIM_IDX_ONE = 1;
 constexpr uint32_t DIM_IDX_TWO = 2;
@@ -63,11 +69,13 @@ constexpr uint32_t DIM_IDX_THREE = 3;
 constexpr uint32_t DIM_NUM_TWO = 2;
 constexpr uint32_t DIM_NUM_THREE = 3;
 constexpr uint32_t DIM_NUM_FOUR = 4;
-// Input Parameter Limit Constant
+// 入参限制常量
 constexpr uint32_t HEAD_DIM_LIMIT = 128;
 constexpr uint32_t SPARSE_LIMIT = 2048;
 constexpr uint32_t SPARSE_MODE_LOWER = 3;
+constexpr uint32_t QUERY_HEAD_NUM_LIMIT = 64;
 
+// -----------算子TilingData定义---------------
 BEGIN_TILING_DATA_DEF(LITilingData)
 TILING_DATA_FIELD_DEF(uint32_t, bSize)
 TILING_DATA_FIELD_DEF(uint32_t, n2Size)
@@ -79,11 +87,16 @@ TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum)
 TILING_DATA_FIELD_DEF(uint32_t, blockSize)
 TILING_DATA_FIELD_DEF(uint32_t, maxBlockNumPerBatch)
 TILING_DATA_FIELD_DEF(uint32_t, sparseMode)
+TILING_DATA_FIELD_DEF(int64_t, preTokens)
+TILING_DATA_FIELD_DEF(int64_t, nextTokens)
+TILING_DATA_FIELD_DEF(uint32_t, returnValue)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(LightningIndexerVllm, LITilingData)
 
+// -----------算子CompileInfo定义-------------------
 struct LICompileInfo {};
 
+// -----------算子Tiling入参结构体定义---------------
 struct LiParaInfo {
     TilingRequiredParaInfo query = {nullptr, nullptr};
     TilingRequiredParaInfo key = {nullptr, nullptr};
@@ -92,14 +105,19 @@ struct LiParaInfo {
     TilingOptionalParaInfo actualSeqLengths = {nullptr, nullptr};
     TilingOptionalParaInfo blockTable = {nullptr, nullptr};
     TilingRequiredParaInfo attenOut = {nullptr, nullptr};
+    TilingRequiredParaInfo valuesOut = {nullptr, nullptr};
 
     const char *layOut = nullptr;
     const char *layOutKey = nullptr;
     const int32_t *blockSize = nullptr;
     const int32_t *sparseMode = nullptr;
     const int32_t *sparseCount = nullptr;
+    const int64_t *preTokens = nullptr;
+    const int64_t *nextTokens = nullptr;
+    const bool *returnValue = nullptr;
 };
 
+// -----------算子Tiling入参信息类---------------
 class LITilingInfo {
 public:
     const char *opName = nullptr;
@@ -122,15 +140,20 @@ public:
     int32_t sparseMode = 0;
     // Others Flag
     uint32_t sparseCount = 0;
+    int64_t preTokens = INT64_MAX;
+    int64_t nextTokens = INT64_MAX;
+    bool returnValue = false;
     // DType
     ge::DataType inputQType = ge::DT_FLOAT16;
     ge::DataType inputKType = ge::DT_FLOAT16;
+    ge::DataType weightsType = ge::DT_FLOAT16;
     ge::DataType outputType = ge::DT_INT32;
     // Layout
     DataLayout inputQLayout = DataLayout::BSND;
     DataLayout inputKLayout = DataLayout::BnBsND;
 };
 
+// -----------算子Tiling入参信息解析及Check类---------------
 class LIInfoParser {
 public:
     explicit LIInfoParser(gert::TilingContext *context) : context_(context)
@@ -142,7 +165,7 @@ public:
     ge::graphStatus CheckRequiredAttrExistence() const;
     ge::graphStatus CheckRequiredParaExistence() const;
     ge::graphStatus GetActualSeqLenSize(uint32_t &size, const gert::Tensor *tensor,
-                                        const std::string &actualSeqLenName);
+                                        const std::string &actualSeqLenName) const;
     ge::graphStatus GetOpName();
     ge::graphStatus GetNpuInfo();
     void GetOptionalInputParaInfo();
@@ -150,8 +173,8 @@ public:
     void GetOutputParaInfo();
     ge::graphStatus GetAndCheckAttrParaInfo();
     ge::graphStatus GetOpParaInfo();
-    ge::graphStatus ValidateInputShapesMatchQBsnd();
-    ge::graphStatus ValidateInputShapesMatchQTnd();
+    ge::graphStatus ValidateInputShapesMatchQbsnd();
+    ge::graphStatus ValidateInputShapesMatchQtnd();
     ge::graphStatus ValidateInputShapesMatch();
     ge::graphStatus GetAndCheckInOutDataType();
     ge::graphStatus GetBatchSize();
@@ -199,8 +222,10 @@ public:
     ge::DataType blockTableType_ = ge::DT_FLOAT16;
     ge::DataType inputKRopeType_ = ge::DT_FLOAT16;
     ge::DataType outputType_ = ge::DT_FLOAT16;
+    ge::DataType valuesOutType_ = ge::DT_FLOAT16;
 };
 
+// ---------------算子Tiling类---------------
 class LightningIndexerTiling {
 public:
     explicit LightningIndexerTiling(gert::TilingContext *context) : context_(context){};
