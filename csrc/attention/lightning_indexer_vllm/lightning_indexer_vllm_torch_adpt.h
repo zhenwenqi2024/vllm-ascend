@@ -56,9 +56,9 @@ at::Tensor npu_lightning_indexer(
     // convert str
     char *query_layout_ptr = const_cast<char *>(query_layout_str.c_str());
     char *key_layout_ptr = const_cast<char *>(key_layout_str.c_str());
-    int64_t pre_tokens = 9223372036854775807;
-    int64_t next_tokens = 9223372036854775807;
-    bool return_value = true;
+    // int64_t pre_tokens = 9223372036854775807;
+    // int64_t next_tokens = 9223372036854775807;
+    // bool return_value = true;
     EXEC_NPU_CMD(
         aclnnLightningIndexerVllm,
         query,

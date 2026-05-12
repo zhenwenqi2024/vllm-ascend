@@ -242,7 +242,7 @@ std::tuple<at::Tensor, at::Tensor> npu_lightning_indexer_meta(
     // construct the output tensor
     at::Tensor lightning_indexer_output = at::empty(output_size, query.options().dtype(at::kInt));
     at::Tensor lightning_indexer_value = at::empty(output_size, query.options().dtype(at::kInt));
-    return lightning_indexer_output, lightning_indexer_value;
+    return {lightning_indexer_output, lightning_indexer_value};
 }
 
 at::Tensor npu_sparse_flash_attention_meta(

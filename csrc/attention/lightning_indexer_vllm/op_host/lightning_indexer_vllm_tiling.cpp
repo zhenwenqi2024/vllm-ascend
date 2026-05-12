@@ -13,7 +13,7 @@
  * \brief
  */
 
-#include "lightning_indexer_tiling.h"
+#include "lightning_indexer_vllm_tiling.h"
 #include "../op_kernel/lightning_indexer_template_tiling_key.h"
 
 using namespace ge;
@@ -96,8 +96,7 @@ ge::graphStatus LIInfoParser::GetNpuInfo()
 
     socVersion_ = ascendcPlatform.GetSocVersion();
     if ((socVersion_ != platform_ascendc::SocVersion::ASCEND910B) &&
-        (socVersion_ != platform_ascendc::SocVersion::ASCEND910_93) &&
-        (socVersion_ != platform_ascendc::SocVersion::ASCEND950)) {
+        (socVersion_ != platform_ascendc::SocVersion::ASCEND910_93)) {
         OP_LOGE(opName_, "SOC Version[%d] is not support.", static_cast<int32_t>(socVersion_));
         return GRAPH_FAILED;
     }
@@ -226,7 +225,7 @@ ge::graphStatus LIInfoParser::GetAndCheckInOutDataType()
     OP_CHECK_IF(((inputQType_ != ge::DT_FLOAT16) && (inputQType_ != ge::DT_BF16)),
                OP_LOGE(opName_, "The data types of the input query, key must be float16 or bfloat16."),
                return ge::GRAPH_FAILED);
-    if (socVersion_ == platform_ascendc::SocVersion::ASCEND950) {
+    if (false) {
         OP_CHECK_IF((inputQType_ != weightsType_),
                 OP_LOGE(opName_, "The data types of the input query, key, and weights must be the same."),
                 return ge::GRAPH_FAILED);
@@ -759,7 +758,7 @@ ge::graphStatus LightningIndexerTiling::DoTiling(LITilingInfo *tilingInfo)
     constexpr uint32_t TOPK_MAX_SIZE = 2048;          // TopK选取个数
     uint32_t workspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
     // 主流程需Workspace大小
-    if (ascendcPlatform.GetCurNpuArch() == NpuArch::DAV_3510) {
+    if (false) {
         constexpr uint32_t s1BaseSize = 4;
         constexpr uint32_t s2BaseSize = 128;
         workspaceSize +=
