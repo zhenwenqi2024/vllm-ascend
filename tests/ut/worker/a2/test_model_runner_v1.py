@@ -190,23 +190,30 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         )
 
     def test_sparse_replicated_indexer_page_size_uses_expanded_storage_once(self):
+        block_size = 16
+        k_head_dim = 512
+        v_head_dim = 64
+        index_head_dim = 128
+        dcp_size = 4
+        expected_head_size = k_head_dim + v_head_dim + index_head_dim * dcp_size
+
         spec = AscendMLAAttentionSpec(
-            block_size=16,
+            block_size=block_size,
             num_kv_heads=1,
-            head_size=1088,
-            sparse_head_dim=(512, 64, 128 * 4),
+            head_size=k_head_dim + v_head_dim + index_head_dim,
+            sparse_head_dim=(k_head_dim, v_head_dim, index_head_dim),
             dtype=torch.bfloat16,
             cache_dtype_str="auto",
-            sfa_dcp_replicated_indexer_size=4,
+            sfa_dcp_replicated_indexer_size=dcp_size,
         )
 
-        self.assertEqual(spec.page_size_bytes, 16 * (512 + 64 + 128 * 4) * 2)
+        self.assertEqual(spec.page_size_bytes, block_size * expected_head_size * 2)
         self.assertEqual(
             spec.sparse_kv_cache_ratio,
             (
-                (512 + 64 + 128 * 4) / 512,
-                (512 + 64 + 128 * 4) / 64,
-                (512 + 64 + 128 * 4) / (128 * 4),
+                expected_head_size / k_head_dim,
+                expected_head_size / v_head_dim,
+                expected_head_size / (index_head_dim * dcp_size),
                 None,
             ),
         )
