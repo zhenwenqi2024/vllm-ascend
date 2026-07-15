@@ -93,11 +93,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             and self.sfa_dcp_replicated_indexer_size > 1
         ):
             k_head_dim, v_head_dim, index_head_dim = self.sparse_head_dim
-            replicated_head_size = (
-                k_head_dim
-                + v_head_dim
-                + index_head_dim * self.sfa_dcp_replicated_indexer_size
-            )
+            replicated_head_size = k_head_dim + v_head_dim + index_head_dim * self.sfa_dcp_replicated_indexer_size
             return (
                 self.block_size
                 * self.num_kv_heads
