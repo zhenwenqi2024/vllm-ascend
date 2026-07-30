@@ -44,7 +44,10 @@ def _select_kv_token_budget(
     max_in_flight_tokens: int | None,
     max_num_batched_tokens: int | None,
 ) -> int:
-    token_budget = max_num_batched_tokens if vllm_version_is("0.25.1") else max_in_flight_tokens
+    if vllm_version_is("0.25.1"):
+        token_budget = max_num_batched_tokens
+    else:
+        token_budget = max_in_flight_tokens
     return token_budget if token_budget is not None else max_model_len
 
 
