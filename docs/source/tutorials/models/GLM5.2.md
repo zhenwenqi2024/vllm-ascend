@@ -160,13 +160,13 @@ vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w4a8c8 \
 --enable-auto-tool-choice \
 --max-num-seqs 12 \
 --max-model-len 135000 \
---max-num-batched-tokens 6144 \
+--max-num-batched-tokens 8192 \
 --trust-remote-code \
 --gpu-memory-utilization 0.92 \
 --quantization ascend \
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
 --additional-config '{"enable_dsa_cp": true, "enable_sparse_li_c8": true,"enable_balance_scheduling": true,"multistream_overlap_shared_expert":true}' \
---speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp","enforce_eager":true}'
+--speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp","enforce_eager":true}'
 
 ```
 
@@ -234,13 +234,13 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
     --enable-auto-tool-choice \
     --max-num-seqs 16 \
     --max-model-len 66000 \
-    --max-num-batched-tokens 6144 \
+    --max-num-batched-tokens 8192 \
     --trust-remote-code \
     --gpu-memory-utilization 0.90 \
     --quantization ascend \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
     --additional-config '{"enable_dsa_cp": true, "enable_sparse_li_c8": true,"enable_balance_scheduling": true,"fuse_muls_add":true, "enable_reduce_sample": true}'  \
-    --speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp","enforce_eager":true}'
+    --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp","enforce_eager":true}'
 ```
 
 **node 1**
@@ -285,13 +285,13 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
     --enable-auto-tool-choice \
     --max-num-seqs 16 \
     --max-model-len 66000 \
-    --max-num-batched-tokens 6144 \
+    --max-num-batched-tokens 8192 \
     --trust-remote-code \
     --gpu-memory-utilization 0.90 \
     --quantization ascend \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
     --additional-config '{"enable_dsa_cp": true, "enable_sparse_li_c8": true,"enable_balance_scheduling": true,"fuse_muls_add":true, "enable_reduce_sample": true}'  \
-    --speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp","enforce_eager":true}'
+    --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp","enforce_eager":true}'
 ```
 
 ::::
@@ -334,7 +334,7 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
 
     vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w4a8c8 \
     --max_model_len 40000 \
-    --max-num-batched-tokens 6144 \
+    --max-num-batched-tokens 4096 \
     --served-model-name glm-52 \
     --seed 1024 \
     --gpu-memory-utilization 0.95 \
@@ -353,7 +353,7 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
     --async-scheduling \
     --additional-config '{"multistream_overlap_shared_expert": true}' \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-    --speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp", "enforce_eager": true}'
+    --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}'
 ```
 
 **node 1**
@@ -390,7 +390,7 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
 
     vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w4a8c8 \
     --max_model_len 40000 \
-    --max-num-batched-tokens 6144 \
+    --max-num-batched-tokens 4096 \
     --served-model-name glm-52 \
     --seed 1024 \
     --gpu-memory-utilization 0.95 \
@@ -410,7 +410,7 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
     --async-scheduling \
     --additional-config '{"multistream_overlap_shared_expert": true}' \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-    --speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp", "enforce_eager": true}'
+    --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}'
 ```
 
 ::::
@@ -418,7 +418,7 @@ If you want to deploy multi-node environment, you need to verify multi-node comm
 
 ### 5.3 Prefill-Decode Disaggregation
 
-We'd like to show the deployment guide of `GLM-5.2` on multi-node environment with 1P1D for better performance.
+We'd like to show the deployment guide of `GLM-5` on multi-node environment with 1P1D for better performance.
 
 Prefill-Decode disaggregation can be deployed on 4 Atlas 800 A3 (64GB × 8).
 
@@ -1178,7 +1178,7 @@ vllm serve <MODEL_PATH> \
   --port 9000 \
   --served-model-name glm-52 \
   --max-model-len 1024000 \
-  --max-num-batched-tokens 6144 \
+  --max-num-batched-tokens 16384 \
   --gpu-memory-utilization 0.80 \
   --api-server-count 1 \
   --max-num-seqs 32 \
@@ -1190,7 +1190,7 @@ vllm serve <MODEL_PATH> \
   --cp-kv-cache-interleave-size 128 \
   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [4, 16, 128]}' \
   --additional-config '{"enable_flashcomm1": true, "enable_dsa_cp": true, "ascend_compilation_config": {"enable_npugraph_ex": true, "enable_static_kernel": false}, "fuse_muls_add": true, "multistream_overlap_shared_expert": true, "enable_sparse_sfa_c8": true, "enable_sparse_li_c8": true, "enable_cpu_binding": true}' \
-  --speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp", "enforce_eager": true}' \
+  --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}' \
   --quantization ascend \
   --enable-expert-parallel \
   --safetensors-load-strategy prefetch
@@ -1228,7 +1228,7 @@ vllm serve <MODEL_PATH> \
   --port 9000 \
   --served-model-name glm-52 \
   --max-model-len 1024000 \
-  --max-num-batched-tokens 6144 \
+  --max-num-batched-tokens 16384 \
   --gpu-memory-utilization 0.75 \
   ${server_role_args} \
   --max-num-seqs 8 \
@@ -1244,7 +1244,7 @@ vllm serve <MODEL_PATH> \
   --cp-kv-cache-interleave-size 128 \
   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
   --additional-config '{"enable_flashcomm1": true, "enable_dsa_cp": true, "ascend_compilation_config": {"enable_npugraph_ex": true, "enable_static_kernel": false}, "fuse_muls_add": true, "multistream_overlap_shared_expert": true, "enable_sparse_sfa_c8": true, "enable_sparse_li_c8": true, "enable_cpu_binding": true}' \
-  --speculative-config '{"num_speculative_tokens": 5, "method": "deepseek_mtp", "enforce_eager": true}' \
+  --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}' \
   --quantization ascend \
   --enable-expert-parallel \
   --safetensors-load-strategy prefetch
