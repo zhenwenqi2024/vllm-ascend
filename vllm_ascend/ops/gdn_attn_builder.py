@@ -148,7 +148,10 @@ def _build_non_spec_chunked_prefill_metadata(
     device: torch.device,
 ) -> GDNChunkedPrefillMetadata:
     hf_text_config = getattr(builder.vllm_config.model_config, "hf_text_config", None)
-    if hf_text_config is not None and hasattr(hf_text_config, "linear_num_value_heads"):
+    linear_attn_config = getattr(hf_text_config, "linear_attn_config", None)
+    if isinstance(linear_attn_config, dict) and linear_attn_config.get("num_heads") is not None:
+        gdn_num_heads = linear_attn_config["num_heads"] // builder.vllm_config.parallel_config.tensor_parallel_size
+    elif hf_text_config is not None and hasattr(hf_text_config, "linear_num_value_heads"):
         gdn_num_heads = (
             hf_text_config.linear_num_value_heads // builder.vllm_config.parallel_config.tensor_parallel_size
         )
@@ -699,6 +702,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 non_blocking=True,
             )
             num_accepted_tokens = self.num_accepted_tokens[:spec_batch_size]
+            # Zero-length rows are skipped before the recurrent kernel reads
+            # this value. Keep the padding sentinel within the public
+            # accepted-token range [1, query_width].
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
         if (

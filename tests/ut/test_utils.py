@@ -15,6 +15,7 @@
 
 import math
 import os
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -182,6 +183,41 @@ class TestUtils(TestBase):
     def test_enable_dsa_cp_with_o_proj_tp_rejects_when_dsa_cp_disabled(self):
         with mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=False):
             self.assertFalse(utils.enable_dsa_cp_with_o_proj_tp())
+
+    def test_flashcomm1_and_shared_expert_dp_switches_are_independent(self):
+        cases = [
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ]
+        for enable_flashcomm1, enable_shared_expert_dp in cases:
+            with self.subTest(
+                enable_flashcomm1=enable_flashcomm1,
+                enable_shared_expert_dp=enable_shared_expert_dp,
+            ):
+                utils.clear_enable_sp()
+                vllm_config = mock.MagicMock(
+                    additional_config={
+                        "enable_flashcomm1": enable_flashcomm1,
+                        "refresh": True,
+                    }
+                )
+                ascend_config = mock.MagicMock(
+                    enable_flashcomm1=enable_flashcomm1,
+                    enable_shared_expert_dp=enable_shared_expert_dp,
+                    enable_sp_by_pass=False,
+                )
+
+                with mock.patch("vllm_ascend.utils.get_ascend_config", return_value=ascend_config):
+                    self.assertEqual(
+                        utils.enable_sp(
+                            vllm_config,
+                            enable_shared_expert_dp=enable_shared_expert_dp,
+                        ),
+                        enable_flashcomm1,
+                    )
+                    self.assertEqual(utils.shared_expert_dp_enabled(), enable_shared_expert_dp)
 
     def test_vllm_version_is(self):
         with mock.patch.dict(os.environ, {"VLLM_VERSION": "1.0.0"}):
@@ -401,6 +437,36 @@ def test_is_pd_decode_recompute_scheduler_enabled_kv_producer():
     vllm_config.kv_transfer_config.is_kv_consumer = False
     vllm_config.kv_transfer_config.is_kv_producer = True
     assert utils.is_pd_decode_recompute_scheduler_enabled(vllm_config) is False
+
+
+@pytest.mark.parametrize(
+    ("top_layer_types", "text_layer_types", "is_linear_attn", "expected"),
+    [
+        (["linear_attention"], None, False, True),
+        (None, ["linear_attention"], False, True),
+        (None, None, True, True),
+        (["full_attention"], ["full_attention"], False, False),
+    ],
+)
+def test_check_gdn_layer_detects_supported_config_shapes(
+    top_layer_types,
+    text_layer_types,
+    is_linear_attn,
+    expected,
+):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                layer_types=top_layer_types,
+                text_config=SimpleNamespace(
+                    layer_types=text_layer_types,
+                    is_linear_attn=is_linear_attn,
+                ),
+            ),
+        ),
+    )
+
+    assert utils.check_gdn_layer(vllm_config) is expected
 
 
 def test_is_pd_decode_recompute_scheduler_enabled_decode_consumer():
