@@ -354,10 +354,22 @@ class AscendMLAMetadata:
     attn_mask: torch.Tensor = None
     # chunked prefill by default if no attn_states passed
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
+    causal: bool = True
 
     decode: AscendMLADecodeMetadata | None = None
     prefill: AscendMLAPrefillMetadata | None = None
     reshape_cache_event: torch.npu.Event = None
+
+    # Deferred parallel-draft reject finalize (dspark async spec decode). The
+    # builder copies these from AscendCommonAttentionMetadata when the proposer
+    # published an optimistic parallel_draft_seq_lens_cpu; _forward_decode
+    # synchronizes the event and subtracts the per-request reject count from
+    # ``decode.seq_lens_list`` exactly once (``reject_finalized`` guards re-entry
+    # across layers sharing this metadata object). None when no finalize is pending.
+    pending_reject_cpu: torch.Tensor = None
+    pending_reject_event: torch.npu.Event = None
+    pending_reject_num_reqs: int = 0
+    reject_finalized: bool = False
 
     def __post_init__(self):
         pass
@@ -597,9 +609,15 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
 
         query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         self.query_lens = query_seq_lens_cpu[:num_reqs]
-        # Prefer _seq_lens_cpu (always available, updated during draft
-        # iterations) over seq_lens_cpu (None in async spec decode mode).
-        if common_attn_metadata._seq_lens_cpu is not None:
+        # Async parallel drafting publishes an optimistic host length here.
+        # The first FIA forward waits for the overlapped reject-count copy and
+        # applies the exact post-rejection correction before launching FIA.
+        # Other paths retain the existing CPU-mirror contract.
+        if common_attn_metadata.parallel_draft_seq_lens_cpu is not None:
+            self.seq_lens = common_attn_metadata.parallel_draft_seq_lens_cpu[:num_reqs]
+        # Prefer _seq_lens_cpu (always available, updated during non-parallel
+        # draft iterations) over seq_lens_cpu (None in async spec mode).
+        elif common_attn_metadata._seq_lens_cpu is not None:
             self.seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]
         elif common_attn_metadata.seq_lens_cpu is not None:
             self.seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
@@ -628,12 +646,17 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             num_prefills=self.num_prefills,
             attn_mask=self.attn_mask_builder.get_splitfuse_attn_mask(),
             attn_state=common_attn_metadata.attn_state,
+            causal=common_attn_metadata.causal,
             prefill=prefill_metadata,
             decode=decode_metadata,
             query_start_loc=query_start_loc,
             block_tables=self.block_table,
             seq_lens=self.seq_lens,
             seq_lens_cpu=self.seq_lens,
+            pending_reject_cpu=common_attn_metadata.parallel_draft_num_reject_cpu,
+            pending_reject_event=common_attn_metadata.parallel_draft_num_reject_event,
+            pending_reject_num_reqs=common_attn_metadata.parallel_draft_num_reject_num_reqs,
+            reject_finalized=False,
         )
 
     def build_chunked_metadata(
@@ -1641,6 +1664,20 @@ class AscendMLAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         decode_meta = attn_metadata.decode
         assert decode_meta is not None
+        # Deferred parallel-draft reject finalize (dspark async spec decode):
+        # synchronize the side-stream D2H of num_rejected_tokens and subtract
+        # the per-request reject count from decode_meta.seq_lens_list -- the
+        # host list FIA consumes as actual_seq_kvlen. Runs once per metadata
+        # object; layers sharing this metadata skip via reject_finalized. The
+        # D2H was launched right after prepare_inputs_padded, so by the first
+        # attention layer the copy is typically already complete (sync no-op).
+        if attn_metadata.pending_reject_event is not None and not attn_metadata.reject_finalized:
+            attn_metadata.pending_reject_event.synchronize()
+            reject = attn_metadata.pending_reject_cpu[: attn_metadata.pending_reject_num_reqs].tolist()
+            seq_lens_list = decode_meta.seq_lens_list
+            for i in range(attn_metadata.pending_reject_num_reqs):
+                seq_lens_list[i] -= reject[i]
+            attn_metadata.reject_finalized = True
         # TODO: The CANN package is expected to support num_heads that are not
         # powers of 2 in 2026 Q2. Once supported, all padding operations under
         # `if self.head_padding > 0` in this function can be removed.
@@ -1692,8 +1729,18 @@ class AscendMLAImpl(MLAAttentionImpl):
                 q_nope = F.pad(q_nope, (0, 0, 0, self.head_padding), "constant", 0)
             # Output shape: [num_heads, num_tokens, dim]
             attn_output_shape = (self.num_heads_padded, num_tokens, self.kv_lora_rank)
-            sparse_mode = 3
-            attn_mask = attn_metadata.decode.attn_mask  # type:ignore
+            if not attn_metadata.causal:
+                # The DSpark MLA draft block is non-causal (bidirectional):
+                # every query token attends to the trailing context window plus
+                # all other query tokens in the draft block. On Ascend FIA this
+                # is sparse_mode=0 with NO atten_mask (a mask under sparse_mode=0
+                # is applied as defaultMask and would wrongly hide the upper
+                # triangle -- see vllm_ascend/attention/attention_mask.py).
+                sparse_mode = 0
+                attn_mask = None
+            else:
+                sparse_mode = 3
+                attn_mask = decode_meta.attn_mask
             actual_seq_lengths = decode_meta.actual_seq_lengths_q
             if self.fa_quant_layer:
                 dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, self.num_heads)
