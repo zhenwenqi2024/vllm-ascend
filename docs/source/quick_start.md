@@ -259,6 +259,16 @@ pip install modelscope
 python example.py
 ```
 
+```{note}
+If you encounter custom-op security verification errors while running inference on Atlas 950DT, refer to [Pooling enables UB and UBoE for 950DT and 950PR](https://gitcode.com/Ascend/memcache/wiki/%E6%B1%A0%E5%8C%96%E4%BD%BF%E8%83%BD950DT%E5%92%8C950PR%E7%9A%84UB%E5%92%8CUBoE.md) and run the following commands:
+
+> Each NPU will prompt for confirmation when running the first command. You must manually enter `Y` for all of them.
+
+```bash
+for i in {0..7}; do npu-smi set -t custom-op-secverify-enable -i $i -d 1; done;
+for i in {0..7}; do npu-smi set -t custom-op-secverify-mode -i $i -d 0; done;
+```
+
 This section shows ascend platform is successfully detected in vllm:
 
 ```bash
