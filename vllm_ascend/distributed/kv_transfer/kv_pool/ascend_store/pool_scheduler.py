@@ -45,6 +45,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     build_layerwise_cache_layout,
+    build_layerwise_reuse_layout,
+    get_gva_layerwise_config,
+    get_layerwise_kv_cache_specs,
 )
 
 
@@ -109,6 +112,9 @@ class KVPoolScheduler:
         self.num_speculative_blocks = (
             vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0
         )
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        use_eagle_fn = getattr(speculative_config, "use_eagle", None)
+        self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
         self.original_block_size = self._infer_group_block_sizes(vllm_config, kv_cache_config)
         cp_scale = self.pcp_size * self.dcp_size
         self.grouped_block_size = [block_size * cp_scale for block_size in self.original_block_size]
@@ -191,10 +197,24 @@ class KVPoolScheduler:
         self.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.layerwise_offload = False
         if self.use_gva_layerwise:
-            self.layerwise_offload = build_layerwise_cache_layout(
-                self.num_layers,
-                vllm_config.kv_transfer_config.kv_connector_extra_config,
-            ).has_layer_reuse
+            extra_config = get_gva_layerwise_config(vllm_config.kv_transfer_config)
+            if kv_cache_config is not None and extra_config is not None:
+                reuse_layout = build_layerwise_reuse_layout(
+                    get_layerwise_kv_cache_specs(kv_cache_config),
+                    self.num_layers,
+                    extra_config,
+                )
+                if reuse_layout.layer_cache_specs:
+                    self.num_layers = max(
+                        self.num_layers,
+                        max(reuse_layout.layer_cache_specs) + 1,
+                    )
+                self.layerwise_offload = reuse_layout.has_layer_reuse
+            else:
+                self.layerwise_offload = build_layerwise_cache_layout(
+                    self.num_layers,
+                    vllm_config.kv_transfer_config.kv_connector_extra_config,
+                ).has_layer_reuse
         self.model_name = model_config.model.split("/")[-1]
 
         # Keep this in sync with pool_worker.py because it affects GVA allocation size.
@@ -558,6 +578,12 @@ class KVPoolScheduler:
             return 0, False
 
         store_skip_tokens = num_external_hit_tokens
+        if self.use_layerwise and self.use_eagle:
+            # TODO(lf): Support loading the trailing block as dirty data.
+            num_external_hit_tokens = max(
+                num_computed_tokens,
+                num_external_hit_tokens - self.lcm_block_size,
+            )
         if num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
 
@@ -577,7 +603,7 @@ class KVPoolScheduler:
         # In layerwise mode, even when vLLM has local cached tokens, we still
         # need to load KV cache from the pool because layerwise transfer loads
         # per-layer data that may not be in HBM.
-        force_layerwise_load = self.use_layerwise and num_external_hit_tokens > 0
+        force_layerwise_load = self.use_layerwise and store_skip_tokens > 0
         if need_to_allocate <= 0 and not force_layerwise_load:
             return 0, False
 
@@ -624,8 +650,9 @@ class KVPoolScheduler:
 
         if num_external_tokens == 0:
             # No need to load anything
-            self.load_specs[request.request_id].can_load = (
-                self.use_layerwise and self.load_specs[request.request_id].kvpool_cached_tokens > 0
+            load_spec = self.load_specs[request.request_id]
+            self.load_specs[request.request_id].can_load = self.use_layerwise and (
+                load_spec.kvpool_cached_tokens > 0 or bool(load_spec.kvpool_store_skip_tokens)
             )
             logger.debug(
                 "KV pool load spec updated req=%s because num_external_tokens=0 "
@@ -716,6 +743,7 @@ class KVPoolScheduler:
             original_block_size=self.original_block_size,
             kv_cache_group_families=self.kv_cache_group_families,
             save_partial_block=self.layerwise_offload,
+            hash_block_size=self.hash_block_size,
         )
 
     def _process_new_request(
@@ -925,6 +953,7 @@ class KVPoolScheduler:
             discard_partial_chunks=self._discard_partial_chunks,
             original_block_size=self.original_block_size,
             kv_cache_group_families=self.kv_cache_group_families,
+            hash_block_size=self.hash_block_size,
         )
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:

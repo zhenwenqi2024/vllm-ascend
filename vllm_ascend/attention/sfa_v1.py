@@ -1975,9 +1975,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert k_li is not None
                 k_li = self._get_full_kv(k_li, attn_metadata)
 
-        if kv_cache is not None and self.is_kv_producer:
-            attn_metadata.reshape_cache_event = torch.npu.Event()
-
         if kv_cache is not None and self.has_indexer:
             assert k_li is not None
             use_li_c8_reshape_optim = self._use_li_c8_reshape_optim()
@@ -2017,6 +2014,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                             slot_mapping.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
+        # Notify for every layer that wrote the cache, not just indexer layers:
+        # by this point all of the layer's KV (main + indexer) has been
+        # scattered, so the connector can dispatch the PD pull immediately.
+        if kv_cache is not None:
             notify_kv_cache_written(self.layer_name or "")
 
         if self.enable_dsa_cp and attn_metadata.dsa_cp_context is not None:

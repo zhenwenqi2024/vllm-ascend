@@ -60,11 +60,13 @@ class LayerBatchBuilder:
         )
         group_block_stride = token_database.group_block_stride.get(group_id, token_database.group_block_len[group_id])
         self._block_stride_np = np.asarray(group_block_stride, dtype=np.int64)
-        # group_block_len[group_id] / kv_caches_base_addr[group_id] are laid out flat as
-        # [layer0_caches..., layer1_caches..., ...]; the per-layer stride is the
-        # total length divided by the number of layers (mirrors
-        # ChunkedTokenDatabase caches_per_layer computation).
-        self._caches_per_layer = max(1, self._block_len_np.shape[0] // max(1, num_layers))
+        layer_cache_entry_offsets = token_database.group_layer_cache_entry_offsets.get(group_id)
+        if layer_cache_entry_offsets is None:
+            caches_per_layer = max(1, self._block_len_np.shape[0] // max(1, num_layers))
+            layer_cache_entry_offsets = [
+                min(layer * caches_per_layer, self._block_len_np.shape[0]) for layer in range(num_layers + 1)
+            ]
+        self._layer_cache_entry_offsets_np = np.asarray(layer_cache_entry_offsets, dtype=np.int64)
         self._block_ids_buf: np.ndarray | None = None
         self._block_gvas_buf: np.ndarray | None = None
 
@@ -103,20 +105,16 @@ class LayerBatchBuilder:
         base_gvas_arr: np.ndarray,
         layer_id: int,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        caches_per_layer = self._caches_per_layer
-        # group_* arrays are laid out flat as [layer0_caches..., layer1_caches...];
-        # slice the per-layer window for ``layer_id``. Using the full length as the
-        # stride (the old behaviour) overshoots for layer_id >= 1 and yields empty
-        # slices -> broadcast errors.
-        base_offset = layer_id * caches_per_layer
-        layer_base_addrs = self._kv_caches_base_addr_np[base_offset : base_offset + caches_per_layer]
-        layer_block_len = self._block_len_np[base_offset : base_offset + caches_per_layer]
-        layer_block_stride = self._block_stride_np[base_offset : base_offset + caches_per_layer]
+        base_offset = int(self._layer_cache_entry_offsets_np[layer_id])
+        end_offset = int(self._layer_cache_entry_offsets_np[layer_id + 1])
+        layer_base_addrs = self._kv_caches_base_addr_np[base_offset:end_offset]
+        layer_block_len = self._block_len_np[base_offset:end_offset]
+        layer_block_stride = self._block_stride_np[base_offset:end_offset]
         # Per-cache inner offsets within one layer's page: [0, len0, len0+len1, ...].
         layer_inner_offsets = np.concatenate(
             (np.zeros(1, dtype=np.int64), np.cumsum(layer_block_len[:-1], dtype=np.int64))
         )
-        rank_layer_offset = layer_id * self.page_size_bytes
+        rank_layer_offset = int(self._block_len_np[:base_offset].sum())
         if base_gvas_arr.size > 0 and np.any(base_gvas_arr <= 0):
             zero_count = int(np.sum(base_gvas_arr <= 0))
             logger.warning(
@@ -132,7 +130,7 @@ class LayerBatchBuilder:
             "base_gvas=%s",
             layer_id,
             self.page_size_bytes,
-            caches_per_layer,
+            end_offset - base_offset,
             rank_layer_offset,
             layer_block_len.tolist(),
             layer_inner_offsets.tolist(),
@@ -242,11 +240,11 @@ class LayerBatchBuilder:
 
             if block_range.partial_block_index is not None:
                 partial_block_gva = None
-                partial_gvas_by_group = (
-                    request.partial_save_gvas_by_group if is_save else request.partial_load_gvas_by_group
+                partial_gva_per_group = (
+                    request.partial_save_gva_per_group if is_save else request.partial_load_gva_per_group
                 )
-                if task.group_id < len(partial_gvas_by_group):
-                    partial_block_gva = partial_gvas_by_group[task.group_id]
+                if task.group_id < len(partial_gva_per_group):
+                    partial_block_gva = partial_gva_per_group[task.group_id]
                 if partial_block_gva is None:
                     partial_block_gva = request.last_block_gva
                 assert partial_block_gva is not None
@@ -1486,7 +1484,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
         group_builders: list[LayerBatchBuilder] | None = None,
-        layerwise_reuse_waiter: Callable[[int], None] | None = None,
+        external_slot_release_waiter: Callable[[int], None] | None = None,
         save_failure_checker: Callable[[], None] | None = None,
     ):
         super().__init__(
@@ -1507,7 +1505,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.h2d_stagger_us = h2d_stagger_us
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
-        self.layerwise_reuse_waiter = layerwise_reuse_waiter
+        self.external_slot_release_waiter = external_slot_release_waiter
         self.save_failure_checker = save_failure_checker
         self.group_builders: list[LayerBatchBuilder] | None = group_builders
         if group_builders is not None:
@@ -1572,8 +1570,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.layer_save_finished_events[wait_for_save].clear()
 
         if len(transfer_tasks) == 0:
-            if self.layerwise_reuse_waiter is not None:
-                self.layerwise_reuse_waiter(layer_id)
+            if self.external_slot_release_waiter is not None:
+                self.external_slot_release_waiter(layer_id)
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug("Layer load event set: layer %d", layer_id)
             self.layer_load_finished_events[layer_id].set()
@@ -1593,8 +1591,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 task_metas.append((task, req_meta))
 
         if not task_metas:
-            if self.layerwise_reuse_waiter is not None:
-                self.layerwise_reuse_waiter(layer_id)
+            if self.external_slot_release_waiter is not None:
+                self.external_slot_release_waiter(layer_id)
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug("Layer load event set: layer %d", layer_id)
             self.layer_load_finished_events[layer_id].set()
@@ -1626,8 +1624,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         gvas_array = np.concatenate(all_gvas) if len(all_gvas) > 1 else all_gvas[0]
         addr_array = np.concatenate(all_addrs) if len(all_addrs) > 1 else all_addrs[0]
         size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
-        if self.layerwise_reuse_waiter is not None:
-            self.layerwise_reuse_waiter(layer_id)
+        if self.external_slot_release_waiter is not None:
+            self.external_slot_release_waiter(layer_id)
         res = self._batch_copy_with_limits(
             gvas_array,
             addr_array,
