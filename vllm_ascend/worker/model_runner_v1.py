@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation import breakable_cudagraph
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -2571,6 +2572,7 @@ class NPUModelRunner(GPUModelRunner):
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
 
         (
+            num_nans_in_logits,
             logprobs_lists,
             valid_sampled_token_ids,
             prompt_logprobs_dict,
@@ -2632,6 +2634,7 @@ class NPUModelRunner(GPUModelRunner):
             kv_connector_output=kv_connector_output,
             pooler_output=[],
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+            num_nans_in_logits=num_nans_in_logits,
             cudagraph_stats=cudagraph_stats,
             routed_experts=None,
         )
@@ -2747,6 +2750,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens: int,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> tuple[
+        dict[str, int],
         LogprobsLists | None,
         list[list[int]],
         dict[str, LogprobsTensors | None],
@@ -2754,6 +2758,10 @@ class NPUModelRunner(GPUModelRunner):
         dict[str, int],
         list[int],
     ]:
+        num_nans_in_logits: dict[str, int] = {}
+        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+            num_nans_in_logits = self._get_nans_in_logits(logits)
+
         # TODO: implement PR 28597 from vllm
         discard_sampled_tokens_req_indices = self.discard_request_indices.np[: self.num_discarded_requests]
         for i in discard_sampled_tokens_req_indices:
@@ -2868,6 +2876,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         return (
+            num_nans_in_logits,
             logprobs_lists,
             valid_sampled_token_ids,
             prompt_logprobs_dict,
