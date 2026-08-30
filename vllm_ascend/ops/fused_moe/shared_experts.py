@@ -153,7 +153,19 @@ class AscendSharedExperts:
         return shared_gate_up
 
     def part2(self, hidden_states: torch.Tensor, shared_gate_up: torch.Tensor):
-        shared_act = self.layer.act_fn(shared_gate_up)  # type: ignore
+        shared_act = self._activate(shared_gate_up)
+        return self._down_project(hidden_states, shared_act)
+
+    def _activate(self, shared_gate_up: torch.Tensor) -> torch.Tensor:
+        """Run the Vector stage between the two shared-expert projections."""
+        return self.layer.act_fn(shared_gate_up)  # type: ignore
+
+    def _down_project(
+        self,
+        hidden_states: torch.Tensor,
+        shared_act: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the second Cube stage and the optional output gate."""
         shared_out, _ = self.layer.down_proj(shared_act)  # type: ignore
 
         # Qwen3-Next specific gating mechanism
@@ -425,6 +437,23 @@ class AscendSharedExperts:
             "router_output_ready",
         )
         gate_up = self.part1(hidden_states)
+
+        if self.multistream_overlap:
+            # CV parallelism: overlap the shared-expert Vector activation
+            # with the routed-expert GMM2 Cube work.  Keep both projections
+            # behind their communication windows so two Cube-heavy kernels
+            # are not deliberately launched at the same milestone.
+            self._wait_for_milestone(
+                milestones.routed_gmm2_start,
+                "routed_gmm2_start",
+            )
+            shared_act = self._activate(gate_up)
+            self._wait_for_milestone(
+                down_projection_ready,
+                down_projection_milestone,
+            )
+            return self._down_project(hidden_states, shared_act)
+
         self._wait_for_milestone(
             down_projection_ready,
             down_projection_milestone,
