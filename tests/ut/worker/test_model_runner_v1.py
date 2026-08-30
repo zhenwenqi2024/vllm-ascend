@@ -1601,9 +1601,7 @@ class TestNPUModelRunnerNaNDetection(unittest.TestCase):
         runner._get_nans_in_logits = MagicMock()
         scheduler_output, sampler_output, hidden_states = self._make_inputs(num_reqs=2)
 
-        result = runner._bookkeeping_sync(
-            scheduler_output, sampler_output, torch.randn(2, 8), hidden_states, 2, None
-        )
+        result = runner._bookkeeping_sync(scheduler_output, sampler_output, torch.randn(2, 8), hidden_states, 2, None)
 
         self.assertEqual(result[0], {})
         runner._get_nans_in_logits.assert_not_called()
