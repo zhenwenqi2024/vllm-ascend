@@ -428,6 +428,7 @@ class AscendSharedExperts:
             "router_output_ready",
         )
         gate_up = self.part1(hidden_states)
+
         self._wait_for_milestone(
             milestones.routed_gmm2_start,
             "routed_gmm2_start",

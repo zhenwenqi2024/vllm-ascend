@@ -1102,11 +1102,15 @@ def test_w4a8_mxfp_gate_up_waits_for_router_output(monkeypatch):
     )
 
 
-def test_linear_wrapper_gate_up_waits_for_router_output(monkeypatch):
+def test_linear_wrapper_uses_cv_parallel_milestones(monkeypatch):
+    activation = MagicMock()
+    down_proj = MagicMock()
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
     shared_experts.layer = SimpleNamespace(
         gate_up_proj=SimpleNamespace(),
-        down_proj=SimpleNamespace(),
+        act_fn=activation,
+        down_proj=down_proj,
+        expert_gate=None,
     )
     shared_experts.multistream_overlap = True
     shared_experts.quant_type = QuantType.NONE
@@ -1114,13 +1118,16 @@ def test_linear_wrapper_gate_up_waits_for_router_output(monkeypatch):
     shared_experts.parallel_mode = MagicMock(return_value=SharedExpertParallelMode.TENSOR_PARALLEL)
     hidden_states = torch.randn(2, 4)
     part1_out = torch.randn(2, 8)
+    shared_act = torch.randn(2, 4)
     expected = torch.randn(2, 4)
     shared_experts.part1 = MagicMock(return_value=part1_out)
-    shared_experts.part2 = MagicMock(return_value=expected)
+    activation.return_value = shared_act
+    down_proj.return_value = (expected, None)
     milestones = RoutedMoEMilestones(
         shared_input_ready=MagicMock(),
         router_output_ready=MagicMock(),
         routed_dispatch_start=MagicMock(),
+        routed_gmm2_start=MagicMock(),
         routed_combine_start=MagicMock(),
     )
     auxiliary_stream = MagicMock()
@@ -1136,12 +1143,18 @@ def test_linear_wrapper_gate_up_waits_for_router_output(monkeypatch):
     )
 
     assert output is expected
-    auxiliary_stream.wait_event.assert_any_call(milestones.router_output_ready)
+    assert auxiliary_stream.wait_event.call_args_list == [
+        call(milestones.shared_input_ready),
+        call(milestones.router_output_ready),
+        call(milestones.routed_gmm2_start),
+        call(milestones.routed_combine_start),
+    ]
     assert not any(
         call.args == (milestones.routed_dispatch_start,) for call in auxiliary_stream.wait_event.call_args_list
     )
     shared_experts.part1.assert_called_once_with(hidden_states)
-    shared_experts.part2.assert_called_once_with(hidden_states, part1_out)
+    activation.assert_called_once_with(part1_out)
+    down_proj.assert_called_once_with(shared_act)
 
 
 @pytest.mark.parametrize(
@@ -1322,8 +1335,8 @@ def test_sp_multistream_down_projection_and_reduce_scatter_wait_for_routed_final
     shared_experts.parallel_mode = MagicMock(return_value=SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY)
     hidden_states = torch.randn(4, 4)
     part1_out = torch.randn(4, 8)
-    shared_act = torch.randn(4, 4)
     shared_out = torch.randn(4, 4)
+    shared_act = torch.randn(4, 4)
     reduced_out = torch.randn(2, 4)
     shared_experts.part1 = MagicMock(return_value=part1_out)
     shared_experts.apply_activation = MagicMock(return_value=shared_act)
