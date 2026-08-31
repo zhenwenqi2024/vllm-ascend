@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
@@ -426,7 +426,10 @@ def test_unquantized_shared_situ_uses_split_bf16_path(monkeypatch):
     runner._shared_experts_part1 = MagicMock(return_value=gate_up)
     runner._shared_experts_part2 = MagicMock(return_value=down_out)
     runner.quant_type = QuantType.W4A8MXFP
-    runner.multistream_overlap_shared_expert = False
+    runner.multistream_overlap_shared_expert = True
+    main_stream = MagicMock()
+    auxiliary_stream = MagicMock()
+    record_stream = MagicMock()
     events = fused_moe_module.FusedMoEEvents(
         before_routed_experts=MagicMock(),
         before_dispatch=MagicMock(),
@@ -436,12 +439,17 @@ def test_unquantized_shared_situ_uses_split_bf16_path(monkeypatch):
 
     monkeypatch.setattr(fused_moe_module, "npu_stream_switch", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(fused_moe_module, "shared_expert_dp_enabled", lambda: True)
-    monkeypatch.setattr(fused_moe_module, "shared_experts_calculation_stream", MagicMock())
+    monkeypatch.setattr(
+        fused_moe_module,
+        "shared_experts_calculation_stream",
+        lambda: auxiliary_stream,
+    )
     monkeypatch.setattr(
         fused_moe_module.torch.npu,
         "current_stream",
-        MagicMock(return_value=MagicMock()),
+        MagicMock(return_value=main_stream),
     )
+    monkeypatch.setattr(torch.Tensor, "record_stream", record_stream)
     monkeypatch.setattr(
         fused_moe_module,
         "_EXTRA_CTX",
@@ -454,6 +462,8 @@ def test_unquantized_shared_situ_uses_split_bf16_path(monkeypatch):
     output = runner._forward_shared_experts(hidden_states, events)
 
     assert output is down_out
+    assert record_stream.call_args_list == [call(auxiliary_stream), call(main_stream)]
+    main_stream.wait_stream.assert_called_once_with(auxiliary_stream)
     runner._shared_experts_part1.assert_called_once_with(hidden_states)
     runner._shared_experts_part2.assert_called_once_with(hidden_states, gate_up)
 
