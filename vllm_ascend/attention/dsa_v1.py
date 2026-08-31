@@ -1898,6 +1898,7 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         e_q_quant_done = main_stream.record_event()
 
+        hidden_states.record_stream(aux_stream)
         with npu_stream_switch(aux_stream, enabled=True):
             torch.npu.current_stream().wait_event(e_q_quant_done)
             kv_quant, kv_pertoken_scale = self.cv_wkv.quantize(hidden_states)
@@ -2188,6 +2189,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 with npu_stream_switch(aux_stream, enabled=True):
                     torch.npu.current_stream().wait_event(e_compressed_kv_done)
                     weights_proj_output = self.weights_proj(hidden_states)
+                    weights_proj_output.record_stream(main_stream)
                 # Main stream: q_quant (between compressed_kv and kv_scatter)
                 q_quant, q_scale = DeviceOperator.indexer_quantize_query(indexer_q)
 
@@ -2486,6 +2488,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 with npu_stream_switch(aux_stream, enabled=True):
                     torch.npu.current_stream().wait_event(e_compressed_kv_done)
                     weights_proj_output = self.weights_proj(hidden_states)
+                    weights_proj_output.record_stream(main_stream)
                 # Main stream: q_quant (between compressed_kv and kv_scatter)
                 q_quant, q_scale = DeviceOperator.indexer_quantize_query(indexer_q)
 
@@ -2925,6 +2928,7 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         # Aux: kv_quant + scatter_k_cache (parallel with main matmul + rope)
         if kv is not None:
+            kv.record_stream(aux_stream)
             with npu_stream_switch(aux_stream, enabled=True):
                 torch.npu.current_stream().wait_event(e_kv_ready)
                 kv, kv_scale = DeviceOperator.indexer_quant_scatter_part1(
