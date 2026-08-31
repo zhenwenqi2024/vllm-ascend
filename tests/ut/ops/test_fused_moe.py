@@ -15,6 +15,8 @@
 import ast
 import inspect
 import textwrap
+from collections import Counter
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TypedDict
 from unittest.mock import MagicMock, patch
@@ -323,6 +325,18 @@ def _method_uses_super(method) -> bool:
     return any(
         isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "super"
         for node in ast.walk(tree)
+    )
+
+
+def _record_stream_targets(owner: type | ast.ClassDef) -> Counter[tuple[str, str]]:
+    tree = owner if isinstance(owner, ast.ClassDef) else ast.parse(textwrap.dedent(inspect.getsource(owner)))
+    return Counter(
+        (ast.unparse(node.func.value), ast.unparse(node.args[0]))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "record_stream"
+        and len(node.args) == 1
     )
 
 
@@ -875,6 +889,30 @@ class TestAscendFusedMoE:
 
 
 class TestAscendFusedMoESharedExperts:
+    def test_legacy_cross_stream_lifetime_registrations(self):
+        assert _record_stream_targets(AscendFusedMoE) == Counter(
+            {
+                ("hidden_states", "AscendFusedMoE.gate_stream"): 1,
+                ("router_logits", "AscendFusedMoE.gate_stream"): 1,
+                ("hidden_states", "shared_experts_calculation_stream()"): 1,
+                ("shared_out", "main_stream"): 2,
+            }
+        )
+
+    def test_compat_runner_cross_stream_lifetime_registrations(self):
+        tree = ast.parse(Path(fused_moe_module.__file__).read_text(encoding="utf-8"))
+        owner = next(
+            node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "AscendMoERunner"
+        )
+        assert _record_stream_targets(owner) == Counter(
+            {
+                ("hidden_states", "AscendMoERunner.gate_stream"): 1,
+                ("router_logits", "AscendMoERunner.gate_stream"): 1,
+                ("hidden_states", "shared_experts_calculation_stream()"): 1,
+                ("shared_out", "main_stream"): 2,
+            }
+        )
+
     def test_properties_and_forward_delegate(self, monkeypatch):
         layer = AscendFusedMoE.__new__(AscendFusedMoE)
         if not hasattr(type(layer), "gate"):
