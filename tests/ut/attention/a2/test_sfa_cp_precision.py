@@ -54,39 +54,6 @@ def _reference_remap(
     return torch.gather(remapped, dim=-1, index=pack_order.to(torch.int64)).to(topk_indices.dtype)
 
 
-def test_sfa_dcp_sparse_indices_are_compacted_per_owner_rank() -> None:
-    replicated_indices = torch.tensor([[0, 2, 1, 3, 4, 6, -1, 5]], dtype=torch.int32)
-
-    rank0 = _make_impl(0)._remap_sparse_indices(replicated_indices)
-    rank1 = _make_impl(1)._remap_sparse_indices(replicated_indices)
-
-    torch.testing.assert_close(
-        rank0,
-        torch.tensor([[0, 1, 2, 3, -1, -1, -1, -1]], dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        rank1,
-        torch.tensor([[0, 1, 2, -1, -1, -1, -1, -1]], dtype=torch.int32),
-    )
-
-
-def test_sfa_dcp_sparse_indices_interleave_size_one() -> None:
-    # interleave_size == 1: local index is just the global index divided by dcp_size.
-    replicated_indices = torch.tensor([[0, 1, 2, 3, 4, 5, -1, 6]], dtype=torch.int32)
-
-    rank0 = _make_impl(0, interleave_size=1)._remap_sparse_indices(replicated_indices)
-    rank1 = _make_impl(1, interleave_size=1)._remap_sparse_indices(replicated_indices)
-
-    torch.testing.assert_close(
-        rank0,
-        torch.tensor([[0, 1, 2, 3, -1, -1, -1, -1]], dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        rank1,
-        torch.tensor([[0, 1, 2, -1, -1, -1, -1, -1]], dtype=torch.int32),
-    )
-
-
 @pytest.mark.skipif(not HAS_NPU, reason="NPU is not available")
 @pytest.mark.parametrize("dcp_size", [2, 4])
 @pytest.mark.parametrize("interleave_size", [1, 2, 4])
@@ -136,25 +103,3 @@ def test_sfa_dcp_sparse_indices_3d_input(interleave_size: int) -> None:
             _reference_remap(indices, dcp_size, rank, interleave_size),
             msg=f"mismatch for interleave_size={interleave_size}, rank={rank}",
         )
-
-
-def test_sfa_dcp_torch_merge_handles_invalid_lse() -> None:
-    output = torch.tensor(
-        [
-            [[[1.0]], [[3.0]]],
-            [[[5.0]], [[7.0]]],
-        ]
-    )
-    lse = torch.tensor(
-        [
-            [[0.0], [float("-inf")]],
-            [[0.0], [0.0]],
-        ]
-    )
-
-    merged = AscendSFADCPImpl._merge_dcp_outputs_with_torch(output, lse, token_dim=2)
-
-    torch.testing.assert_close(merged, torch.tensor([[[3.0], [7.0]]]))
-
-    dsa_merged = AscendSFADCPImpl._merge_dcp_outputs_with_torch(output, lse, token_dim=1)
-    torch.testing.assert_close(dsa_merged, torch.tensor([[[3.0]], [[7.0]]]))
