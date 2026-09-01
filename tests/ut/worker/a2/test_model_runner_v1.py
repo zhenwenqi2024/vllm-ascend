@@ -29,7 +29,8 @@ class TestDummyRunSlotInvalidation(unittest.TestCase):
         runner.uniform_decode_query_len = 1
         runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=8, max_num_seqs=8)
         runner.dynamic_eplb = False
-        runner.use_dcp = False
+        # use_dcp is a read-only property derived from dcp_size.
+        runner.dcp_size = 1
         runner.speculative_config = None
         runner.use_compress = True
         runner._has_gdn = False
