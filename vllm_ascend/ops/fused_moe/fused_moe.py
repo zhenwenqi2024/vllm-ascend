@@ -602,9 +602,6 @@ else:
                 assert fc3_context is not None
                 assert AscendMoERunner.gate_stream is not None
                 AscendMoERunner.gate_stream.wait_stream(torch.npu.current_stream())
-                main_stream = torch.npu.current_stream()
-                hidden_states.record_stream(AscendMoERunner.gate_stream)
-                router_logits.record_stream(AscendMoERunner.gate_stream)
                 with npu_stream_switch(AscendMoERunner.gate_stream, enabled=self.multistream_overlap_gate):
                     # share_expert
                     assert fc3_context.shared_experts is not None
@@ -617,7 +614,6 @@ else:
                     ):
                         shared_out = tensor_model_parallel_all_reduce(shared_out)
                     set_flash_common3_context(shared_out=shared_out)
-                    shared_out.record_stream(main_stream)
                     input_ids = getattr(get_forward_context(), "input_ids", None)
 
                     topk_weights, topk_ids = select_experts(
@@ -735,8 +731,6 @@ else:
                 if evt is not None:
                     torch.npu.current_stream().wait_event(evt)
 
-            main_stream = torch.npu.current_stream()
-            hidden_states.record_stream(shared_experts_calculation_stream())
             with npu_stream_switch(shared_experts_calculation_stream(), enabled=self.multistream_overlap_shared_expert):
                 # Only used for int quantization
                 has_quantized_shared = hasattr(self._shared_experts.gate_up_proj, "weight_scale") and hasattr(
@@ -821,8 +815,6 @@ else:
                     # communication.
                     maybe_wait_event(fused_moe_evts.before_combine)
                     shared_out = self._shared_experts_part2(hidden_states, part1_out)
-
-                shared_out.record_stream(main_stream)
 
             # Make sure the default stream waits for the shared experts stream to
             # finish.
