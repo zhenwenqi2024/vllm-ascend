@@ -314,7 +314,8 @@ class AscendConfig:
                 "lmhead_tensor_parallel_size": 0,
                 "embedding_tensor_parallel_size": 0,
                 "mlp_tensor_parallel_size": 0,
-                "olora_tensor_parallel_size": 0
+                "olora_tensor_parallel_size": 0,
+                "kda_tensor_parallel_size": 0
             },
             "scheduler_config": {
                 "enable_balance_scheduling": false,
@@ -920,6 +921,7 @@ class FinegrainedTPConfig:
     embedding_tensor_parallel_size: int = 0
     mlp_tensor_parallel_size: int = 0
     olora_tensor_parallel_size: int = 0
+    kda_tensor_parallel_size: int = 0
 
     @model_validator(mode="after")
     def _validate_sizes(self):
@@ -929,6 +931,7 @@ class FinegrainedTPConfig:
             "embedding_tensor_parallel_size",
             "mlp_tensor_parallel_size",
             "olora_tensor_parallel_size",
+            "kda_tensor_parallel_size",
         )
         for field_name in size_fields:
             value = getattr(self, field_name)
@@ -979,12 +982,20 @@ class FinegrainedTPConfig:
             enabled_configs.append(f"embedding_tensor_parallel_size={self.embedding_tensor_parallel_size}")
         if self.mlp_tensor_parallel_size > 0:
             enabled_configs.append(f"mlp_tensor_parallel_size={self.mlp_tensor_parallel_size}")
+        if self.kda_tensor_parallel_size > 0:
+            enabled_configs.append(f"kda_tensor_parallel_size={self.kda_tensor_parallel_size}")
+            if vc.parallel_config.tensor_parallel_size > 1:
+                raise AssertionError(
+                    "kda_tensor_parallel_size currently requires tensor_parallel_size == 1, got "
+                    f"{vc.parallel_config.tensor_parallel_size}."
+                )
         module_tp_sizes = [
             self.oproj_tensor_parallel_size,
             self.lmhead_tensor_parallel_size,
             self.embedding_tensor_parallel_size,
             self.mlp_tensor_parallel_size,
             self.olora_tensor_parallel_size,
+            self.kda_tensor_parallel_size,
         ]
         for module_tp_size in module_tp_sizes:
             # If it is a dense model, then expert parallel is not needed,

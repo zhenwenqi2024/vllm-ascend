@@ -95,6 +95,7 @@ The details of each configuration option are as follows:
 | ---- | ---- | ------- | ----------- |
 | `lmhead_tensor_parallel_size`    | int  | `0` | The custom tensor parallel size of lm_head.    |
 | `oproj_tensor_parallel_size`     | int  | `0` | The custom tensor parallel size of o_proj.     |
+| `kda_tensor_parallel_size`       | int  | `0` | Experimental Kimi K3 KDA tensor-parallel group size along the DP axis. |
 | `embedding_tensor_parallel_size` | int  | `0` | The custom tensor parallel size of embedding. |
 | `mlp_tensor_parallel_size`       | int  | `0` | The custom tensor parallel size of mlp.       |
 

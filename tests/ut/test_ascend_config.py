@@ -162,6 +162,7 @@ class TestAscendConfig(TestBase):
 
         self.assertFalse(config.xlite_graph_config.enabled)
         self.assertEqual(config.finegrained_tp_config.oproj_tensor_parallel_size, 0)
+        self.assertEqual(config.finegrained_tp_config.kda_tensor_parallel_size, 0)
         self.assertFalse(config.scheduler_config.short_request_first_config.enabled)
         self.assertFalse(config.rl_config.enabled)
 

@@ -5,12 +5,14 @@ import pytest
 from vllm.config import ParallelConfig
 
 from vllm_ascend.distributed.parallel_state import (
+    _KDA_TP,
     _LMTP,
     _MC2,
     _OTP,
     _P_TP,
     destroy_ascend_model_parallel,
     get_global_rank,
+    get_kda_tp_group,
     get_lmhead_tp_group,
     get_mc2_group,
     get_otp_group,
@@ -47,6 +49,7 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
     mock_ascend_config.finegrained_tp_config.oproj_tensor_parallel_size = 2
     mock_ascend_config.finegrained_tp_config.embedding_tensor_parallel_size = 2
     mock_ascend_config.finegrained_tp_config.mlp_tensor_parallel_size = 2
+    mock_ascend_config.finegrained_tp_config.kda_tensor_parallel_size = 2
     mock_ascend_config.pd_tp_ratio = 2
     mock_ascend_config.num_head_replica = 0
     mock_ascend_config.pd_head_ratio = 2
@@ -64,16 +67,19 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
 
         mc2_group = get_mc2_group()
         lmheadtp_group = get_lmhead_tp_group()
+        kdatp_group = get_kda_tp_group()
         otp_group = get_otp_group()
         p_tp_group = get_p_tp_group()
         assert mc2_group is not None
         assert otp_group is not None
         assert lmheadtp_group is not None
+        assert kdatp_group is not None
         assert p_tp_group is not None
 
         destroy_ascend_model_parallel()
         assert _MC2 is None
         assert _LMTP is None
+        assert _KDA_TP is None
         assert _OTP is None
         assert _P_TP is None
 

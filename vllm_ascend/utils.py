@@ -806,6 +806,10 @@ def mlp_tp_enable() -> bool:
     return get_ascend_config().finegrained_tp_config.mlp_tensor_parallel_size > 0
 
 
+def kda_tp_enable() -> bool:
+    return get_ascend_config().finegrained_tp_config.kda_tensor_parallel_size > 0
+
+
 def enable_sp(vllm_config=None) -> bool:
     if vllm_config is None:
         try:
