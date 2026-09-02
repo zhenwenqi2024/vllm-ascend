@@ -994,11 +994,6 @@ class FinegrainedTPConfig:
                 raise AssertionError(
                     "kda_tensor_parallel_size is only supported for Kimi K3."
                 )
-            if not vc.model_config.enforce_eager:
-                raise AssertionError(
-                    "kda_tensor_parallel_size currently requires enforce_eager "
-                    "because DP token counts are exchanged dynamically."
-                )
         module_tp_sizes = [
             self.oproj_tensor_parallel_size,
             self.lmhead_tensor_parallel_size,

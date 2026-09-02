@@ -841,7 +841,7 @@ class TestSubconfigPydanticTypeValidation(TestBase):
         )
         cfg._validate_preconditions(vllm_config)
 
-    def test_kda_weight_tp_rejects_graph_mode(self):
+    def test_kda_weight_tp_accepts_graph_mode(self):
         cfg = FinegrainedTPConfig(kda_tensor_parallel_size=2)
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
@@ -854,8 +854,7 @@ class TestSubconfigPydanticTypeValidation(TestBase):
                 data_parallel_size=2,
             ),
         )
-        with self.assertRaisesRegex(AssertionError, "requires enforce_eager"):
-            cfg._validate_preconditions(vllm_config)
+        cfg._validate_preconditions(vllm_config)
 
     def test_eplb_config_int_field_lax(self):
         cfg = EplbConfig(eplb_policy_type="2")

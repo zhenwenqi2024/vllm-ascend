@@ -20,21 +20,25 @@ DP-local input -> distributed weight shards -> DP-owner output -> DP-local KDA s
 }
 ```
 
-The topology requires standard tensor parallel size one, eager execution, and
+The topology requires standard tensor parallel size one and
 `kda_tensor_parallel_size` dividing the data-parallel size. KDA and MLA state
-ownership is unchanged.
+ownership is unchanged. Eager and full-decode ACL graph execution share the
+same communication layout.
 
 ## Execution
 
-- Column-parallel projections gather padded DP token batches, calculate their
+- Before model execution, the model runner synchronizes the token count over
+  DP and pads every rank to the same token capacity. This also aligns graph
+  selection across ranks.
+- Column-parallel projections gather the uniformly padded DP token batches, calculate their
   local weight shard, and all-to-all the projection shards back to each request
   owner. Packed projections restore checkpoint partition order and retain only
   one copy of replicated `f_a` and alignment padding.
 - Row-parallel output projections split each owner's full attention result,
   all-to-all input shards to the weight owners, calculate partial outputs, and
   all-to-all the partial results back for summation by the request owner.
-- Uneven token counts across DP ranks are supported through a dynamically
-  exchanged token capacity.
+- Uneven DP workloads are represented by padding at the model-runner boundary;
+  no projection performs a token-count collective or device-to-host read.
 
 ## Sharded and replicated data
 
@@ -44,6 +48,6 @@ The KDA packed input projections, mixed-quantization QKV/gate projections,
 MLA KV cache, and attention metadata remain fully DP-local. Consequently no
 state index remapping or scheduler changes are required.
 
-The initial implementation is eager-only because reading uneven token counts
-introduces a device-to-host synchronization. ACL graph support requires a
-fixed-capacity exchange layout and is left for a follow-up.
+Full-decode ACL graphs capture fixed-shape all-gather and all-to-all operations.
+Prefill outside the graph uses the same DP-wide padded token shape. Future work
+can replace the two-way O-projection exchange with a fused GEMM/collective.

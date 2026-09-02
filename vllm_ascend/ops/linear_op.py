@@ -46,10 +46,6 @@ from vllm.distributed import split_tensor_along_last_dim
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import logger
 
-from vllm_ascend.distributed.hybrid_attention_parallel import (
-    gather_token_counts,
-    pad_tokens,
-)
 from vllm_ascend.distributed.parallel_state import (
     get_kda_tp_group,
     get_mlp_tp_group,
@@ -216,9 +212,8 @@ class AttentionWeightColumnParallelOp(CustomColumnParallelOp):
         return torch.cat(outputs, dim=-1)
 
     def apply_impl(self, input_: torch.Tensor):
-        counts, token_capacity = gather_token_counts(input_, self.comm_group)
-        padded = pad_tokens(input_, token_capacity)
-        gathered = self.comm_group.all_gather(padded, dim=0)
+        token_capacity = input_.shape[0]
+        gathered = self.comm_group.all_gather(input_, dim=0)
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
         local_output = self.quant_method.apply(self.layer, gathered, bias)
@@ -232,7 +227,6 @@ class AttentionWeightColumnParallelOp(CustomColumnParallelOp):
             group=self.comm_group.device_group,
         )
         output = self._restore_partition_order(received)
-        output = output[: counts[self.tp_rank]]
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -245,13 +239,11 @@ class AttentionWeightRowParallelOp(CustomRowParallelOp):
         return get_kda_tp_group()
 
     def apply_impl(self, input_: torch.Tensor):
-        counts, token_capacity = gather_token_counts(input_, self.comm_group)
+        token_capacity = input_.shape[0]
         input_shards = split_tensor_along_last_dim(
             input_, num_partitions=self.tp_size
         )
-        send = torch.stack(
-            [pad_tokens(shard.contiguous(), token_capacity) for shard in input_shards]
-        )
+        send = torch.stack([shard.contiguous() for shard in input_shards])
         received = torch.empty_like(send)
         dist.all_to_all_single(
             received,
@@ -269,7 +261,7 @@ class AttentionWeightRowParallelOp(CustomRowParallelOp):
             partial.contiguous(),
             group=self.comm_group.device_group,
         )
-        output = returned.sum(dim=0)[: counts[self.tp_rank]]
+        output = returned.sum(dim=0)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 

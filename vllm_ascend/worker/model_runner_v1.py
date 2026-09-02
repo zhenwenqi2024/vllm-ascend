@@ -182,6 +182,7 @@ from vllm_ascend.utils import (
     global_stream,
     is_hidden_state_cache_spec,
     is_score_encoder_cache_manager,
+    kda_tp_enable,
     kv_cache_spec_uses_sparse_sfa_c8,
     lmhead_tp_enable,
     oproj_tp_enable,
@@ -3030,6 +3031,7 @@ class NPUModelRunner(GPUModelRunner):
                 allow_dp_padding=((cudagraph_mode != CUDAGraphMode.NONE)
                                   or enable_sp(self.vllm_config)
                                   or oproj_tp_enable()
+                                  or kda_tp_enable()
                                   or embedding_tp_enable()),
             )
 
