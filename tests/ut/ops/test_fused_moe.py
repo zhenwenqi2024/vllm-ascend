@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -502,7 +502,16 @@ def test_local_shared_expert_dp_reduces_partial_routed_output(
         all_reduce.assert_not_called()
 
 
+def _disable_force_eplb(monkeypatch):
+    monkeypatch.setattr(
+        routed_experts_module,
+        "get_ascend_config",
+        lambda: SimpleNamespace(enable_force_eplb=False),
+    )
+
+
 def test_routed_experts_select_experts_validates_router_logits(monkeypatch):
+    _disable_force_eplb(monkeypatch)
     routed_experts = AscendRoutedExperts.__new__(AscendRoutedExperts)
     hidden_states = torch.randn(2, 4)
     router_logits = torch.randn(2, 3)
@@ -541,6 +550,7 @@ def _build_routing_replay_experts(router, log2phy):
 
 
 def test_routing_replay_captures_logical_ids_before_ascend_mapping(monkeypatch):
+    _disable_force_eplb(monkeypatch)
     router = AscendGroupedTopKRouter(
         top_k=2,
         global_num_experts=4,
@@ -575,6 +585,7 @@ def test_routing_replay_captures_logical_ids_before_ascend_mapping(monkeypatch):
 
 
 def test_routing_replay_disabled_keeps_ascend_routing_unchanged(monkeypatch):
+    _disable_force_eplb(monkeypatch)
     router = AscendGroupedTopKRouter(
         top_k=2,
         global_num_experts=4,
@@ -707,6 +718,7 @@ def test_hash_router_chunks_unaligned_input_ids_for_sequence_parallel(monkeypatc
 @pytest.mark.parametrize("is_sequence_parallel", [False, True])
 def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_event, v2_eplb, is_sequence_parallel):
     """Verify routed-expert forward preserves the current dispatch flow."""
+    _disable_force_eplb(monkeypatch)
     routed_experts = AscendRoutedExperts.__new__(AscendRoutedExperts)
     hidden_states = torch.randn(2, 4)
     prepared_hidden_states = torch.randn(2, 4)
@@ -1110,11 +1122,23 @@ def test_linear_wrapper_uses_cv_parallel_milestones(monkeypatch):
         routed_combine_start=MagicMock(),
     )
     auxiliary_stream = MagicMock()
+    main_stream = MagicMock()
+    active_stream = {"stream": main_stream}
+
+    @contextmanager
+    def switch_stream(stream, *, enabled):
+        previous_stream = active_stream["stream"]
+        if enabled:
+            active_stream["stream"] = stream
+        try:
+            yield
+        finally:
+            active_stream["stream"] = previous_stream
 
     monkeypatch.setattr(shared_experts_module, "has_lora", lambda _: False)
-    monkeypatch.setattr(shared_experts_module, "npu_stream_switch", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(shared_experts_module, "npu_stream_switch", switch_stream)
     monkeypatch.setattr(shared_experts_module, "shared_experts_calculation_stream", lambda: auxiliary_stream)
-    monkeypatch.setattr(shared_experts_module.torch.npu, "current_stream", lambda: auxiliary_stream)
+    monkeypatch.setattr(shared_experts_module.torch.npu, "current_stream", lambda: active_stream["stream"])
 
     output = shared_experts.forward(
         PreparedSharedExpertInput(hidden_states),
@@ -1128,6 +1152,7 @@ def test_linear_wrapper_uses_cv_parallel_milestones(monkeypatch):
         call(milestones.routed_gmm2_start),
         call(milestones.routed_combine_start),
     ]
+    main_stream.wait_event.assert_called_once_with(auxiliary_stream.record_event.return_value)
     assert not any(
         call.args == (milestones.routed_dispatch_start,) for call in auxiliary_stream.wait_event.call_args_list
     )
