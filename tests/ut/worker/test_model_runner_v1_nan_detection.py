@@ -18,6 +18,7 @@ class TestNPUModelRunnerNaNDetection(unittest.TestCase):
         runner.num_discarded_requests = 0
         runner.discard_request_indices = SimpleNamespace(np=np.array([], dtype=np.int64))
         runner.max_model_len = max_model_len
+        runner.num_spec_tokens = 0
         runner.requests = {f"req-{i}": SimpleNamespace(output_token_ids=[]) for i in range(num_reqs)}
         runner.input_batch = SimpleNamespace(
             req_ids=[f"req-{i}" for i in range(num_reqs)],
@@ -25,8 +26,8 @@ class TestNPUModelRunnerNaNDetection(unittest.TestCase):
             generators={},
             num_tokens_no_spec=[0] * num_reqs,
             num_tokens=[0] * num_reqs,
-            token_ids_cpu=torch.zeros(num_reqs, max_model_len, dtype=torch.long),
-            is_token_ids=torch.zeros(num_reqs, max_model_len, dtype=torch.bool),
+            token_ids_cpu=np.zeros((num_reqs, max_model_len), dtype=np.int64),
+            is_token_ids=np.zeros((num_reqs, max_model_len), dtype=np.bool_),
         )
         runner._to_list = lambda sampled_token_ids: sampled_token_ids.tolist()
         runner._get_prompt_logprobs_dict = lambda *args, **kwargs: {}
@@ -56,11 +57,12 @@ class TestNPUModelRunnerNaNDetection(unittest.TestCase):
 
         result = runner._bookkeeping_sync(scheduler_output, sampler_output, logits, hidden_states, 3, None)
 
-        self.assertEqual(len(result), 7)
+        self.assertEqual(len(result), 8)
         self.assertEqual(result[0], {"req-0": 2, "req-1": 0, "req-2": 3})
         self.assertIsNone(result[1])
-        self.assertEqual(result[2], [[1], [2], [3]])
-        self.assertEqual(result[4], ["req-0", "req-1", "req-2"])
+        self.assertIsNone(result[2])
+        self.assertEqual(result[3], [[1], [2], [3]])
+        self.assertEqual(result[5], ["req-0", "req-1", "req-2"])
 
     @patch("vllm_ascend.worker.model_runner_v1.envs.VLLM_COMPUTE_NANS_IN_LOGITS", False)
     def test_bookkeeping_sync_skips_nan_computation_when_disabled(self):
@@ -71,6 +73,30 @@ class TestNPUModelRunnerNaNDetection(unittest.TestCase):
         result = runner._bookkeeping_sync(scheduler_output, sampler_output, torch.randn(2, 8), hidden_states, 2, None)
 
         self.assertEqual(result[0], {})
+        self.assertIsNone(result[1])
+        runner._get_nans_in_logits.assert_not_called()
+
+    @patch(
+        "vllm_ascend.worker.model_runner_v1.envs.VLLM_COMPUTE_NANS_IN_LOGITS",
+        True,
+    )
+    def test_bookkeeping_sync_keeps_nan_counts_on_device_when_async(self):
+        runner = self._build_runner(num_reqs=3)
+        runner.use_async_scheduling = True
+        runner._get_nans_in_logits = MagicMock()
+        logits = torch.tensor(
+            [
+                [float("nan"), 1.0, float("nan")],
+                [1.0, 2.0, 3.0],
+                [float("nan"), float("nan"), float("nan")],
+            ]
+        )
+        scheduler_output, sampler_output, hidden_states = self._make_inputs(num_reqs=3)
+
+        result = runner._bookkeeping_sync(scheduler_output, sampler_output, logits, hidden_states, 3, None)
+
+        self.assertEqual(result[0], {})
+        torch.testing.assert_close(result[1], torch.tensor([2, 0, 3], dtype=result[1].dtype))
         runner._get_nans_in_logits.assert_not_called()
 
     @patch("vllm_ascend.worker.model_runner_v1.envs.VLLM_COMPUTE_NANS_IN_LOGITS", True)
