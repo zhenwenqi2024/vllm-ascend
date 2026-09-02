@@ -96,6 +96,7 @@ class TestNPUModelRunnerNaNDetection(unittest.TestCase):
         result = runner._bookkeeping_sync(scheduler_output, sampler_output, logits, hidden_states, 3, None)
 
         self.assertEqual(result[0], {})
+        self.assertEqual(result[1].dtype, torch.int32)
         torch.testing.assert_close(result[1], torch.tensor([2, 0, 3], dtype=result[1].dtype))
         runner._get_nans_in_logits.assert_not_called()
 
