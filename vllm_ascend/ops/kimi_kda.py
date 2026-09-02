@@ -15,7 +15,9 @@ from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
+    RowParallelLinear,
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.models.kimi_k3.nvidia.kda import (
@@ -27,8 +29,10 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend.distributed.parallel_state import get_kda_tp_group
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
+from vllm_ascend.utils import kda_tp_enable
 
 _KDA_CHUNK_SIZE = 64
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
@@ -79,6 +83,8 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         )
         super().__init__(config, vllm_config, prefix)
         self.uses_mixed_projection = uses_mixed_projection
+        if kda_tp_enable():
+            self._init_weight_only_parallel_projections(prefix, quant_config)
         if uses_mixed_projection:
             # vLLM 0.27 packs all KDA input projections into one linear.  A
             # QuaRot checkpoint instead stores q/k/v as W8A8 and keeps the
@@ -97,16 +103,31 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 self.num_heads,
             ]
             if self.in_proj_padding:
-                gate_output_sizes.append(self.in_proj_padding * self.tp_size)
+                gate_output_sizes.append(
+                    self.in_proj_padding
+                    * (
+                        get_kda_tp_group().world_size
+                        if kda_tp_enable()
+                        else self.tp_size
+                    )
+                )
             self.in_proj_gfab = _KimiGDNMergedColumnParallelLinear(
                 self.hidden_size,
                 gate_output_sizes,
                 replicated_shard_id=1,
-                tp_size=self.tp_size,
+                tp_size=(
+                    get_kda_tp_group().world_size
+                    if kda_tp_enable()
+                    else self.tp_size
+                ),
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.in_proj_gfab",
             )
+            if self.in_proj_padding:
+                self.in_proj_gfab.weight_only_replicated_output_shards = {
+                    len(gate_output_sizes) - 1
+                }
             if self.in_proj_padding:
                 self.in_proj_gfab.weight.data[-self.in_proj_padding :].zero_()
         # Upstream's FusedRMSNormGated constructor defaults to 1e-5, while
@@ -138,6 +159,50 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             return result
 
         self.conv1d.quant_method.process_weights_after_loading = process_weights_and_pack
+
+    def _init_weight_only_parallel_projections(self, prefix, quant_config) -> None:
+        """Shard large KDA matrices while leaving KDA state fully DP-local."""
+        weight_tp_size = get_kda_tp_group().world_size
+        qkvg_output_sizes = [self.projection_size] * 4
+        output_sizes = qkvg_output_sizes + [self.head_dim, self.num_heads]
+        local_output_size = (
+            4 * (self.projection_size // weight_tp_size)
+            + self.head_dim
+            + self.num_heads // weight_tp_size
+        )
+        weight_padding = -local_output_size % 16
+        if weight_padding:
+            output_sizes.append(weight_padding * weight_tp_size)
+        self.in_proj_padding = weight_padding
+        self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
+            self.hidden_size,
+            output_sizes,
+            replicated_shard_id=4,
+            tp_size=weight_tp_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.in_proj_qkvgfab",
+        )
+        if weight_padding:
+            self.in_proj_qkvgfab.weight_only_replicated_output_shards = {
+                len(output_sizes) - 1
+            }
+        if weight_padding:
+            self.in_proj_qkvgfab.weight.data[-weight_padding:].zero_()
+        self.f_b_proj = ColumnParallelLinear(
+            self.head_dim,
+            self.projection_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.f_b_proj",
+        )
+        self.o_proj = RowParallelLinear(
+            self.projection_size,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return AscendGDNAttentionBackend

@@ -908,7 +908,7 @@ class DynamicSpecConfig:
 class FinegrainedTPConfig:
     """Configuration Object for ``additional_config["finegrained_tp_config"]``.
 
-    Migrated to ``@config`` (pydantic dataclass). 5 int fields get lax coercion
+    Migrated to ``@config`` (pydantic dataclass). Integer fields get lax coercion
     ('2'→2). vllm_config-dependent preconditions (TP/eager/kv_consumer/is_moe/
     data_parallel divisibility) are validated in ``_validate_preconditions()``,
     a plain method invoked explicitly by ``init_ascend_config`` (Plan B:
@@ -988,6 +988,16 @@ class FinegrainedTPConfig:
                 raise AssertionError(
                     "kda_tensor_parallel_size currently requires tensor_parallel_size == 1, got "
                     f"{vc.parallel_config.tensor_parallel_size}."
+                )
+            hf_config = vc.model_config.hf_text_config
+            if getattr(hf_config, "model_type", "") != "kimi_linear":
+                raise AssertionError(
+                    "kda_tensor_parallel_size is only supported for Kimi K3."
+                )
+            if not vc.model_config.enforce_eager:
+                raise AssertionError(
+                    "kda_tensor_parallel_size currently requires enforce_eager "
+                    "because DP token counts are exchanged dynamically."
                 )
         module_tp_sizes = [
             self.oproj_tensor_parallel_size,

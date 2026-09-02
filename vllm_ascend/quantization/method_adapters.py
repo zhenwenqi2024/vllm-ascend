@@ -25,8 +25,12 @@ from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.parameter import BlockQuantScaleParameter, PerTensorScaleParameter
 from vllm.model_executor.utils import set_weight_attrs
 
-from vllm_ascend.distributed.parallel_state import get_mlp_tp_group, get_otp_group
-from vllm_ascend.utils import mlp_tp_enable, oproj_tp_enable
+from vllm_ascend.distributed.parallel_state import (
+    get_kda_tp_group,
+    get_mlp_tp_group,
+    get_otp_group,
+)
+from vllm_ascend.utils import kda_tp_enable, mlp_tp_enable, oproj_tp_enable
 
 from .methods import AscendAttentionScheme, AscendLinearScheme, AscendMoEScheme, is_mx_quant_type
 
@@ -171,7 +175,13 @@ class AscendLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if isinstance(layer, RowParallelLinear):
-            if layer.prefix.find("o_proj") != -1 and oproj_tp_enable():
+            if (
+                kda_tp_enable()
+                and ".self_attn." in layer.prefix
+                and "o_proj" in layer.prefix
+            ):
+                tp_rank = get_kda_tp_group().rank_in_group
+            elif layer.prefix.find("o_proj") != -1 and oproj_tp_enable():
                 tp_rank = get_otp_group().rank_in_group
             elif layer.prefix.find("down_proj") != -1 and mlp_tp_enable():
                 tp_rank = get_mlp_tp_group().rank_in_group

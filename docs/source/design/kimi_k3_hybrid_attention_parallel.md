@@ -1,13 +1,13 @@
-# Kimi K3 Hybrid Attention Parallel Prototype
+# Kimi K3 Weight-Only Attention Parallelism
 
 ## Goal
 
-This prototype keeps MLA request execution and latent KV cache data parallel,
-while preparing a fine-grained tensor-parallel group for KDA. The same existing
-fine-grained O-projection group can shard MLA `o_proj` weights.
+This feature keeps MLA and KDA execution, metadata, and state data parallel,
+while sharding the large KDA projections and MLA output projection over a
+fine-grained group formed along the DP axis.
 
 ```text
-DP-local MLA -> KDA group gather -> KDA head shards -> reduce-scatter -> DP-local output
+DP-local input -> distributed weight shards -> DP-owner output -> DP-local KDA state
 ```
 
 ## Configuration
@@ -15,31 +15,35 @@ DP-local MLA -> KDA group gather -> KDA head shards -> reduce-scatter -> DP-loca
 ```json
 {
   "finegrained_tp_config": {
-    "oproj_tensor_parallel_size": 8,
     "kda_tensor_parallel_size": 8
   }
 }
 ```
 
-The initial topology requires standard tensor parallel size one. Both
-fine-grained sizes divide the data-parallel size and are formed along the DP
-axis. They may therefore reuse the same physical ranks without changing MLA KV
-ownership.
+The topology requires standard tensor parallel size one, eager execution, and
+`kda_tensor_parallel_size` dividing the data-parallel size. KDA and MLA state
+ownership is unchanged.
 
-## Implemented foundation
+## Execution
 
-- Typed `kda_tensor_parallel_size` configuration and validation.
-- A dedicated KDA process group initialized with the existing fine-grained TP
-  group builder.
-- Fixed-capacity token gather/reduce-scatter helpers for graph-safe integration.
-- Collision-free `(owner_rank, local_slot)` KDA state slot mapping.
-- Existing `oproj_tensor_parallel_size` remains the MLA O-projection sharding
-  mechanism.
+- Column-parallel projections gather padded DP token batches, calculate their
+  local weight shard, and all-to-all the projection shards back to each request
+  owner. Packed projections restore checkpoint partition order and retain only
+  one copy of replicated `f_a` and alignment padding.
+- Row-parallel output projections split each owner's full attention result,
+  all-to-all input shards to the weight owners, calculate partial outputs, and
+  all-to-all the partial results back for summation by the request owner.
+- Uneven token counts across DP ranks are supported through a dynamically
+  exchanged token capacity.
 
-## Remaining runtime integration
+## Sharded and replicated data
 
-The Kimi K3 KDA module must use the KDA group for projection weight loading and
-head/state sharding. Its metadata builder must gather request boundaries,
-positions, and state slots in the same rank order as hidden states. Until that
-integration lands, setting `kda_tensor_parallel_size` only initializes the
-experimental group and must not be used for production serving.
+The KDA packed input projections, mixed-quantization QKV/gate projections,
+`f_b_proj`, KDA `o_proj`, and MLA `o_proj` are sharded. Convolution weights,
+`A_log`, `dt_bias`, normalization weights, convolution state, recurrent state,
+MLA KV cache, and attention metadata remain fully DP-local. Consequently no
+state index remapping or scheduler changes are required.
+
+The initial implementation is eager-only because reading uneven token counts
+introduces a device-to-host synchronization. ACL graph support requires a
+fixed-capacity exchange layout and is left for a follow-up.

@@ -200,6 +200,18 @@ class TestColumnParallelOpDispatch(unittest.TestCase):
         self.assertIsNone(self._get_column_op("model.vision_model_proj.indexer_proj"))
         self.assertIsNone(self._get_column_op("model.vision_tower_encoder.qkv_proj"))
 
+    def test_kimi_kda_projection_uses_weight_only_parallel(self):
+        from vllm_ascend.ops.linear_op import AttentionWeightColumnParallelOp
+
+        with patch(
+            "vllm_ascend.ops.linear_op._is_kimi_k3_attention_projection",
+            return_value=True,
+        ):
+            op = self._get_column_op(
+                "model.layers.0.self_attn.in_proj_qkvgfab"
+            )
+        self.assertIsInstance(op, AttentionWeightColumnParallelOp)
+
 
 class TestRowParallelOpDispatch(unittest.TestCase):
     """Tests for _get_row_parallel_op — mtp_block, share_expert."""
@@ -233,6 +245,40 @@ class TestRowParallelOpDispatch(unittest.TestCase):
         """Multimodal encoder variants should not enter the SP row path."""
         self.assertIsNone(self._op("model.multi_modal_projector.down_proj"))
         self.assertIsNone(self._op("model.patch_merge_mlp.out_proj"))
+
+    def test_kimi_attention_oproj_uses_weight_only_parallel(self):
+        from vllm_ascend.ops.linear_op import AttentionWeightRowParallelOp
+
+        with patch(
+            "vllm_ascend.ops.linear_op._is_kimi_k3_attention_projection",
+            return_value=True,
+        ):
+            op = self._op("model.layers.0.self_attn.o_proj")
+        self.assertIsInstance(op, AttentionWeightRowParallelOp)
+
+
+class TestAttentionWeightColumnParallelOp(unittest.TestCase):
+    def test_restore_partition_order_keeps_replicated_partition_once(self):
+        from vllm_ascend.ops.linear_op import AttentionWeightColumnParallelOp
+
+        layer = MagicMock()
+        layer.output_partition_sizes = [2, 1, 1]
+        layer.replicated_shard_id = 1
+        layer.weight_only_replicated_output_shards = {2}
+        op = AttentionWeightColumnParallelOp(layer)
+        received = torch.tensor(
+            [
+                [[1, 2, 9, 7], [3, 4, 9, 7]],
+                [[5, 6, 9, 7], [7, 8, 9, 7]],
+            ]
+        )
+
+        restored = op._restore_partition_order(received)
+
+        torch.testing.assert_close(
+            restored,
+            torch.tensor([[1, 2, 5, 6, 9, 7], [3, 4, 7, 8, 9, 7]]),
+        )
 
 
 class TestGetParallelOpShareExpert(unittest.TestCase):

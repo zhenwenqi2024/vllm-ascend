@@ -826,6 +826,37 @@ class TestSubconfigPydanticTypeValidation(TestBase):
         with self.assertRaisesRegex(ValueError, "lmhead_tensor_parallel_size must be non-negative"):
             FinegrainedTPConfig(lmhead_tensor_parallel_size=-1)
 
+    def test_kda_weight_tp_accepts_eager_kimi_dp(self):
+        cfg = FinegrainedTPConfig(kda_tensor_parallel_size=2)
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                enforce_eager=True,
+                hf_text_config=SimpleNamespace(model_type="kimi_linear"),
+                is_moe=True,
+            ),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                data_parallel_size=4,
+            ),
+        )
+        cfg._validate_preconditions(vllm_config)
+
+    def test_kda_weight_tp_rejects_graph_mode(self):
+        cfg = FinegrainedTPConfig(kda_tensor_parallel_size=2)
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                enforce_eager=False,
+                hf_text_config=SimpleNamespace(model_type="kimi_linear"),
+                is_moe=True,
+            ),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                data_parallel_size=2,
+            ),
+        )
+        with self.assertRaisesRegex(AssertionError, "requires enforce_eager"):
+            cfg._validate_preconditions(vllm_config)
+
     def test_eplb_config_int_field_lax(self):
         cfg = EplbConfig(eplb_policy_type="2")
         self.assertEqual(cfg.eplb_policy_type, 2)

@@ -46,16 +46,34 @@ from vllm.distributed import split_tensor_along_last_dim
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import logger
 
+from vllm_ascend.distributed.hybrid_attention_parallel import (
+    gather_token_counts,
+    pad_tokens,
+)
 from vllm_ascend.distributed.parallel_state import (
+    get_kda_tp_group,
     get_mlp_tp_group,
     get_otp_group,
 )
 from vllm_ascend.utils import (
     enable_dsa_cp,
+    kda_tp_enable,
     mlp_tp_enable,
     oproj_tp_enable,
     shared_expert_dp_enabled,
 )
+
+
+def _is_kimi_k3_attention_projection(prefix: str) -> bool:
+    if not kda_tp_enable() or ".self_attn." not in prefix:
+        return False
+    try:
+        from vllm.config import get_current_vllm_config
+
+        hf_config = get_current_vllm_config().model_config.hf_text_config
+    except (AssertionError, AttributeError):
+        return False
+    return getattr(hf_config, "model_type", "") == "kimi_linear"
 
 
 class CustomLinearOp:
@@ -167,6 +185,91 @@ class MLPColumnParallelOp(CustomColumnParallelOp):
         input_parallel = self.comm_group.all_gather(input_, 0)
         output = self.quant_method.apply(self.layer, input_parallel, bias)
 
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+
+class AttentionWeightColumnParallelOp(CustomColumnParallelOp):
+    """Shard a projection while keeping attention and its state DP-local."""
+
+    @property
+    def comm_group(self):
+        return get_kda_tp_group()
+
+    def _restore_partition_order(self, received: torch.Tensor) -> torch.Tensor:
+        partition_sizes = self.layer.output_partition_sizes
+        replicated_shards = set(
+            getattr(self.layer, "weight_only_replicated_output_shards", ())
+        )
+        replicated_shard = getattr(self.layer, "replicated_shard_id", None)
+        if replicated_shard is not None:
+            replicated_shards.add(replicated_shard)
+        outputs = []
+        offset = 0
+        for index, size in enumerate(partition_sizes):
+            partition = received[..., offset : offset + size]
+            if index in replicated_shards:
+                outputs.append(partition[0])
+            else:
+                outputs.append(partition.transpose(0, 1).flatten(1))
+            offset += size
+        return torch.cat(outputs, dim=-1)
+
+    def apply_impl(self, input_: torch.Tensor):
+        counts, token_capacity = gather_token_counts(input_, self.comm_group)
+        padded = pad_tokens(input_, token_capacity)
+        gathered = self.comm_group.all_gather(padded, dim=0)
+        bias = self.bias if not self.skip_bias_add else None
+        assert self.quant_method is not None
+        local_output = self.quant_method.apply(self.layer, gathered, bias)
+        local_output = local_output.view(
+            self.tp_size, token_capacity, local_output.shape[-1]
+        )
+        received = torch.empty_like(local_output)
+        dist.all_to_all_single(
+            received,
+            local_output.contiguous(),
+            group=self.comm_group.device_group,
+        )
+        output = self._restore_partition_order(received)
+        output = output[: counts[self.tp_rank]]
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+
+class AttentionWeightRowParallelOp(CustomRowParallelOp):
+    """Apply a row-sharded projection to independent DP token batches."""
+
+    @property
+    def comm_group(self):
+        return get_kda_tp_group()
+
+    def apply_impl(self, input_: torch.Tensor):
+        counts, token_capacity = gather_token_counts(input_, self.comm_group)
+        input_shards = split_tensor_along_last_dim(
+            input_, num_partitions=self.tp_size
+        )
+        send = torch.stack(
+            [pad_tokens(shard.contiguous(), token_capacity) for shard in input_shards]
+        )
+        received = torch.empty_like(send)
+        dist.all_to_all_single(
+            received,
+            send.contiguous(),
+            group=self.comm_group.device_group,
+        )
+        received = received.flatten(0, 1)
+        bias = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        assert self.quant_method is not None
+        partial = self.quant_method.apply(self.layer, received, bias)
+        partial = partial.view(self.tp_size, token_capacity, -1)
+        returned = torch.empty_like(partial)
+        dist.all_to_all_single(
+            returned,
+            partial.contiguous(),
+            group=self.comm_group.device_group,
+        )
+        output = returned.sum(dim=0)[: counts[self.tp_rank]]
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -298,7 +401,18 @@ def _is_shared_expert_layer(prefix: str) -> bool:
 
 def _get_column_parallel_op(
     prefix, layer
-) -> MLPColumnParallelOp | DSV4OProjColumnParallelOp | ShardedCPColumnParallelOp | None:
+) -> (
+    AttentionWeightColumnParallelOp
+    | MLPColumnParallelOp
+    | DSV4OProjColumnParallelOp
+    | ShardedCPColumnParallelOp
+    | None
+):
+    if _is_kimi_k3_attention_projection(prefix) and any(
+        name in prefix
+        for name in ("in_proj_qkvgfab", "in_proj_qkv", "in_proj_gfab", "f_b_proj")
+    ):
+        return AttentionWeightColumnParallelOp(layer)
     if enable_dsa_cp() and ("q_b_proj" in prefix or "kv_b_proj" in prefix):
         return ShardedCPColumnParallelOp(layer)
     if "wo_a" in prefix and oproj_tp_enable():
@@ -308,7 +422,17 @@ def _get_column_parallel_op(
     return None
 
 
-def _get_row_parallel_op(prefix, layer) -> MLPRowParallelOp | OProjRowParallelOp | DSV4OProjRowParallelOp | None:
+def _get_row_parallel_op(
+    prefix, layer
+) -> (
+    AttentionWeightRowParallelOp
+    | MLPRowParallelOp
+    | OProjRowParallelOp
+    | DSV4OProjRowParallelOp
+    | None
+):
+    if _is_kimi_k3_attention_projection(prefix) and "o_proj" in prefix:
+        return AttentionWeightRowParallelOp(layer)
     if "wo_b" in prefix and oproj_tp_enable():
         return DSV4OProjRowParallelOp(layer)
     if "down_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
@@ -329,7 +453,9 @@ def get_parallel_op(disable_tp, prefix, layer, direct):
     elif disable_tp:
         return None, 0, 1
     custom_op: (
-        MLPColumnParallelOp
+        AttentionWeightColumnParallelOp
+        | AttentionWeightRowParallelOp
+        | MLPColumnParallelOp
         | DSV4OProjColumnParallelOp
         | MLPRowParallelOp
         | OProjRowParallelOp
