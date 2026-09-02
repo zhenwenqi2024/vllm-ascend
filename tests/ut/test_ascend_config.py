@@ -826,14 +826,22 @@ class TestSubconfigPydanticTypeValidation(TestBase):
         with self.assertRaisesRegex(ValueError, "lmhead_tensor_parallel_size must be non-negative"):
             FinegrainedTPConfig(lmhead_tensor_parallel_size=-1)
 
-    def test_kda_weight_tp_accepts_eager_kimi_dp(self):
+    def test_kda_state_parallel_accepts_eager_kimi_dp(self):
         cfg = FinegrainedTPConfig(kda_tensor_parallel_size=2)
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
                 enforce_eager=True,
-                hf_text_config=SimpleNamespace(model_type="kimi_linear"),
+                hf_text_config=SimpleNamespace(
+                    model_type="kimi_linear",
+                    linear_attn_config={"num_heads": 8},
+                ),
                 is_moe=True,
             ),
+            cache_config=SimpleNamespace(
+                mamba_cache_mode="align",
+                use_kda_recoverssm=False,
+            ),
+            speculative_config=None,
             parallel_config=SimpleNamespace(
                 tensor_parallel_size=1,
                 data_parallel_size=4,
@@ -841,20 +849,75 @@ class TestSubconfigPydanticTypeValidation(TestBase):
         )
         cfg._validate_preconditions(vllm_config)
 
-    def test_kda_weight_tp_accepts_graph_mode(self):
+    def test_kda_state_parallel_accepts_graph_mode(self):
         cfg = FinegrainedTPConfig(kda_tensor_parallel_size=2)
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
                 enforce_eager=False,
-                hf_text_config=SimpleNamespace(model_type="kimi_linear"),
+                hf_text_config=SimpleNamespace(
+                    model_type="kimi_linear",
+                    linear_attn_config={"num_heads": 8},
+                ),
                 is_moe=True,
             ),
+            cache_config=SimpleNamespace(
+                mamba_cache_mode="all",
+                use_kda_recoverssm=False,
+            ),
+            speculative_config=SimpleNamespace(method="mtp"),
             parallel_config=SimpleNamespace(
                 tensor_parallel_size=1,
                 data_parallel_size=2,
             ),
         )
         cfg._validate_preconditions(vllm_config)
+
+    def test_kda_state_parallel_rejects_speculative_align_mode(self):
+        cfg = FinegrainedTPConfig(kda_tensor_parallel_size=2)
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    model_type="kimi_linear",
+                    linear_attn_config={"num_heads": 8},
+                ),
+                is_moe=True,
+            ),
+            cache_config=SimpleNamespace(
+                mamba_cache_mode="align",
+                use_kda_recoverssm=False,
+            ),
+            speculative_config=SimpleNamespace(method="mtp"),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                data_parallel_size=2,
+            ),
+        )
+        with self.assertRaisesRegex(AssertionError, "mamba_cache_mode='all'"):
+            cfg._validate_preconditions(vllm_config)
+
+    def test_kda_state_parallel_rejects_pd_until_transfer_is_owner_aware(self):
+        cfg = FinegrainedTPConfig(kda_tensor_parallel_size=2)
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    model_type="kimi_linear",
+                    linear_attn_config={"num_heads": 8},
+                ),
+                is_moe=True,
+            ),
+            cache_config=SimpleNamespace(
+                mamba_cache_mode="align",
+                use_kda_recoverssm=False,
+            ),
+            speculative_config=None,
+            kv_transfer_config=SimpleNamespace(is_kv_producer=True),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                data_parallel_size=2,
+            ),
+        )
+        with self.assertRaisesRegex(AssertionError, "PD disaggregation"):
+            cfg._validate_preconditions(vllm_config)
 
     def test_eplb_config_int_field_lax(self):
         cfg = EplbConfig(eplb_policy_type="2")

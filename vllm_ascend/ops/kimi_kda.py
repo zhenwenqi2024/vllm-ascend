@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Ascend backend for the vLLM 0.27 Kimi K3 delta-attention layer.
 
-The projections, weight loading, and cache specification stay owned by
-upstream vLLM.  Only the CUDA-specific convolution and KDA execution is
-replaced here with the Ascend metadata builder and AscendC operators.
+The default path retains upstream projection and cache ownership. Optional
+KDA state parallelism rebuilds the KDA head-local parameters and cache shape
+over an Ascend fine-grained group while preserving DP execution for MLA.
 """
 
 from functools import wraps
@@ -19,7 +19,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.models.kimi_k3.nvidia.kda import (
     KimiK3DeltaAttention,
     _KimiGDNMergedColumnParallelLinear,
@@ -29,6 +29,10 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend.distributed.kda_state_parallel import (
+    flatten_kda_state_cache,
+    remap_kda_metadata_state_indices,
+)
 from vllm_ascend.distributed.parallel_state import get_kda_tp_group
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
@@ -36,6 +40,41 @@ from vllm_ascend.utils import kda_tp_enable
 
 _KDA_CHUNK_SIZE = 64
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
+
+
+def _kda_sharded_weight_loader(shard_axis: int, *, legacy_a_log: bool = False):
+    """Load a tensor shard using the KDA-specific group rank."""
+
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        if legacy_a_log and loaded_weight.dim() == 4:
+            if loaded_weight.shape[:2] != (1, 1) or loaded_weight.shape[-1] != 1:
+                raise ValueError(f"Unexpected legacy KDA A_log shape: {loaded_weight.shape}.")
+            loaded_weight = loaded_weight.reshape(loaded_weight.shape[2])
+        shard_size = param.shape[shard_axis]
+        start = get_kda_tp_group().rank_in_group * shard_size
+        param.data.copy_(loaded_weight.narrow(shard_axis, start, shard_size))
+
+    return loader
+
+
+def _kda_conv_weight_loader(local_projection_size: int):
+    """Load one Q/K/V convolution shard from an unfused checkpoint tensor."""
+
+    def loader(
+        param: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: int,
+    ) -> None:
+        if loaded_weight.dim() == 2:
+            loaded_weight = loaded_weight.unsqueeze(1)
+        rank = get_kda_tp_group().rank_in_group
+        source_start = rank * local_projection_size
+        target_start = loaded_shard_id * local_projection_size
+        param.data[target_start : target_start + local_projection_size].copy_(
+            loaded_weight[source_start : source_start + local_projection_size]
+        )
+
+    return loader
 
 
 def _zero_padded_output(
@@ -84,7 +123,10 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         super().__init__(config, vllm_config, prefix)
         self.uses_mixed_projection = uses_mixed_projection
         if kda_tp_enable():
-            self._init_weight_only_parallel_projections(prefix, quant_config)
+            self._init_state_parallel_components(prefix, quant_config)
+        else:
+            self.kda_state_parallel_size = 1
+            self.kda_state_parallel_rank = 0
         if uses_mixed_projection:
             # vLLM 0.27 packs all KDA input projections into one linear.  A
             # QuaRot checkpoint instead stores q/k/v as W8A8 and keeps the
@@ -104,30 +146,19 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             ]
             if self.in_proj_padding:
                 gate_output_sizes.append(
-                    self.in_proj_padding
-                    * (
-                        get_kda_tp_group().world_size
-                        if kda_tp_enable()
-                        else self.tp_size
-                    )
+                    self.in_proj_padding * (get_kda_tp_group().world_size if kda_tp_enable() else self.tp_size)
                 )
             self.in_proj_gfab = _KimiGDNMergedColumnParallelLinear(
                 self.hidden_size,
                 gate_output_sizes,
                 replicated_shard_id=1,
-                tp_size=(
-                    get_kda_tp_group().world_size
-                    if kda_tp_enable()
-                    else self.tp_size
-                ),
+                tp_size=(get_kda_tp_group().world_size if kda_tp_enable() else self.tp_size),
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.in_proj_gfab",
             )
             if self.in_proj_padding:
-                self.in_proj_gfab.weight_only_replicated_output_shards = {
-                    len(gate_output_sizes) - 1
-                }
+                self.in_proj_gfab.weight_only_replicated_output_shards = {len(gate_output_sizes) - 1}
             if self.in_proj_padding:
                 self.in_proj_gfab.weight.data[-self.in_proj_padding :].zero_()
         # Upstream's FusedRMSNormGated constructor defaults to 1e-5, while
@@ -160,16 +191,20 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
 
         self.conv1d.quant_method.process_weights_after_loading = process_weights_and_pack
 
-    def _init_weight_only_parallel_projections(self, prefix, quant_config) -> None:
-        """Shard large KDA matrices while leaving KDA state fully DP-local."""
-        weight_tp_size = get_kda_tp_group().world_size
+    def _init_state_parallel_components(self, prefix, quant_config) -> None:
+        """Rebuild KDA parameters over its DP-axis state-parallel group."""
+        group = get_kda_tp_group()
+        weight_tp_size = group.world_size
+        self.kda_state_parallel_size = weight_tp_size
+        self.kda_state_parallel_rank = group.rank_in_group
+        self.tp_size = weight_tp_size
+        self.tp_rank = group.rank_in_group
+        self.local_num_heads = self.num_heads // weight_tp_size
+        self.local_projection_size = self.projection_size // weight_tp_size
+
         qkvg_output_sizes = [self.projection_size] * 4
         output_sizes = qkvg_output_sizes + [self.head_dim, self.num_heads]
-        local_output_size = (
-            4 * (self.projection_size // weight_tp_size)
-            + self.head_dim
-            + self.num_heads // weight_tp_size
-        )
+        local_output_size = 4 * self.local_projection_size + self.head_dim + self.local_num_heads
         weight_padding = -local_output_size % 16
         if weight_padding:
             output_sizes.append(weight_padding * weight_tp_size)
@@ -184,9 +219,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             prefix=f"{prefix}.in_proj_qkvgfab",
         )
         if weight_padding:
-            self.in_proj_qkvgfab.weight_only_replicated_output_shards = {
-                len(output_sizes) - 1
-            }
+            self.in_proj_qkvgfab.weight_only_replicated_output_shards = {len(output_sizes) - 1}
         if weight_padding:
             self.in_proj_qkvgfab.weight.data[-weight_padding:].zero_()
         self.f_b_proj = ColumnParallelLinear(
@@ -196,6 +229,35 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             quant_config=quant_config,
             prefix=f"{prefix}.f_b_proj",
         )
+        self.dt_bias = nn.Parameter(torch.empty(self.local_projection_size, dtype=torch.float32))
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": _kda_sharded_weight_loader(0)},
+        )
+        self.conv1d = ColumnParallelLinear(
+            input_size=self.conv_size,
+            output_size=3 * self.projection_size,
+            bias=False,
+            params_dtype=torch.float32,
+            prefix=f"{prefix}.conv1d",
+        )
+        self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
+        if hasattr(self.conv1d.weight, "weight_loader"):
+            delattr(self.conv1d.weight, "weight_loader")
+        set_weight_attrs(
+            self.conv1d.weight,
+            {"weight_loader": _kda_conv_weight_loader(self.local_projection_size)},
+        )
+        self.A_log = nn.Parameter(torch.empty(self.local_num_heads, dtype=torch.float32))
+        set_weight_attrs(
+            self.A_log,
+            {
+                "weight_loader": _kda_sharded_weight_loader(
+                    0,
+                    legacy_a_log=True,
+                )
+            },
+        )
         self.o_proj = RowParallelLinear(
             self.projection_size,
             self.hidden_size,
@@ -203,6 +265,16 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        self.gemm_rs_ar = None
+        self.decode_conv1d_weight = None
+        self.decode_norm_weight = None
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        shapes = super().get_state_shape()
+        parallel_size = getattr(self, "kda_state_parallel_size", 1)
+        if parallel_size == 1:
+            return shapes
+        return tuple((parallel_size, *shape) for shape in shapes)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return AscendGDNAttentionBackend
@@ -212,8 +284,15 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        if not kda_tp_enable() and not self.uses_mixed_projection:
+            return super().forward(hidden_states, positions)
+
+        local_token_capacity = hidden_states.size(0)
+        if kda_tp_enable():
+            hidden_states = get_kda_tp_group().all_gather(hidden_states, dim=0)
+        num_tokens = hidden_states.size(0)
+
         if self.uses_mixed_projection:
-            num_tokens = hidden_states.size(0)
             mixed_qkv = self.in_proj_qkvgfab(hidden_states)[0]
             projected_gfab = self.in_proj_gfab(hidden_states)[0]
             split_sizes = [
@@ -224,16 +303,77 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             if self.in_proj_padding:
                 split_sizes.append(self.in_proj_padding)
             g_proj_states, f_a, beta = projected_gfab.split(split_sizes, dim=-1)[:3]
-            beta = beta.unsqueeze(0)
+        else:
+            projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+            split_sizes = [
+                3 * self.local_projection_size,
+                self.local_projection_size,
+                self.head_dim,
+                self.local_num_heads,
+            ]
+            if self.in_proj_padding:
+                split_sizes.append(self.in_proj_padding)
+            mixed_qkv, g_proj_states, f_a, beta = projected_qkvgfab.split(
+                split_sizes,
+                dim=-1,
+            )[:4]
 
-            g1 = self.f_b_proj(f_a)[0]
-            g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
-            g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
-            core_attn_out = torch.empty(
-                (1, num_tokens, self.local_num_heads, self.head_dim),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
+        beta = beta.unsqueeze(0)
+        g1 = self.f_b_proj(f_a)[0]
+        g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
+        g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
+        core_attn_out = torch.empty(
+            (1, num_tokens, self.local_num_heads, self.head_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        if kda_tp_enable():
+            forward_context = get_forward_context()
+            metadata_by_prefix = getattr(
+                forward_context,
+                "kda_parallel_metadata",
+                None,
             )
+            if metadata_by_prefix is None:
+                if forward_context.attn_metadata is not None:
+                    raise RuntimeError("KDA state-parallel metadata was not prepared by the model runner.")
+                core_attn_out.zero_()
+            else:
+                owner_metadata = metadata_by_prefix[self.prefix]
+                if len(owner_metadata) != self.kda_state_parallel_size:
+                    raise RuntimeError(
+                        f"Expected {self.kda_state_parallel_size} KDA metadata owners, got {len(owner_metadata)}."
+                    )
+                flat_kv_cache = (
+                    flatten_kda_state_cache(
+                        self.kv_cache[0],
+                        self.kda_state_parallel_size,
+                    ),
+                    flatten_kda_state_cache(
+                        self.kv_cache[1],
+                        self.kda_state_parallel_size,
+                    ),
+                )
+                for owner_rank, metadata in enumerate(owner_metadata):
+                    token_slice = slice(
+                        owner_rank * local_token_capacity,
+                        (owner_rank + 1) * local_token_capacity,
+                    )
+                    self._forward(
+                        mixed_qkv=mixed_qkv[token_slice],
+                        g1=g1[:, token_slice],
+                        g2=g2[token_slice],
+                        beta=beta[:, token_slice],
+                        core_attn_out=core_attn_out[:, token_slice],
+                        attn_metadata=remap_kda_metadata_state_indices(
+                            metadata,
+                            owner_rank,
+                            self.kda_state_parallel_size,
+                        ),
+                        kv_cache=flat_kv_cache,
+                    )
+        else:
             self._forward(
                 mixed_qkv=mixed_qkv,
                 g1=g1,
@@ -241,9 +381,12 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 beta=beta,
                 core_attn_out=core_attn_out,
             )
-            core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-            return self.o_proj(core_attn_out)[0]
-        return super().forward(hidden_states, positions)
+
+        core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+        output_parallel = self.o_proj(core_attn_out)[0]
+        if kda_tp_enable():
+            return get_kda_tp_group().reduce_scatter(output_parallel, dim=0)
+        return output_parallel
 
     @staticmethod
     def _run_causal_conv1d(
@@ -390,17 +533,20 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         g2: torch.Tensor,
         beta: torch.Tensor,
         core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata | None = None,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         """Dispatch speculative, prefill, and decode tokens through KDA kernels."""
         forward_context = get_forward_context()
-        attn_metadata_raw = forward_context.attn_metadata
-        if attn_metadata_raw is None:
-            core_attn_out.zero_()
-            return
+        if attn_metadata is None:
+            attn_metadata_raw = forward_context.attn_metadata
+            if attn_metadata_raw is None:
+                core_attn_out.zero_()
+                return
 
-        assert isinstance(attn_metadata_raw, dict)
-        attn_metadata = attn_metadata_raw[self.prefix]
-        assert isinstance(attn_metadata, GDNAttentionMetadata)
+            assert isinstance(attn_metadata_raw, dict)
+            attn_metadata = attn_metadata_raw[self.prefix]
+            assert isinstance(attn_metadata, GDNAttentionMetadata)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         mixed_qkv = mixed_qkv[:num_actual_tokens]
@@ -408,7 +554,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         g2 = g2[:num_actual_tokens]
         beta = _prepare_beta(beta, num_actual_tokens)
 
-        conv_state, recurrent_state = self.kv_cache
+        conv_state, recurrent_state = self.kv_cache if kv_cache is None else kv_cache
         conv_weights_t = self.get_parameter(_PACKED_CONV_WEIGHT_NAME)
         spec_masks = attn_metadata.spec_sequence_masks
         spec_token_indices = attn_metadata.spec_token_indx

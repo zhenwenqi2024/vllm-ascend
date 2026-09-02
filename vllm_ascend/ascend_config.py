@@ -991,8 +991,29 @@ class FinegrainedTPConfig:
                 )
             hf_config = vc.model_config.hf_text_config
             if getattr(hf_config, "model_type", "") != "kimi_linear":
+                raise AssertionError("kda_tensor_parallel_size is only supported for Kimi K3.")
+            num_kda_heads = hf_config.linear_attn_config["num_heads"]
+            if num_kda_heads % self.kda_tensor_parallel_size != 0:
                 raise AssertionError(
-                    "kda_tensor_parallel_size is only supported for Kimi K3."
+                    "Kimi K3 KDA heads must be divisible by "
+                    "kda_tensor_parallel_size, got "
+                    f"{num_kda_heads} and {self.kda_tensor_parallel_size}."
+                )
+            if vc.speculative_config is not None and vc.cache_config.mamba_cache_mode == "align":
+                raise AssertionError(
+                    "KDA state parallelism with MTP or DSpark requires "
+                    "mamba_cache_mode='all'. The align-mode speculative "
+                    "postprocess kernel is not owner-aware yet."
+                )
+            if vc.cache_config.use_kda_recoverssm:
+                raise AssertionError(
+                    "KDA state parallelism does not yet support RecoverSSM. Use the native KDA speculative state path."
+                )
+            if getattr(vc, "kv_transfer_config", None) is not None:
+                raise AssertionError(
+                    "KDA state parallelism is not yet supported with PD "
+                    "disaggregation because KV transfer must address the "
+                    "state-cache owner dimension."
                 )
         module_tp_sizes = [
             self.oproj_tensor_parallel_size,

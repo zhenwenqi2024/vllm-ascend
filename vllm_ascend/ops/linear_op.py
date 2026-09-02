@@ -61,7 +61,7 @@ from vllm_ascend.utils import (
 
 
 def _is_kimi_k3_attention_projection(prefix: str) -> bool:
-    if not kda_tp_enable() or ".self_attn." not in prefix:
+    if not kda_tp_enable() or re.search(r"(?:^|\.)model\.layers\.\d+\.self_attn\.", prefix) is None:
         return False
     try:
         from vllm.config import get_current_vllm_config
@@ -70,6 +70,18 @@ def _is_kimi_k3_attention_projection(prefix: str) -> bool:
     except (AssertionError, AttributeError):
         return False
     return getattr(hf_config, "model_type", "") == "kimi_linear"
+
+
+def _is_kimi_k3_kda_projection(prefix: str) -> bool:
+    if not _is_kimi_k3_attention_projection(prefix):
+        return False
+    match = re.search(r"layers\.(\d+)\.", prefix)
+    if match is None:
+        return False
+    from vllm.config import get_current_vllm_config
+
+    hf_config = get_current_vllm_config().model_config.hf_text_config
+    return bool(hf_config.is_kda_layer(int(match.group(1))))
 
 
 class CustomLinearOp:
@@ -194,9 +206,7 @@ class AttentionWeightColumnParallelOp(CustomColumnParallelOp):
 
     def _restore_partition_order(self, received: torch.Tensor) -> torch.Tensor:
         partition_sizes = self.layer.output_partition_sizes
-        replicated_shards = set(
-            getattr(self.layer, "weight_only_replicated_output_shards", ())
-        )
+        replicated_shards = set(getattr(self.layer, "weight_only_replicated_output_shards", ()))
         replicated_shard = getattr(self.layer, "replicated_shard_id", None)
         if replicated_shard is not None:
             replicated_shards.add(replicated_shard)
@@ -217,9 +227,7 @@ class AttentionWeightColumnParallelOp(CustomColumnParallelOp):
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
         local_output = self.quant_method.apply(self.layer, gathered, bias)
-        local_output = local_output.view(
-            self.tp_size, token_capacity, local_output.shape[-1]
-        )
+        local_output = local_output.view(self.tp_size, token_capacity, local_output.shape[-1])
         received = torch.empty_like(local_output)
         dist.all_to_all_single(
             received,
@@ -240,9 +248,7 @@ class AttentionWeightRowParallelOp(CustomRowParallelOp):
 
     def apply_impl(self, input_: torch.Tensor):
         token_capacity = input_.shape[0]
-        input_shards = split_tensor_along_last_dim(
-            input_, num_partitions=self.tp_size
-        )
+        input_shards = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)
         send = torch.stack([shard.contiguous() for shard in input_shards])
         received = torch.empty_like(send)
         dist.all_to_all_single(
@@ -262,6 +268,37 @@ class AttentionWeightRowParallelOp(CustomRowParallelOp):
             group=self.comm_group.device_group,
         )
         output = returned.sum(dim=0)
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+
+class KDAStateColumnParallelOp(CustomColumnParallelOp):
+    """Run a KDA column shard after the layer-level token all-gather."""
+
+    @property
+    def comm_group(self):
+        return get_kda_tp_group()
+
+    def apply_impl(self, input_: torch.Tensor):
+        bias = self.bias if not self.skip_bias_add else None
+        assert self.quant_method is not None
+        output = self.quant_method.apply(self.layer, input_, bias)
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+
+class KDAStateRowParallelOp(CustomRowParallelOp):
+    """Return a KDA O-projection partial for the layer-level reduce-scatter."""
+
+    @property
+    def comm_group(self):
+        return get_kda_tp_group()
+
+    def apply_impl(self, input_: torch.Tensor):
+        input_parallel = self.get_input_parallel(input_)
+        bias = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        assert self.quant_method is not None
+        output = self.quant_method.apply(self.layer, input_parallel, bias)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -395,14 +432,25 @@ def _get_column_parallel_op(
     prefix, layer
 ) -> (
     AttentionWeightColumnParallelOp
+    | KDAStateColumnParallelOp
     | MLPColumnParallelOp
     | DSV4OProjColumnParallelOp
     | ShardedCPColumnParallelOp
     | None
 ):
-    if _is_kimi_k3_attention_projection(prefix) and any(
+    if _is_kimi_k3_kda_projection(prefix) and any(
         name in prefix
-        for name in ("in_proj_qkvgfab", "in_proj_qkv", "in_proj_gfab", "f_b_proj")
+        for name in (
+            "in_proj_qkvgfab",
+            "in_proj_qkv",
+            "in_proj_gfab",
+            "f_b_proj",
+            "conv1d",
+        )
+    ):
+        return KDAStateColumnParallelOp(layer)
+    if _is_kimi_k3_attention_projection(prefix) and any(
+        name in prefix for name in ("in_proj_qkvgfab", "in_proj_qkv", "in_proj_gfab", "f_b_proj")
     ):
         return AttentionWeightColumnParallelOp(layer)
     if enable_dsa_cp() and ("q_b_proj" in prefix or "kv_b_proj" in prefix):
@@ -418,11 +466,14 @@ def _get_row_parallel_op(
     prefix, layer
 ) -> (
     AttentionWeightRowParallelOp
+    | KDAStateRowParallelOp
     | MLPRowParallelOp
     | OProjRowParallelOp
     | DSV4OProjRowParallelOp
     | None
 ):
+    if _is_kimi_k3_kda_projection(prefix) and "o_proj" in prefix:
+        return KDAStateRowParallelOp(layer)
     if _is_kimi_k3_attention_projection(prefix) and "o_proj" in prefix:
         return AttentionWeightRowParallelOp(layer)
     if "wo_b" in prefix and oproj_tp_enable():
@@ -447,6 +498,8 @@ def get_parallel_op(disable_tp, prefix, layer, direct):
     custom_op: (
         AttentionWeightColumnParallelOp
         | AttentionWeightRowParallelOp
+        | KDAStateColumnParallelOp
+        | KDAStateRowParallelOp
         | MLPColumnParallelOp
         | DSV4OProjColumnParallelOp
         | MLPRowParallelOp
