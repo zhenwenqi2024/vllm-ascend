@@ -61,7 +61,7 @@ from vllm_ascend.utils import (
 
 
 def _is_kimi_k3_attention_projection(prefix: str) -> bool:
-    if not kda_tp_enable() or re.search(r"(?:^|\.)model\.layers\.\d+\.self_attn\.", prefix) is None:
+    if not kda_tp_enable() or ".self_attn." not in prefix:
         return False
     try:
         from vllm.config import get_current_vllm_config
@@ -70,18 +70,6 @@ def _is_kimi_k3_attention_projection(prefix: str) -> bool:
     except (AssertionError, AttributeError):
         return False
     return getattr(hf_config, "model_type", "") == "kimi_linear"
-
-
-def _is_kimi_k3_kda_projection(prefix: str) -> bool:
-    if not _is_kimi_k3_attention_projection(prefix):
-        return False
-    match = re.search(r"layers\.(\d+)\.", prefix)
-    if match is None:
-        return False
-    from vllm.config import get_current_vllm_config
-
-    hf_config = get_current_vllm_config().model_config.hf_text_config
-    return bool(hf_config.is_kda_layer(int(match.group(1))))
 
 
 class CustomLinearOp:
@@ -272,37 +260,6 @@ class AttentionWeightRowParallelOp(CustomRowParallelOp):
         return output, output_bias
 
 
-class KDAStateColumnParallelOp(CustomColumnParallelOp):
-    """Run a KDA column shard after the layer-level token all-gather."""
-
-    @property
-    def comm_group(self):
-        return get_kda_tp_group()
-
-    def apply_impl(self, input_: torch.Tensor):
-        bias = self.bias if not self.skip_bias_add else None
-        assert self.quant_method is not None
-        output = self.quant_method.apply(self.layer, input_, bias)
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
-
-
-class KDAStateRowParallelOp(CustomRowParallelOp):
-    """Return a KDA O-projection partial for the layer-level reduce-scatter."""
-
-    @property
-    def comm_group(self):
-        return get_kda_tp_group()
-
-    def apply_impl(self, input_: torch.Tensor):
-        input_parallel = self.get_input_parallel(input_)
-        bias = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        assert self.quant_method is not None
-        output = self.quant_method.apply(self.layer, input_parallel, bias)
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
-
-
 class MLPRowParallelOp(CustomRowParallelOp):
     def __init__(self, layer):
         super().__init__(layer)
@@ -431,24 +388,8 @@ def _is_shared_expert_layer(prefix: str) -> bool:
 def _get_column_parallel_op(
     prefix, layer
 ) -> (
-    AttentionWeightColumnParallelOp
-    | KDAStateColumnParallelOp
-    | MLPColumnParallelOp
-    | DSV4OProjColumnParallelOp
-    | ShardedCPColumnParallelOp
-    | None
+    AttentionWeightColumnParallelOp | MLPColumnParallelOp | DSV4OProjColumnParallelOp | ShardedCPColumnParallelOp | None
 ):
-    if _is_kimi_k3_kda_projection(prefix) and any(
-        name in prefix
-        for name in (
-            "in_proj_qkvgfab",
-            "in_proj_qkv",
-            "in_proj_gfab",
-            "f_b_proj",
-            "conv1d",
-        )
-    ):
-        return KDAStateColumnParallelOp(layer)
     if _is_kimi_k3_attention_projection(prefix) and any(
         name in prefix for name in ("in_proj_qkvgfab", "in_proj_qkv", "in_proj_gfab", "f_b_proj")
     ):
@@ -464,16 +405,7 @@ def _get_column_parallel_op(
 
 def _get_row_parallel_op(
     prefix, layer
-) -> (
-    AttentionWeightRowParallelOp
-    | KDAStateRowParallelOp
-    | MLPRowParallelOp
-    | OProjRowParallelOp
-    | DSV4OProjRowParallelOp
-    | None
-):
-    if _is_kimi_k3_kda_projection(prefix) and "o_proj" in prefix:
-        return KDAStateRowParallelOp(layer)
+) -> AttentionWeightRowParallelOp | MLPRowParallelOp | OProjRowParallelOp | DSV4OProjRowParallelOp | None:
     if _is_kimi_k3_attention_projection(prefix) and "o_proj" in prefix:
         return AttentionWeightRowParallelOp(layer)
     if "wo_b" in prefix and oproj_tp_enable():
@@ -498,8 +430,6 @@ def get_parallel_op(disable_tp, prefix, layer, direct):
     custom_op: (
         AttentionWeightColumnParallelOp
         | AttentionWeightRowParallelOp
-        | KDAStateColumnParallelOp
-        | KDAStateRowParallelOp
         | MLPColumnParallelOp
         | DSV4OProjColumnParallelOp
         | MLPRowParallelOp

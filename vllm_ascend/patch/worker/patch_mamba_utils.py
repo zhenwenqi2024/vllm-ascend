@@ -1,7 +1,6 @@
 # mypy: ignore-errors
 
 import itertools
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -300,7 +299,6 @@ def preprocess_mamba(
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
     copy_bufs: MambaCopyBuffers,
-    copy_plan_callback: Callable[[list[int], int, int, int, CachedRequestState], None] | None = None,
 ):
     """
     Copy the mamba state of previous step to the last
@@ -354,27 +352,17 @@ def preprocess_mamba(
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
-            accepted_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1
-            if copy_plan_callback is not None:
-                copy_plan_callback(
-                    mamba_group_ids,
-                    prev_state_idx,
-                    curr_state_idx,
-                    accepted_token_bias,
-                    req_state,
-                )
-            else:
-                mamba_utils.collect_mamba_copy_meta(
-                    copy_bufs,
-                    kv_cache_config,
-                    mamba_state_copy_funcs,
-                    mamba_group_ids,
-                    prev_state_idx,
-                    curr_state_idx,
-                    accepted_token_bias,
-                    req_state,
-                    forward_context,
-                )
+            mamba_utils.collect_mamba_copy_meta(
+                copy_bufs,
+                kv_cache_config,
+                mamba_state_copy_funcs,
+                mamba_group_ids,
+                prev_state_idx,
+                curr_state_idx,
+                input_batch.num_accepted_tokens_cpu[i] - 1,
+                req_state,
+                forward_context,
+            )
             input_batch.num_accepted_tokens_cpu[i] = 1
     if _can_launch_triton_batch_memcpy():
         # Only stage the pointer table here. This runs inside the existing

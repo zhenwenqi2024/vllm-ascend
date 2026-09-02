@@ -134,12 +134,6 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
-from vllm_ascend.distributed.kda_state_parallel import (
-    KDAStateCopyPlan,
-    execute_kda_copy_plans,
-    gather_kda_step_metadata,
-    make_kda_copy_plan_callback,
-)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
 )
@@ -2099,9 +2093,6 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        kda_copy_plans: list[KDAStateCopyPlan] = []
-        kda_parallel_metadata = None
-        kda_copy_plans_by_owner = None
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
@@ -2253,11 +2244,6 @@ class NPUModelRunner(GPUModelRunner):
                         self.compilation_config.static_forward_context,
                         self.model.get_mamba_state_copy_func(),
                         preprocess_bufs,
-                        copy_plan_callback=(
-                            make_kda_copy_plan_callback(kda_copy_plans)
-                            if kda_tp_enable()
-                            else None
-                        ),
                     )
                     # preprocess_mamba resets num_accepted_tokens_cpu to 1
                     # for requests whose state was copied to a new block.
@@ -2323,15 +2309,6 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
-                if kda_tp_enable():
-                    (
-                        kda_parallel_metadata,
-                        kda_copy_plans_by_owner,
-                    ) = gather_kda_step_metadata(
-                        attn_metadata,
-                        kda_copy_plans,
-                        self.device,
-                    )
 
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
@@ -2389,7 +2366,6 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
-                kda_parallel_metadata=kda_parallel_metadata,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -2398,13 +2374,7 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
-            if kda_copy_plans_by_owner is not None:
-                execute_kda_copy_plans(
-                    kda_copy_plans_by_owner,
-                    self.kv_cache_config,
-                    self.compilation_config.static_forward_context,
-                )
-            elif self.cache_config.mamba_cache_mode == "align":
+            if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
@@ -3680,14 +3650,6 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
-            kda_parallel_metadata = None
-            if kda_tp_enable():
-                kda_parallel_metadata, _ = gather_kda_step_metadata(
-                    attn_metadata,
-                    [],
-                    self.device,
-                )
-
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -3700,7 +3662,6 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 has_sinks = self._has_sinks,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
-                kda_parallel_metadata=kda_parallel_metadata,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds

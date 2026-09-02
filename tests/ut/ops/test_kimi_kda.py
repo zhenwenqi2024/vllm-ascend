@@ -6,48 +6,15 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
+from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 
 from vllm_ascend.ops.kimi_kda import (
     _PACKED_CONV_WEIGHT_NAME,
     AscendKimiK3DeltaAttention,
-    _kda_conv_weight_loader,
-    _kda_sharded_weight_loader,
     _prepare_beta,
     _zero_padded_output,
     _zero_padded_recurrent_output,
 )
-
-
-def test_kda_sharded_weight_loader_uses_kda_group_rank():
-    parameter = nn.Parameter(torch.empty(2))
-    group = SimpleNamespace(rank_in_group=1)
-
-    with patch(
-        "vllm_ascend.ops.kimi_kda.get_kda_tp_group",
-        return_value=group,
-    ):
-        _kda_sharded_weight_loader(0)(parameter, torch.arange(4))
-
-    torch.testing.assert_close(parameter, torch.tensor([2.0, 3.0]))
-
-
-def test_kda_conv_weight_loader_shards_each_qkv_partition():
-    parameter = nn.Parameter(torch.zeros(6, 1, 2))
-    loaded = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-    group = SimpleNamespace(rank_in_group=1)
-
-    with patch(
-        "vllm_ascend.ops.kimi_kda.get_kda_tp_group",
-        return_value=group,
-    ):
-        _kda_conv_weight_loader(local_projection_size=2)(
-            parameter,
-            loaded,
-            loaded_shard_id=2,
-        )
-
-    torch.testing.assert_close(parameter[4:, 0], loaded[2:])
-    assert torch.count_nonzero(parameter[:4]) == 0
 
 
 def test_zero_padded_recurrent_output_clears_uncovered_tail():
@@ -215,3 +182,7 @@ def test_kda_conv_weight_is_packed_once_in_kernel_layout():
         packed,
         source[:, 0, :].transpose(0, 1).to(torch.bfloat16),
     )
+
+
+def test_kda_weight_parallel_keeps_upstream_state_shape_contract():
+    assert AscendKimiK3DeltaAttention.get_state_shape is KimiK3DeltaAttention.get_state_shape

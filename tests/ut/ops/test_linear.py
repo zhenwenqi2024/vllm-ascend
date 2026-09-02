@@ -200,25 +200,15 @@ class TestColumnParallelOpDispatch(unittest.TestCase):
         self.assertIsNone(self._get_column_op("model.vision_model_proj.indexer_proj"))
         self.assertIsNone(self._get_column_op("model.vision_tower_encoder.qkv_proj"))
 
-    def test_kimi_kda_projection_uses_state_parallel(self):
-        from vllm_ascend.ops.linear_op import KDAStateColumnParallelOp
+    def test_kimi_kda_projection_uses_weight_only_parallel(self):
+        from vllm_ascend.ops.linear_op import AttentionWeightColumnParallelOp
 
         with patch(
-            "vllm_ascend.ops.linear_op._is_kimi_k3_kda_projection",
+            "vllm_ascend.ops.linear_op._is_kimi_k3_attention_projection",
             return_value=True,
         ):
             op = self._get_column_op("model.layers.0.self_attn.in_proj_qkvgfab")
-        self.assertIsInstance(op, KDAStateColumnParallelOp)
-
-    def test_kimi_kda_conv_uses_state_parallel(self):
-        from vllm_ascend.ops.linear_op import KDAStateColumnParallelOp
-
-        with patch(
-            "vllm_ascend.ops.linear_op._is_kimi_k3_kda_projection",
-            return_value=True,
-        ):
-            op = self._get_column_op("model.layers.0.self_attn.conv1d")
-        self.assertIsInstance(op, KDAStateColumnParallelOp)
+        self.assertIsInstance(op, AttentionWeightColumnParallelOp)
 
 
 class TestRowParallelOpDispatch(unittest.TestCase):
@@ -254,15 +244,15 @@ class TestRowParallelOpDispatch(unittest.TestCase):
         self.assertIsNone(self._op("model.multi_modal_projector.down_proj"))
         self.assertIsNone(self._op("model.patch_merge_mlp.out_proj"))
 
-    def test_kimi_kda_oproj_uses_state_parallel(self):
-        from vllm_ascend.ops.linear_op import KDAStateRowParallelOp
+    def test_kimi_attention_oproj_uses_weight_only_parallel(self):
+        from vllm_ascend.ops.linear_op import AttentionWeightRowParallelOp
 
         with patch(
-            "vllm_ascend.ops.linear_op._is_kimi_k3_kda_projection",
+            "vllm_ascend.ops.linear_op._is_kimi_k3_attention_projection",
             return_value=True,
         ):
             op = self._op("model.layers.0.self_attn.o_proj")
-        self.assertIsInstance(op, KDAStateRowParallelOp)
+        self.assertIsInstance(op, AttentionWeightRowParallelOp)
 
 
 class TestAttentionWeightColumnParallelOp(unittest.TestCase):

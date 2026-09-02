@@ -175,11 +175,7 @@ class AscendLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if isinstance(layer, RowParallelLinear):
-            if (
-                kda_tp_enable()
-                and ".self_attn." in layer.prefix
-                and "o_proj" in layer.prefix
-            ):
+            if kda_tp_enable() and ".self_attn." in layer.prefix and "o_proj" in layer.prefix:
                 tp_rank = get_kda_tp_group().rank_in_group
             elif layer.prefix.find("o_proj") != -1 and oproj_tp_enable():
                 tp_rank = get_otp_group().rank_in_group

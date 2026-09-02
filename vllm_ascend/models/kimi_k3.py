@@ -26,7 +26,6 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -79,7 +78,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.math_utils import cdiv
 
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.models.llama_eagle3 import get_rotation_path
 from vllm_ascend.ops.kimi_kda import AscendKimiK3DeltaAttention  # type: ignore[import-untyped]
 
@@ -773,34 +771,6 @@ class AscendKimiLinearForCausalLM(UpstreamKimiLinearForCausalLM):
     def set_dspark_aux_capture_materialized(self, enabled: bool) -> None:
         self.model.dspark_aux_capture_materialized = enabled
 
-    @classmethod
-    def get_mamba_state_shape_from_config(
-        cls,
-        vllm_config: VllmConfig,
-    ) -> tuple[tuple[int, ...], ...]:
-        parallel_size = get_ascend_config().finegrained_tp_config.kda_tensor_parallel_size
-        if parallel_size <= 1:
-            return super().get_mamba_state_shape_from_config(vllm_config)
-
-        hf_config = vllm_config.model_config.hf_config
-        num_spec = vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0
-        shapes = MambaStateShapeCalculator.kda_state_shape(
-            parallel_size,
-            hf_config.linear_attn_config["num_heads"],
-            hf_config.linear_attn_config["head_dim"],
-            conv_kernel_size=hf_config.linear_attn_config["short_conv_kernel_size"],
-            num_spec=num_spec,
-        )
-        if vllm_config.cache_config.use_kda_recoverssm:
-            shapes = MambaStateShapeCalculator.append_kda_recoverssm_record(
-                shapes,
-                hf_config.linear_attn_config["num_heads"],
-                hf_config.linear_attn_config["head_dim"],
-                tp_world_size=parallel_size,
-                spec_query_len=1 + num_spec,
-            )
-        return tuple((parallel_size, *shape) for shape in shapes)
-
 
 class AscendKimiK3MultiModalProjector(KimiK25MultiModalProjector):
     """Kimi projector with the optional ModelSlim output rotation."""
@@ -896,14 +866,6 @@ class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneratio
             self.language_model.make_empty_intermediate_tensors
         )
         self.media_placeholder = self.config.media_placeholder_token_id
-
-    @classmethod
-    def get_mamba_state_shape_from_config(
-        cls,
-        vllm_config: VllmConfig,
-    ) -> tuple[tuple[int, ...], ...]:
-        text_config = vllm_config.model_config.hf_config.text_config
-        return AscendKimiLinearForCausalLM.get_mamba_state_shape_from_config(vllm_config.with_hf_config(text_config))
 
     def set_dspark_aux_capture_materialized(self, enabled: bool) -> None:
         self.language_model.set_dspark_aux_capture_materialized(enabled)
