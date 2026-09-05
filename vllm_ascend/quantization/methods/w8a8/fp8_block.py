@@ -151,7 +151,9 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
         input_sharded: bool,
     ) -> tuple[tuple[TPWeightGatherSpec, ...], tuple[TPWeightRepeatSpec, ...]]:
         if self.mxfp8_method is not None:
-            return self.mxfp8_method.get_tp_weight_switch_specs(input_sharded=input_sharded)
+            if input_sharded:
+                return self.mxfp8_method.tp_weight_gather_specs, self.mxfp8_method.tp_weight_repeat_specs
+            return self.mxfp8_method.tp_weight_output_gather_specs, self.mxfp8_method.tp_weight_output_repeat_specs
         gather_dim = 1 if input_sharded else 0
         return (TPWeightGatherSpec("weight", gather_dim=gather_dim),), ()
 
