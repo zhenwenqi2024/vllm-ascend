@@ -145,29 +145,15 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
 
     supports_tp_weight_switch = True
 
-    @property
-    def tp_weight_gather_specs(self) -> tuple[TPWeightGatherSpec, ...]:
+    def get_tp_weight_switch_specs(
+        self,
+        *,
+        input_sharded: bool,
+    ) -> tuple[tuple[TPWeightGatherSpec, ...], tuple[TPWeightRepeatSpec, ...]]:
         if self.mxfp8_method is not None:
-            return self.mxfp8_method.tp_weight_gather_specs
-        return (TPWeightGatherSpec("weight", gather_dim=1),)
-
-    @property
-    def tp_weight_output_gather_specs(self) -> tuple[TPWeightGatherSpec, ...]:
-        if self.mxfp8_method is not None:
-            return self.mxfp8_method.tp_weight_output_gather_specs
-        return (TPWeightGatherSpec("weight"),)
-
-    @property
-    def tp_weight_repeat_specs(self) -> tuple[TPWeightRepeatSpec, ...]:
-        if self.mxfp8_method is not None:
-            return self.mxfp8_method.tp_weight_repeat_specs
-        return ()
-
-    @property
-    def tp_weight_output_repeat_specs(self) -> tuple[TPWeightRepeatSpec, ...]:
-        if self.mxfp8_method is not None:
-            return self.mxfp8_method.tp_weight_output_repeat_specs
-        return ()
+            return self.mxfp8_method.get_tp_weight_switch_specs(input_sharded=input_sharded)
+        gather_dim = 1 if input_sharded else 0
+        return (TPWeightGatherSpec("weight", gather_dim=gather_dim),), ()
 
     def __init__(self, weight_block_size: tuple[int, int]):
         self.block_n, self.block_k = weight_block_size

@@ -124,19 +124,27 @@ class TestAscendFp8BlockLinearMethod(TestBase):
         scheme.mxfp8_method.tp_weight_output_repeat_specs = output_repeat
 
         self.assertTrue(scheme.supports_tp_weight_switch)
-        self.assertEqual(scheme.tp_weight_gather_specs, input_gather)
-        self.assertEqual(scheme.tp_weight_output_gather_specs, output_gather)
-        self.assertEqual(scheme.tp_weight_repeat_specs, input_repeat)
-        self.assertEqual(scheme.tp_weight_output_repeat_specs, output_repeat)
+        self.assertEqual(
+            scheme.get_tp_weight_switch_specs(input_sharded=True),
+            (input_gather, input_repeat),
+        )
+        self.assertEqual(
+            scheme.get_tp_weight_switch_specs(input_sharded=False),
+            (output_gather, output_repeat),
+        )
 
     def test_tp_weight_switch_specs_cover_dense_fallback(self):
         scheme = self.build_scheme(is_950=False)
 
         self.assertTrue(scheme.supports_tp_weight_switch)
-        self.assertEqual(scheme.tp_weight_gather_specs, (TPWeightGatherSpec("weight", gather_dim=1),))
-        self.assertEqual(scheme.tp_weight_output_gather_specs, (TPWeightGatherSpec("weight"),))
-        self.assertEqual(scheme.tp_weight_repeat_specs, ())
-        self.assertEqual(scheme.tp_weight_output_repeat_specs, ())
+        self.assertEqual(
+            scheme.get_tp_weight_switch_specs(input_sharded=True),
+            ((TPWeightGatherSpec("weight", gather_dim=1),), ()),
+        )
+        self.assertEqual(
+            scheme.get_tp_weight_switch_specs(input_sharded=False),
+            ((TPWeightGatherSpec("weight"),), ()),
+        )
 
     def test_pergroup_param_declares_block_scale_and_loader_hints(self):
         scheme = self.build_scheme(block_size=(128, 64))
