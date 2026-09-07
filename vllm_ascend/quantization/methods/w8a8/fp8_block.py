@@ -45,13 +45,7 @@ from vllm.utils.math_utils import cdiv
 from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
 from vllm_ascend.utils import FP8_METHOD, is_950, maybe_trans_nz
 
-from ..base import (
-    AscendLinearScheme,
-    AscendMoEScheme,
-    QuantType,
-    TPWeightGatherSpec,
-    TPWeightRepeatSpec,
-)
+from ..base import AscendLinearScheme, AscendMoEScheme, QuantType, TPWeightGatherSpec
 from ..registry import register_scheme
 from .w8a8_mxfp8 import AscendW8A8MXFP8DynamicFusedMoEMethod, AscendW8A8MXFP8DynamicLinearMethod
 
@@ -145,17 +139,9 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
 
     supports_tp_weight_switch = True
 
-    def get_tp_weight_switch_specs(
-        self,
-        *,
-        input_sharded: bool,
-    ) -> tuple[tuple[TPWeightGatherSpec, ...], tuple[TPWeightRepeatSpec, ...]]:
-        if self.mxfp8_method is not None:
-            if input_sharded:
-                return self.mxfp8_method.tp_weight_gather_specs, self.mxfp8_method.tp_weight_repeat_specs
-            return self.mxfp8_method.tp_weight_output_gather_specs, self.mxfp8_method.tp_weight_output_repeat_specs
-        gather_dim = 1 if input_sharded else 0
-        return (TPWeightGatherSpec("weight", gather_dim=gather_dim),), ()
+    # Dense post-processing keeps weight in [output, input] layout.
+    tp_weight_gather_specs = (TPWeightGatherSpec("weight", gather_dim=1),)
+    tp_weight_output_gather_specs = (TPWeightGatherSpec("weight"),)
 
     def __init__(self, weight_block_size: tuple[int, int]):
         self.block_n, self.block_k = weight_block_size
@@ -179,6 +165,12 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
         }
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Reset before resolving the execution path, including reloads that
+        # fall back to dense because the reduction dimension is not aligned.
+        self.tp_weight_gather_specs = type(self).tp_weight_gather_specs
+        self.tp_weight_output_gather_specs = type(self).tp_weight_output_gather_specs
+        self.tp_weight_repeat_specs = ()
+        self.tp_weight_output_repeat_specs = ()
         resolved = resolve_block_scales(
             layer.weight.data,
             layer.weight_scale_inv.data,
@@ -219,6 +211,11 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
         layer.weight = torch.nn.Parameter(quantized, requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(mx_scale, requires_grad=False)
         self.mxfp8_method.process_weights_after_loading(layer)
+        # MXFP8 owns the final transposed weight and paired scale layouts.
+        self.tp_weight_gather_specs = self.mxfp8_method.tp_weight_gather_specs
+        self.tp_weight_output_gather_specs = self.mxfp8_method.tp_weight_output_gather_specs
+        self.tp_weight_repeat_specs = self.mxfp8_method.tp_weight_repeat_specs
+        self.tp_weight_output_repeat_specs = self.mxfp8_method.tp_weight_output_repeat_specs
 
     def apply(
         self,

@@ -113,7 +113,7 @@ class TestAscendFp8BlockLinearMethod(TestBase):
         self.assertEqual(weight.dtype, torch.float8_e4m3fn)
 
     def test_tp_weight_switch_specs_follow_mxfp8_execution_method(self):
-        scheme = self.build_scheme(is_950=True)
+        scheme = self.build_scheme(is_950=True, block_size=(4, 32))
         input_gather = (TPWeightGatherSpec("input_weight"),)
         output_gather = (TPWeightGatherSpec("output_weight", gather_dim=1),)
         input_repeat = (TPWeightRepeatSpec("input_scale"),)
@@ -122,14 +122,21 @@ class TestAscendFp8BlockLinearMethod(TestBase):
         scheme.mxfp8_method.tp_weight_output_gather_specs = output_gather
         scheme.mxfp8_method.tp_weight_repeat_specs = input_repeat
         scheme.mxfp8_method.tp_weight_output_repeat_specs = output_repeat
+        layer, _, _ = self._make_layer()
+        with patch(f"{MODULE}._mx_quantize") as mock_quantize:
+            mock_quantize.return_value = (
+                torch.zeros(8, 64, dtype=torch.float8_e4m3fn),
+                torch.zeros(8, 2, dtype=torch.uint8),
+            )
+            scheme.process_weights_after_loading(layer)
 
         self.assertTrue(scheme.supports_tp_weight_switch)
         self.assertEqual(
-            scheme.get_tp_weight_switch_specs(input_sharded=True),
+            (scheme.tp_weight_gather_specs, scheme.tp_weight_repeat_specs),
             (input_gather, input_repeat),
         )
         self.assertEqual(
-            scheme.get_tp_weight_switch_specs(input_sharded=False),
+            (scheme.tp_weight_output_gather_specs, scheme.tp_weight_output_repeat_specs),
             (output_gather, output_repeat),
         )
 
@@ -138,11 +145,11 @@ class TestAscendFp8BlockLinearMethod(TestBase):
 
         self.assertTrue(scheme.supports_tp_weight_switch)
         self.assertEqual(
-            scheme.get_tp_weight_switch_specs(input_sharded=True),
+            (scheme.tp_weight_gather_specs, scheme.tp_weight_repeat_specs),
             ((TPWeightGatherSpec("weight", gather_dim=1),), ()),
         )
         self.assertEqual(
-            scheme.get_tp_weight_switch_specs(input_sharded=False),
+            (scheme.tp_weight_output_gather_specs, scheme.tp_weight_output_repeat_specs),
             ((TPWeightGatherSpec("weight"),), ()),
         )
 
@@ -225,9 +232,19 @@ class TestAscendFp8BlockLinearMethod(TestBase):
     def test_falls_back_when_reduction_dim_is_not_mx_aligned(self):
         scheme = self.build_scheme(is_950=True, block_size=(4, 32))
         layer, weight, scale_inv = self._make_layer(out_features=8, in_features=48, block=(4, 32))
+        # Simulate specs from a previous MXFP8 load to check reset on fallback.
+        scheme.tp_weight_gather_specs = (TPWeightGatherSpec("weight_scale"),)
+        scheme.tp_weight_output_gather_specs = (TPWeightGatherSpec("weight_scale", gather_dim=1),)
+        scheme.tp_weight_repeat_specs = (TPWeightRepeatSpec("weight_scale"),)
+        scheme.tp_weight_output_repeat_specs = (TPWeightRepeatSpec("weight_scale"),)
 
         with patch(f"{MODULE}.maybe_trans_nz", side_effect=lambda tensor: tensor):
             scheme.process_weights_after_loading(layer)
+
+        self.assertEqual(scheme.tp_weight_gather_specs, (TPWeightGatherSpec("weight", gather_dim=1),))
+        self.assertEqual(scheme.tp_weight_output_gather_specs, (TPWeightGatherSpec("weight"),))
+        self.assertEqual(scheme.tp_weight_repeat_specs, ())
+        self.assertEqual(scheme.tp_weight_output_repeat_specs, ())
 
         self.assertIsNone(scheme.mxfp8_method)
         self.assertEqual(layer.weight.dtype, torch.bfloat16)
