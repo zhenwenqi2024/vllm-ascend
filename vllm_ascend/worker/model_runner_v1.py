@@ -2247,7 +2247,9 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     def _skip_drafting(
-        self, sampled_token_ids: torch.Tensor | None = None
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: torch.Tensor | None = None,
     ) -> None:
         """Preserve sampled-token state, align DP ranks, and publish no drafts."""
         if (
@@ -2285,10 +2287,12 @@ class NPUModelRunner(GPUModelRunner):
                 # drafter DP synchronization pads it to the busiest rank.
                 self.drafter.dummy_run(num_tokens=1)
 
-        self._draft_token_ids = [[] for _ in self.input_batch.req_ids]
-        self._draft_token_req_ids = self.input_batch.req_ids.copy()
+        self._draft_token_ids = torch.zeros(
+            1, device=self.device, dtype=torch.int32
+        ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
         self._draft_probs = None
         self._draft_prob_req_ids = None
+        self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
     @torch.inference_mode()
     def sample_tokens(
@@ -2358,7 +2362,8 @@ class NPUModelRunner(GPUModelRunner):
         def propose_draft_token_ids(sampled_token_ids):
             if not input_fits_in_drafter:
                 self._skip_drafting(
-                    sampled_token_ids if use_padded_batch else None
+                    scheduler_output,
+                    sampled_token_ids if use_padded_batch else None,
                 )
                 return
             assert spec_decode_common_attn_metadata is not None
