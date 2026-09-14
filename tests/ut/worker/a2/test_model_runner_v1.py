@@ -190,6 +190,8 @@ class TestDrafterMaxModelLen(unittest.TestCase):
             drafter.num_query_per_req = query_width
         drafter.dummy_run = MagicMock()
         runner.drafter = drafter
+        runner.device = torch.device("cpu")
+        runner._copy_draft_token_ids_to_cpu = MagicMock()
         return runner
 
     def test_dspark_fit_check_uses_its_exact_query_group(self):
@@ -216,22 +218,22 @@ class TestDrafterMaxModelLen(unittest.TestCase):
         runner.drafter = None
 
         self.assertTrue(runner._input_fits_in_drafter(SimpleNamespace(max_seq_len=1024)))
-        runner._skip_drafting()
-        self.assertEqual(runner._draft_token_ids, [[], []])
+        scheduler_output = SimpleNamespace()
+        runner._skip_drafting(scheduler_output)
+        self.assertTrue(torch.equal(runner._draft_token_ids, torch.zeros(2, 5, dtype=torch.int32)))
+        runner._copy_draft_token_ids_to_cpu.assert_called_once_with(scheduler_output, zeros_only=True)
 
     def test_dspark_overflow_rank_runs_complete_dp_dummy(self):
         runner = self._build_runner(dp_size=2, query_width=6)
 
-        runner._skip_drafting()
+        scheduler_output = SimpleNamespace()
+        runner._skip_drafting(scheduler_output)
 
         runner.drafter.dummy_run.assert_called_once_with(num_tokens=6, num_reqs=1)
-        self.assertEqual(runner._draft_token_ids, [[], []])
-        self.assertEqual(runner._draft_token_req_ids, ["req-0", "req-1"])
+        self.assertTrue(torch.equal(runner._draft_token_ids, torch.zeros(2, 5, dtype=torch.int32)))
         self.assertIsNone(runner._draft_probs)
         self.assertIsNone(runner._draft_prob_req_ids)
-        draft_token_ids = runner.take_draft_token_ids()
-        self.assertEqual(draft_token_ids.req_ids, ["req-0", "req-1"])
-        self.assertEqual(draft_token_ids.draft_token_ids, [[], []])
+        runner._copy_draft_token_ids_to_cpu.assert_called_once_with(scheduler_output, zeros_only=True)
 
     def test_padded_overflow_preserves_sampled_token_state(self):
         runner = self._build_runner(dp_size=2)
@@ -248,7 +250,8 @@ class TestDrafterMaxModelLen(unittest.TestCase):
         )
         runner._copy_valid_sampled_token_count = MagicMock()
 
-        runner._skip_drafting(sampled_token_ids)
+        scheduler_output = SimpleNamespace()
+        runner._skip_drafting(scheduler_output, sampled_token_ids)
 
         runner.drafter.prepare_next_token_ids_padded.assert_called_once_with(
             sampled_token_ids,
@@ -259,38 +262,39 @@ class TestDrafterMaxModelLen(unittest.TestCase):
         )
         runner._copy_valid_sampled_token_count.assert_called_once_with(next_token_ids, valid_sampled_tokens_count)
         runner.drafter.dummy_run.assert_called_once_with(num_tokens=1)
+        runner._copy_draft_token_ids_to_cpu.assert_called_once_with(scheduler_output, zeros_only=True)
 
     def test_padded_overflow_avoids_state_work_without_count_event(self):
         runner = self._build_runner(dp_size=1)
         runner.valid_sampled_token_count_event = None
         runner.drafter.prepare_next_token_ids_padded = MagicMock()
 
-        runner._skip_drafting(torch.tensor([[11]]))
+        runner._skip_drafting(SimpleNamespace(), torch.tensor([[11]]))
 
         runner.drafter.prepare_next_token_ids_padded.assert_not_called()
 
     def test_model_backed_overflow_rank_runs_upstream_style_dp_dummy(self):
         runner = self._build_runner(dp_size=2)
 
-        runner._skip_drafting()
+        runner._skip_drafting(SimpleNamespace())
 
         runner.drafter.dummy_run.assert_called_once_with(num_tokens=1)
 
     def test_non_model_proposer_does_not_run_dp_dummy(self):
         runner = self._build_runner(dp_size=2, model_backed=False)
 
-        runner._skip_drafting()
+        runner._skip_drafting(SimpleNamespace())
 
         runner.drafter.dummy_run.assert_not_called()
-        self.assertEqual(runner._draft_token_ids, [[], []])
+        self.assertTrue(torch.equal(runner._draft_token_ids, torch.zeros(2, 5, dtype=torch.int32)))
 
     def test_overflow_rank_skips_dummy_without_dp(self):
         runner = self._build_runner(dp_size=1)
 
-        runner._skip_drafting()
+        runner._skip_drafting(SimpleNamespace())
 
         runner.drafter.dummy_run.assert_not_called()
-        self.assertEqual(runner._draft_token_ids, [[], []])
+        self.assertTrue(torch.equal(runner._draft_token_ids, torch.zeros(2, 5, dtype=torch.int32)))
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
