@@ -405,7 +405,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             prepared_shared_input = (
                 PreparedSharedExpertInput(shared_hidden_states, is_gathered=True)
                 if shared_input_is_gathered
-                else self.ascend_shared_experts.prepare_input_async(shared_hidden_states)
+                else self.ascend_shared_experts.prepare_input_before_routed(shared_hidden_states)
             )
             router_logits, shared_input_ready, router_output_ready = self._prepare_router_and_milestones(
                 shared_hidden_states,

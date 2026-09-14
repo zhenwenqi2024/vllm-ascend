@@ -247,7 +247,12 @@ class AscendSharedExperts:
         self,
         hidden_states: torch.Tensor,
     ) -> PreparedSharedExpertInput:
-        """Start the SP-only input all-gather on the shared-expert stream."""
+        """Start the SP-only input all-gather on the shared-expert stream.
+
+        The caller must wait for ``ready_event`` before enqueueing routed-path
+        collectives.  This method is intended to overlap the gather only with
+        a routed input transform such as Kimi-K3's latent projection.
+        """
         if not (self.multistream_overlap and self.parallel_mode() is SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY):
             return PreparedSharedExpertInput(hidden_states=hidden_states)
 
@@ -262,6 +267,29 @@ class AscendSharedExperts:
             hidden_states=hidden_states,
             is_gathered=True,
             ready_event=all_gather_done,
+        )
+
+    def prepare_input_before_routed(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> PreparedSharedExpertInput:
+        """Prepare SP-only input on the calling stream before routed MoE.
+
+        The TP all-gather deliberately stays on the default/routed stream.
+        Running it on the shared-expert stream while routed EP collectives run
+        on the default stream can deadlock HCCL when ranks make different
+        progress across the two process groups.
+        """
+        if not (self.multistream_overlap and self.parallel_mode() is SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY):
+            return PreparedSharedExpertInput(hidden_states=hidden_states)
+
+        # Keep TP padding across the custom-op boundary; the shared MLP trims
+        # it before computation. The caller records shared_input_ready after
+        # this returns, handing the gathered tensor to the auxiliary stream.
+        hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+        return PreparedSharedExpertInput(
+            hidden_states=hidden_states,
+            is_gathered=True,
         )
 
     def _wait_for_milestone(
@@ -310,7 +338,7 @@ class AscendSharedExperts:
             hidden_states, local_dp_metadata = self._prepare_local_dp_input(hidden_states)
         elif mode is SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY and not prepared_input.is_gathered:
             # TP-sharded weights require full activations. Multistream starts
-            # this gather in prepare_input_async; the serial path does it here.
+            # this gather before the routed path; the serial path does it here.
             hidden_states = self._gather_sp_input(hidden_states)
         elif mode is SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY:
             # An early gather keeps padding across the custom-op boundary so

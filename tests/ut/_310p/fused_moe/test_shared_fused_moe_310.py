@@ -246,7 +246,7 @@ def test_forward_impl_310_returns_current_runner_contract(monkeypatch, has_share
     prepared_shared_input = PreparedSharedExpertInput(hidden_states)
     ascend_shared_experts = SimpleNamespace(
         multistream_overlap=False,
-        prepare_input_async=MagicMock(return_value=prepared_shared_input),
+        prepare_input_before_routed=MagicMock(return_value=prepared_shared_input),
         forward=MagicMock(return_value=shared_out),
     )
     milestones = RoutedMoEMilestones()
@@ -263,7 +263,7 @@ def test_forward_impl_310_returns_current_runner_contract(monkeypatch, has_share
     result = runner._forward_impl(hidden_states, router_logits, shared_experts_input=None)
 
     if has_shared_experts:
-        ascend_shared_experts.prepare_input_async.assert_called_once_with(hidden_states)
+        ascend_shared_experts.prepare_input_before_routed.assert_called_once_with(hidden_states)
         runner.routed_experts.forward_impl.assert_called_once_with(
             hidden_states=hidden_states,
             router_logits=router_logits,
