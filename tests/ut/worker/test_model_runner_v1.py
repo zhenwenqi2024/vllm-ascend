@@ -40,6 +40,7 @@ from vllm_ascend.models.glm5next.kv_cache import (
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _get_kv_cache_config_deepseek_v4_main,
 )
+from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
 from vllm_ascend.utils import AscendDeviceType, vllm_version_is
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
@@ -291,6 +292,49 @@ class TestDSparkAuxCaptureMode(unittest.TestCase):
         )
 
         self.assertFalse(runner._draft_uses_qwen3_gqa_dspark())
+
+
+class TestDSparkMaxModelLen(unittest.TestCase):
+    def _build_runner(self, *, dp_size: int = 1, query_width: int = 6):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.effective_drafter_max_model_len = 1024
+        runner.num_spec_tokens = 5
+        runner.parallel_config = SimpleNamespace(data_parallel_size=dp_size)
+        runner.input_batch = SimpleNamespace(req_ids=["req-0", "req-1"])
+
+        drafter = AscendDSparkProposer.__new__(AscendDSparkProposer)
+        drafter.num_query_per_req = query_width
+        drafter.dummy_run = MagicMock()
+        runner.drafter = drafter
+        return runner
+
+    def test_fit_check_accounts_for_complete_dspark_query_group(self):
+        runner = self._build_runner(query_width=6)
+
+        self.assertTrue(runner._input_fits_in_dspark(SimpleNamespace(max_seq_len=1018)))
+        self.assertFalse(runner._input_fits_in_dspark(SimpleNamespace(max_seq_len=1019)))
+
+    def test_overflow_rank_runs_dp_dummy_and_returns_empty_drafts(self):
+        runner = self._build_runner(dp_size=2, query_width=6)
+
+        runner._skip_dspark_drafting()
+
+        runner.drafter.dummy_run.assert_called_once_with(num_tokens=6, num_reqs=1)
+        self.assertEqual(runner._draft_token_ids, [[], []])
+        self.assertEqual(runner._draft_token_req_ids, ["req-0", "req-1"])
+        self.assertIsNone(runner._draft_probs)
+        self.assertIsNone(runner._draft_prob_req_ids)
+        draft_token_ids = runner.take_draft_token_ids()
+        self.assertEqual(draft_token_ids.req_ids, ["req-0", "req-1"])
+        self.assertEqual(draft_token_ids.draft_token_ids, [[], []])
+
+    def test_overflow_rank_skips_dummy_without_dp(self):
+        runner = self._build_runner(dp_size=1)
+
+        runner._skip_dspark_drafting()
+
+        runner.drafter.dummy_run.assert_not_called()
+        self.assertEqual(runner._draft_token_ids, [[], []])
 
 
 class TestAcceptedTokenSnapshot(unittest.TestCase):

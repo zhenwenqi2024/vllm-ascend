@@ -2582,6 +2582,35 @@ class NPUModelRunner(GPUModelRunner):
             deferred_state_corrections_fn()
         return None
 
+    def _input_fits_in_dspark(
+        self, common_attn_metadata: CommonAttentionMetadata | None
+    ) -> bool:
+        """Return whether DSpark can append its complete query group."""
+        if common_attn_metadata is None:
+            return False
+        assert isinstance(self.drafter, AscendDSparkProposer)
+        return (
+            common_attn_metadata.max_seq_len + self.drafter.num_query_per_req
+            <= self.effective_drafter_max_model_len
+        )
+
+    def _skip_dspark_drafting(self) -> None:
+        """Keep DP collectives aligned and publish truly empty drafts."""
+        assert isinstance(self.drafter, AscendDSparkProposer)
+        if self.parallel_config.data_parallel_size > 1:
+            # Other DP ranks can still run the real drafter. Use one complete
+            # synthetic DSpark query group so this rank enters the same draft
+            # model collectives without constructing over-limit positions.
+            self.drafter.dummy_run(
+                num_tokens=self.drafter.num_query_per_req,
+                num_reqs=1,
+            )
+
+        self._draft_token_ids = [[] for _ in self.input_batch.req_ids]
+        self._draft_token_req_ids = self.input_batch.req_ids.copy()
+        self._draft_probs = None
+        self._draft_prob_req_ids = None
+
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -2643,7 +2672,14 @@ class NPUModelRunner(GPUModelRunner):
 
         self.valid_sampled_token_count_gpu = None
 
+        input_fits_in_dspark = not (
+            self.speculative_config and self.speculative_config.use_dspark()
+        ) or self._input_fits_in_dspark(spec_decode_common_attn_metadata)
+
         def propose_draft_token_ids(sampled_token_ids):
+            if not input_fits_in_dspark:
+                self._skip_dspark_drafting()
+                return
             assert spec_decode_common_attn_metadata is not None
             self._draft_token_ids = self.propose_draft_token_ids(
                 sampled_token_ids,
