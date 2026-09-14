@@ -2605,6 +2605,10 @@ class NPUModelRunner(GPUModelRunner):
         """Return whether the complete drafter query fits its model limit."""
         if common_attn_metadata is None:
             return False
+        if self.drafter is None:
+            # Only the last PP rank owns and runs the drafter. Other PP ranks
+            # must not apply a local drafter limit or join drafter DP work.
+            return True
         return (
             common_attn_metadata.max_seq_len + self._num_drafter_query_tokens()
             <= self.effective_drafter_max_model_len
@@ -2622,10 +2626,10 @@ class NPUModelRunner(GPUModelRunner):
     def _skip_drafting(self) -> None:
         """Keep model-backed DP ranks aligned and publish empty drafts."""
         if (
-            self.parallel_config.data_parallel_size > 1
+            self.drafter is not None
+            and self.parallel_config.data_parallel_size > 1
             and self._drafter_runs_model_forward()
         ):
-            assert self.drafter is not None
             if isinstance(self.drafter, AscendDSparkProposer):
                 # DSpark requires a complete synthetic query group.
                 self.drafter.dummy_run(
