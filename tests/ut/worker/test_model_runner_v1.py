@@ -365,6 +365,42 @@ class TestDrafterMaxModelLen(unittest.TestCase):
         self.assertEqual(draft_token_ids.req_ids, ["req-0", "req-1"])
         self.assertEqual(draft_token_ids.draft_token_ids, [[], []])
 
+    def test_padded_overflow_preserves_sampled_token_state(self):
+        runner = self._build_runner(dp_size=2)
+        sampled_token_ids = torch.tensor([[11, -1], [21, 22]])
+        next_token_ids = torch.tensor([11, 22])
+        valid_sampled_tokens_count = torch.tensor([1, 2])
+        discard_request_indices = torch.tensor([1])
+        runner.valid_sampled_token_count_event = MagicMock()
+        runner.requests = {"req-0": MagicMock(), "req-1": MagicMock()}
+        runner.discard_request_indices = SimpleNamespace(gpu=discard_request_indices)
+        runner.num_discarded_requests = 1
+        runner.drafter.prepare_next_token_ids_padded = MagicMock(
+            return_value=(next_token_ids, valid_sampled_tokens_count)
+        )
+        runner._copy_valid_sampled_token_count = MagicMock()
+
+        runner._skip_drafting(sampled_token_ids)
+
+        runner.drafter.prepare_next_token_ids_padded.assert_called_once_with(
+            sampled_token_ids,
+            runner.requests,
+            runner.input_batch,
+            discard_request_indices,
+            1,
+        )
+        runner._copy_valid_sampled_token_count.assert_called_once_with(next_token_ids, valid_sampled_tokens_count)
+        runner.drafter.dummy_run.assert_called_once_with(num_tokens=1)
+
+    def test_padded_overflow_avoids_state_work_without_count_event(self):
+        runner = self._build_runner(dp_size=1)
+        runner.valid_sampled_token_count_event = None
+        runner.drafter.prepare_next_token_ids_padded = MagicMock()
+
+        runner._skip_drafting(torch.tensor([[11]]))
+
+        runner.drafter.prepare_next_token_ids_padded.assert_not_called()
+
     def test_model_backed_overflow_rank_runs_upstream_style_dp_dummy(self):
         runner = self._build_runner(dp_size=2)
 

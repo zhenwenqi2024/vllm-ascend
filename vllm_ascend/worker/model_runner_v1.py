@@ -2614,8 +2614,29 @@ class NPUModelRunner(GPUModelRunner):
             or spec_config.uses_extract_hidden_states()
         )
 
-    def _skip_drafting(self) -> None:
-        """Keep model-backed DP ranks aligned and publish empty drafts."""
+    def _skip_drafting(
+        self, sampled_token_ids: torch.Tensor | None = None
+    ) -> None:
+        """Preserve sampled-token state, align DP ranks, and publish no drafts."""
+        if (
+            sampled_token_ids is not None
+            and self.valid_sampled_token_count_event is not None
+            and self.drafter is not None
+            and self._drafter_runs_model_forward()
+        ):
+            next_token_ids, valid_sampled_tokens_count = (
+                self.drafter.prepare_next_token_ids_padded(
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_indices.gpu,
+                    self.num_discarded_requests,
+                )
+            )
+            self._copy_valid_sampled_token_count(
+                next_token_ids, valid_sampled_tokens_count
+            )
+
         if (
             self.drafter is not None
             and self.parallel_config.data_parallel_size > 1
@@ -2704,7 +2725,9 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             if not input_fits_in_drafter:
-                self._skip_drafting()
+                self._skip_drafting(
+                    sampled_token_ids if use_padded_batch else None
+                )
                 return
             assert spec_decode_common_attn_metadata is not None
             self._draft_token_ids = self.propose_draft_token_ids(
