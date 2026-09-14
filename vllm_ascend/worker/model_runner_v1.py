@@ -2227,29 +2227,51 @@ class NPUModelRunner(GPUModelRunner):
             deferred_state_corrections_fn()
         return None
 
-    def _input_fits_in_dspark(
+    def _num_drafter_query_tokens(self) -> int:
+        """Return the maximum query width consumed by one drafter request."""
+        assert self.speculative_config is not None
+        if isinstance(self.drafter, AscendDSparkProposer):
+            # DSpark variants use either K or K + 1 queries per request.
+            return self.drafter.num_query_per_req
+        return self.num_spec_tokens + int(self.speculative_config.use_dflash())
+
+    def _input_fits_in_drafter(
         self, common_attn_metadata: CommonAttentionMetadata | None
     ) -> bool:
-        """Return whether DSpark can append its complete query group."""
+        """Return whether the complete drafter query fits its model limit."""
         if common_attn_metadata is None:
             return False
-        assert isinstance(self.drafter, AscendDSparkProposer)
         return (
-            common_attn_metadata.max_seq_len + self.drafter.num_query_per_req
+            common_attn_metadata.max_seq_len + self._num_drafter_query_tokens()
             <= self.effective_drafter_max_model_len
         )
 
-    def _skip_dspark_drafting(self) -> None:
-        """Keep DP collectives aligned and publish truly empty drafts."""
-        assert isinstance(self.drafter, AscendDSparkProposer)
-        if self.parallel_config.data_parallel_size > 1:
-            # Other DP ranks can still run the real drafter. Use one complete
-            # synthetic DSpark query group so this rank enters the same draft
-            # model collectives without constructing over-limit positions.
-            self.drafter.dummy_run(
-                num_tokens=self.drafter.num_query_per_req,
-                num_reqs=1,
-            )
+    def _drafter_runs_model_forward(self) -> bool:
+        """Return whether the proposer participates in model collectives."""
+        spec_config = self.speculative_config
+        return spec_config is not None and (
+            spec_config.use_eagle()
+            or spec_config.uses_draft_model()
+            or spec_config.uses_extract_hidden_states()
+        )
+
+    def _skip_drafting(self) -> None:
+        """Keep model-backed DP ranks aligned and publish empty drafts."""
+        if (
+            self.parallel_config.data_parallel_size > 1
+            and self._drafter_runs_model_forward()
+        ):
+            assert self.drafter is not None
+            if isinstance(self.drafter, AscendDSparkProposer):
+                # DSpark requires a complete synthetic query group.
+                self.drafter.dummy_run(
+                    num_tokens=self.drafter.num_query_per_req,
+                    num_reqs=1,
+                )
+            else:
+                # Match upstream: one token is sufficient for the dummy rank;
+                # drafter DP synchronization pads it to the busiest rank.
+                self.drafter.dummy_run(num_tokens=1)
 
         self._draft_token_ids = [[] for _ in self.input_batch.req_ids]
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
@@ -2317,13 +2339,13 @@ class NPUModelRunner(GPUModelRunner):
 
         self.valid_sampled_token_count_gpu = None
 
-        input_fits_in_dspark = not (
-            self.speculative_config and self.speculative_config.use_dspark()
-        ) or self._input_fits_in_dspark(spec_decode_common_attn_metadata)
+        input_fits_in_drafter = self.speculative_config is None or self._input_fits_in_drafter(
+            spec_decode_common_attn_metadata
+        )
 
         def propose_draft_token_ids(sampled_token_ids):
-            if not input_fits_in_dspark:
-                self._skip_dspark_drafting()
+            if not input_fits_in_drafter:
+                self._skip_drafting()
                 return
             assert spec_decode_common_attn_metadata is not None
             self._draft_token_ids = self.propose_draft_token_ids(
