@@ -375,6 +375,14 @@ class TestDrafterMaxModelLen(unittest.TestCase):
         self.assertFalse(runner._input_fits_in_drafter(SimpleNamespace(max_seq_len=1020)))
         self.assertFalse(runner._input_fits_in_drafter(None))
 
+    def test_pp_rank_without_drafter_does_not_apply_local_limit(self):
+        runner = self._build_runner(dp_size=2)
+        runner.drafter = None
+
+        self.assertTrue(runner._input_fits_in_drafter(SimpleNamespace(max_seq_len=1024)))
+        runner._skip_drafting()
+        self.assertEqual(runner._draft_token_ids, [[], []])
+
     def test_dspark_overflow_rank_runs_complete_dp_dummy(self):
         runner = self._build_runner(dp_size=2, query_width=6)
 
