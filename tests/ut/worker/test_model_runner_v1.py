@@ -32,6 +32,27 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
 class TestDPPaddingPolicy(unittest.TestCase):
+    def test_skip_dp_sync_keeps_local_token_count(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.dp_size = 2
+        runner.dp_rank = 0
+        runner.vllm_config = SimpleNamespace()
+        module = "vllm_ascend.worker.model_runner_v1"
+
+        with (
+            patch(f"{module}.should_skip_allreduce_across_dp_group", return_value=True),
+            patch(f"{module}.dist.all_reduce") as all_reduce,
+            patch(f"{module}.select_moe_comm_method") as select_comm,
+        ):
+            maximum, across_dp, mode = runner._sync_metadata_across_dp(num_tokens=8)
+
+        self.assertEqual(maximum, 8)
+        self.assertEqual(mode, CUDAGraphMode.NONE)
+        assert across_dp is not None
+        self.assertEqual(across_dp.tolist(), [8, 8])
+        all_reduce.assert_not_called()
+        select_comm.assert_not_called()
+
     def test_sync_only_pads_for_uniform_input_consumers(self):
         module = "vllm_ascend.worker.model_runner_v1"
         cases = (
