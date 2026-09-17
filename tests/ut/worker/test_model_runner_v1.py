@@ -22,12 +22,58 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.utils import AscendDeviceType
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+
+class TestDPPaddingPolicy(unittest.TestCase):
+    def test_sync_only_pads_for_uniform_input_consumers(self):
+        module = "vllm_ascend.worker.model_runner_v1"
+        cases = (
+            ("dense_eager", None, CUDAGraphMode.NONE, False, 1, False, False),
+            ("dense_graph", None, CUDAGraphMode.FULL, False, 1, False, True),
+            ("allgather", MoECommType.ALLGATHER, CUDAGraphMode.NONE, False, 1, False, True),
+            ("mc2", MoECommType.MC2, CUDAGraphMode.NONE, False, 1, False, True),
+            ("alltoall", MoECommType.ALLTOALL, CUDAGraphMode.NONE, False, 1, False, False),
+            ("fused_mc2", MoECommType.FUSED_MC2, CUDAGraphMode.NONE, False, 1, False, False),
+            ("mega_moe", MoECommType.FUSED_MC2, CUDAGraphMode.NONE, False, 1, True, True),
+            ("finegrained_tp", None, CUDAGraphMode.NONE, False, 2, False, True),
+            ("draft", None, CUDAGraphMode.NONE, True, 1, False, True),
+        )
+        for name, comm_method, graph_mode, is_draft, finegrained_size, mega_moe, should_pad in cases:
+            with self.subTest(name=name):
+                runner = NPUModelRunner.__new__(NPUModelRunner)
+                runner.dp_size = 2
+                runner.dp_rank = 0
+                runner.vllm_config = SimpleNamespace()
+                runner.ascend_config = SimpleNamespace(
+                    finegrained_tp_config=SimpleNamespace(max_finegrained_tp_size=finegrained_size)
+                )
+
+                def all_reduce(packed_tensor, group, graph_mode=graph_mode):
+                    packed_tensor[0, 1] = 32
+                    packed_tensor[1, 1] = graph_mode.value
+
+                with (
+                    patch(f"{module}.should_skip_allreduce_across_dp_group", return_value=False),
+                    patch(f"{module}.get_dp_group", return_value=SimpleNamespace(cpu_group=None)),
+                    patch(f"{module}.dist.all_reduce", side_effect=all_reduce),
+                    patch(f"{module}.select_moe_comm_method", return_value=comm_method),
+                    patch(f"{module}.use_cann_megamoe", return_value=mega_moe),
+                ):
+                    maximum, across_dp, synced_mode = runner._sync_metadata_across_dp(
+                        num_tokens=8, is_draft_model=is_draft, cudagraph_mode=graph_mode
+                    )
+
+                self.assertEqual(maximum, 32)
+                self.assertEqual(synced_mode, graph_mode)
+                assert across_dp is not None
+                self.assertEqual(across_dp.tolist(), [32, 32] if should_pad else [8, 32])
 
 
 class TestDummyRunSlotInvalidation(unittest.TestCase):
