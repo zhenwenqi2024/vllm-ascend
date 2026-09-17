@@ -58,7 +58,7 @@ from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
 )
-from vllm_ascend.eplb_diagnostics.runtime import annotate_batch, record_diagnostics
+from vllm_ascend.eplb.diagnostics.runtime import annotate_batch, record_diagnostics
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import lmhead_tp_enable, set_potential_max_tokens, vllm_version_is
 from vllm_ascend.worker.utils import disable_compilation

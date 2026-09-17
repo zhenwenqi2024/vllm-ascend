@@ -9,7 +9,7 @@ import torch
 
 pytest.importorskip("torch_npu")
 
-from vllm_ascend.eplb_diagnostics.probe import ExpertLoadProbe
+from vllm_ascend.eplb.diagnostics.probe import ExpertLoadProbe
 from vllm_ascend.ops import register_custom_ops as custom_ops
 from vllm_ascend.ops.fused_moe import prepare_finalize as prepare
 

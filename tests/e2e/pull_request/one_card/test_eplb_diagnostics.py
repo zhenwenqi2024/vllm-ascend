@@ -7,7 +7,7 @@ import torch
 
 pytest.importorskip("torch_npu")
 
-from vllm_ascend.eplb_diagnostics.probe import ExpertLoadProbe
+from vllm_ascend.eplb.diagnostics.probe import ExpertLoadProbe
 
 
 @pytest.mark.parametrize("source_offset", [0, 2])

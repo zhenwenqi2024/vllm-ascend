@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm_ascend.eplb_diagnostics.probe import ExpertLoadProbe
+from vllm_ascend.eplb.diagnostics.probe import ExpertLoadProbe
 
 
 def layer_work(rows, window_size):

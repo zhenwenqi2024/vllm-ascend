@@ -28,7 +28,7 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
-from vllm_ascend.eplb_diagnostics.config import EplbDiagnosticsConfig
+from vllm_ascend.eplb.diagnostics.config import EplbDiagnosticsConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

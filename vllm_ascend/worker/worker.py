@@ -92,7 +92,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     plan_sparse_kv_offload_memory,
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
-from vllm_ascend.eplb_diagnostics.runtime import initialize_diagnostics, run_dummy_batch, start_diagnostics
+from vllm_ascend.eplb.diagnostics.runtime import initialize_diagnostics, run_dummy_batch, start_diagnostics
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (

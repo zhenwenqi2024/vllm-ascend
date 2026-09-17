@@ -23,7 +23,7 @@ def api():
         sys.modules["vllm_ascend"] = package
     yield SimpleNamespace(
         **{
-            name: importlib.import_module(f"vllm_ascend.eplb_diagnostics.{name}")
+            name: importlib.import_module(f"vllm_ascend.eplb.diagnostics.{name}")
             for name in ("config", "probe", "runtime")
         }
     )

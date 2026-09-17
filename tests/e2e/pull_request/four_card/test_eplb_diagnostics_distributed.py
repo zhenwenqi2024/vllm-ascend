@@ -14,9 +14,9 @@ import torch.multiprocessing as mp
 
 pytest.importorskip("torch_npu")
 
-from vllm_ascend.eplb_diagnostics.config import EplbDiagnosticsConfig
-from vllm_ascend.eplb_diagnostics.probe import ExpertLoadProbe
-from vllm_ascend.eplb_diagnostics.runtime import DiagnosticsRecorder
+from vllm_ascend.eplb.diagnostics.config import EplbDiagnosticsConfig
+from vllm_ascend.eplb.diagnostics.probe import ExpertLoadProbe
+from vllm_ascend.eplb.diagnostics.runtime import DiagnosticsRecorder
 
 
 @torch.inference_mode()
@@ -57,7 +57,7 @@ def _worker(rank, rendezvous):
         )
         output = io.StringIO()
         handler = logging.StreamHandler(output)
-        logger = logging.getLogger("vllm_ascend.eplb_diagnostics.runtime")
+        logger = logging.getLogger("vllm_ascend.eplb.diagnostics.runtime")
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
         try:
