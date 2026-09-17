@@ -1215,6 +1215,12 @@ class NPUWorker(WorkerBase):
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
+    def finish_eplb_diagnostics(self) -> None:
+        """Collect the final partial window; invoke on all EP workers after generation."""
+        recorder = getattr(self.model_runner, "_eplb_diagnostics_recorder", None)
+        if recorder is not None:
+            recorder.finish()
+
     def execute_dummy_batch(self) -> None:
         self.log_memory_stats()
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)

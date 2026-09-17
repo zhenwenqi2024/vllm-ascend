@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Bounded, window-level logging of aggregate workload across one EP group."""
+"""Bounded, per-layer workload logging across one EP group."""
 
 import functools
 import logging
-from collections import Counter, deque
+from collections import Counter
 from types import SimpleNamespace
 
 import torch
@@ -12,12 +12,12 @@ import torch
 from vllm_ascend.eplb_diagnostics.probe import ExpertLoadProbe
 
 
-def aggregate_work(rows, window_size):
+def layer_work(rows, window_size):
     """Validate source conservation and map valid routes to actual expert owners."""
     if len({r["step"] for r in rows}) != 1:
         return None, "unaligned_windows"
     names = [x["name"] for x in rows[0]["layers"]]
-    if not names or any([x["name"] for x in r["layers"]] != names for r in rows):
+    if len(names) != 1 or any([x["name"] for x in r["layers"]] != names for r in rows):
         return None, "incomplete_layer_set"
     ranks = [r["rank"] for r in rows]
     if len(set(ranks)) != len(ranks):
@@ -69,72 +69,145 @@ def aggregate_work(rows, window_size):
     total = sum(rank_work)
     if not total:
         return None, "no_real_work"
-    return {"rank_work": rank_work, "total": total, "skew": max(rank_work) * len(rows) / total, "hot": hot}, None
+    return {
+        "rank_work": rank_work,
+        "total": total,
+        "skew": max(rank_work) * len(rows) / total,
+        "hot": hot,
+        "expert_work": [{e: loads[e] for e in range(n) if owners[e] == rank} for rank in range(len(rows))],
+    }, None
 
 
-class WorkloadLogger:
-    """Print one aggregate line per window, with at most four windows of history."""
+class LayerLogger:
+    """Keep cumulative evidence for one layer, with no retained sample history."""
 
-    def __init__(self, ranks, stage):
-        self.ranks, self.stage = ranks, stage
-        self.history = deque(maxlen=4)
+    def __init__(self, ranks, stage, layer):
+        self.ranks, self.stage, self.layer = ranks, stage, layer
         self.signature = None
+        self.valid_windows = self.invalid_windows = self.observed_calls = self.imbalanced_windows = 0
+        self.hot_windows, self.streaks, self.longest = Counter(), Counter(), Counter()
+        self.expert_totals = [Counter() for _ in ranks]
+        self.hint = "collecting"
+        self.persistent = set()
 
-    def log(self, rows, window, window_size):
-        result, reason = aggregate_work(rows, window_size)
+    def log(self, rows, window, window_size, complete=True):
+        result, reason = layer_work(rows, window_size)
         logger = logging.getLogger(__name__)
         if reason:
-            self.history.clear()
+            self.streaks.clear()
+            self.invalid_windows += 1
+            self.hint = "insufficient_evidence"
             logger.info(
-                "[EPLB diagnostic] stage=%s window=%s ranks=%s insufficient_evidence=%s",
+                "[EPLB diagnostic] stage=%s layer=%s window=%s ranks=%s insufficient_evidence=%s",
                 self.stage,
+                self.layer,
                 window,
                 self.ranks,
                 reason,
             )
             return
-        # Reset persistence when source participation, phase, graph mode or
-        # placement changes. Windows contain aggregate work, not per-call peaks.
-        signature = [(r["phases"], [x["mapping"] for x in r["layers"]]) for r in rows]
+        signature = [(r["phases"], r["layers"][0]["mapping"]) for r in rows]
         if signature != self.signature:
-            self.history.clear()
+            self.streaks.clear()
         self.signature = signature
-        self.history.append((set(result["hot"]), result["skew"] >= 1.2))
-        hits = Counter(expert for hot, _ in self.history for expert in hot)
-        previous_hot = self.history[-2][0] if len(self.history) >= 2 else set()
-        persistent = {e for e in result["hot"] if e in previous_hot and hits[e] / len(self.history) >= 0.8}
-        imbalanced = sum(skew for _, skew in self.history)
-        hint = "collecting"
-        if len(self.history) >= 2:
-            hint = (
-                ("consider_eplb" if persistent else "insufficient_hotspot_evidence")
-                if (imbalanced / len(self.history) >= 0.8)
-                else "no_persistent_rank_skew"
+        self.observed_calls += window_size
+        hot = set(result["hot"])
+        if complete:
+            self.valid_windows += 1
+            self.imbalanced_windows += result["skew"] >= 1.2
+            self.hot_windows.update(hot)
+            self.streaks = Counter({e: self.streaks[e] + 1 for e in hot})
+            for expert, streak in self.streaks.items():
+                self.longest[expert] = max(self.longest[expert], streak)
+            self.persistent = {
+                e for e, hits in self.hot_windows.items() if hits / self.valid_windows >= 0.8 and self.longest[e] >= 2
+            }
+            self.hint = "collecting"
+            if self.valid_windows >= 2:
+                self.hint = (
+                    ("consider_eplb" if self.persistent else "insufficient_hotspot_evidence")
+                    if (self.imbalanced_windows / self.valid_windows >= 0.8)
+                    else "no_persistent_rank_skew"
+                )
+        for rank, counts, total, work in zip(
+            self.ranks, result["expert_work"], self.expert_totals, result["rank_work"]
+        ):
+            total.update(counts)
+            # Include owned cold experts. Expert IDs belong to this layer only.
+            logger.info(
+                "[EPLB experts] stage=%s layer=%s rank=%s window=%s window_work=%s cumulative_work=%s expert_work=%s",
+                self.stage,
+                self.layer,
+                rank,
+                window,
+                work,
+                sum(total.values()),
+                [f"{e}:{count}" for e, count in sorted(total.items())],
             )
-        hottest = sorted(result["hot"], key=lambda e: (-result["hot"][e], e))
-        hot_text = [f"{name}:{expert}({result['hot'][(name, expert)]})" for name, expert in hottest[:4]]
+        hottest = sorted(hot, key=lambda e: (-result["hot"][e], e))
+        hot_text = [f"{e}({result['hot'][(name, e)]})" for name, e in hottest[:4]]
         stable_text = [
-            f"{name}:{expert}({hits[(name, expert)]}/{len(self.history)})"
-            for name, expert in hottest
-            if (name, expert) in persistent
-        ][:4]
+            f"{e}({self.hot_windows[(name, e)]}/{self.valid_windows})" for name, e in sorted(self.persistent)
+        ]
         logger.info(
-            "[EPLB diagnostic] stage=%s window=%s calls=%s ranks=%s valid_assignments=%s rank_work=%s "
-            "window_rank_max_mean=%.3f imbalanced_windows=%s/%s hot_experts=%s "
-            "persistent_hot_count=%s persistent_hot_experts=%s hint=%s",
+            "[EPLB diagnostic] stage=%s layer=%s window=%s calls=%s ranks=%s valid_assignments=%s rank_work=%s "
+            "window_rank_max_mean=%.3f imbalanced_windows=%s/%s invalid_windows=%s observed_calls=%s "
+            "hot_experts=%s persistent_hot_experts=%s hint=%s",
             self.stage,
+            self.layer,
             window,
             window_size,
             self.ranks,
             result["total"],
             result["rank_work"],
             result["skew"],
-            imbalanced,
-            len(self.history),
+            self.imbalanced_windows,
+            self.valid_windows,
+            self.invalid_windows,
+            self.observed_calls,
             hot_text,
-            len(persistent),
             stable_text,
-            hint,
+            self.hint,
+        )
+
+
+class WorkloadLogger:
+    """Print each rank/layer, then an overall assessment based on layer evidence."""
+
+    def __init__(self, ranks, stage):
+        self.ranks, self.stage = ranks, stage
+        self.layers = {}
+
+    def log(self, rows, window, window_size, complete=True):
+        names = sorted({layer["name"] for row in rows for layer in row["layers"]} | self.layers.keys())
+        for name in names:
+            if name not in self.layers:
+                self.layers[name] = LayerLogger(self.ranks, self.stage, name)
+            scoped = [dict(row, layers=[layer for layer in row["layers"] if layer["name"] == name]) for row in rows]
+            self.layers[name].log(scoped, window, window_size, complete)
+        self.summarize(window)
+
+    def summarize(self, window, final=False):
+        names = list(self.layers)
+        counts = Counter(layer.hint for layer in self.layers.values())
+        candidates = [name for name, layer in self.layers.items() if layer.hint == "consider_eplb"]
+        conclusion = "insufficient_evidence"
+        if candidates:
+            conclusion = "consider_eplb_for_observed_layers"
+        elif counts["no_persistent_rank_skew"] == len(names) and names:
+            conclusion = "no_persistent_rank_skew_observed"
+        logging.getLogger(__name__).info(
+            "[EPLB summary] stage=%s window=%s final=%s ranks=%s layers=%s layer_assessments=%s candidate_layers=%s "
+            "invalid_layer_windows=%s conclusion=%s scope=observed_valid_windows speedup=not_estimated",
+            self.stage,
+            window,
+            final,
+            self.ranks,
+            len(names),
+            dict(counts),
+            candidates,
+            sum(layer.invalid_windows for layer in self.layers.values()),
+            conclusion,
         )
 
 
@@ -145,7 +218,7 @@ class DiagnosticsRecorder:
         self.summary = WorkloadLogger(list(group.ranks), stage)
         self.step = self.tokens = 0
         self.phases = set()
-        self.collecting = self.real = False
+        self.collecting = self.real = self.finished = False
         self.layout = [
             {
                 "name": name,
@@ -159,7 +232,11 @@ class DiagnosticsRecorder:
     def begin(self, tokens, dummy=False):
         self.step += 1
         offset = self.step - self.config.warmup_steps - 1
-        self.collecting = 0 <= offset < self.config.window_size * self.config.max_windows
+        self.collecting = (
+            not self.finished
+            and offset >= 0
+            and (self.config.max_windows == 0 or offset < self.config.window_size * self.config.max_windows)
+        )
         self.real = not dummy
         if self.collecting and offset % self.config.window_size == 0:
             self.tokens = 0
@@ -173,6 +250,9 @@ class DiagnosticsRecorder:
     def end(self):
         if not self.collecting or (self.step - self.config.warmup_steps) % self.config.window_size:
             return
+        self._collect(self.config.window_size)
+
+    def _collect(self, calls, complete=True):
         # Deliberately synchronous only once per window. All group members,
         # including idle DP participants, must join in model-collective order.
         # Dummy requests contribute no routes/tokens or timing; their participation
@@ -193,7 +273,22 @@ class DiagnosticsRecorder:
             torch.distributed.all_gather_object(rows, row, group=self.group.cpu_group)
         if self.group.rank_in_group == 0:
             self.summary.log(
-                rows, (self.step - self.config.warmup_steps) // self.config.window_size, self.config.window_size
+                rows, (self.step - self.config.warmup_steps - 1) // self.config.window_size + 1, calls, complete
+            )
+
+    @torch.inference_mode()
+    def finish(self):
+        """Called collectively after generation, never from asynchronous teardown."""
+        if self.finished:
+            return
+        pending = (self.step - self.config.warmup_steps) % self.config.window_size
+        if self.collecting and pending:
+            self._collect(pending, complete=False)
+        self.finished = True
+        self.source_tokens.zero_()
+        if self.group.rank_in_group == 0:
+            self.summary.summarize(
+                max(0, (self.step - self.config.warmup_steps - 1) // self.config.window_size + 1), final=True
             )
 
 
@@ -250,7 +345,7 @@ def start_diagnostics(runner):
         runner._eplb_diagnostics_source_tokens,
     )
     logging.getLogger(__name__).info(
-        "EPLB diagnostics: aggregate valid MoE assignments per EP group/stage; synchronous window summaries; "
+        "EPLB diagnostics: per-layer valid MoE assignments across each EP group/stage; synchronous window summaries; "
         "dummy/padding excluded. consider_eplb is a load signal, not a speedup prediction."
     )
 

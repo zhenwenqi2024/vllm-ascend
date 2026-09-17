@@ -33,7 +33,7 @@ def api():
                 del sys.modules[name]
 
 
-def rows():
+def rows(two_layers=False):
     # Two layers on noncontiguous ranks. EP owners deliberately differ from
     # expert-ID modulo rank count. Each rank supplies four top-1 assignments.
     return [
@@ -51,20 +51,20 @@ def rows():
                     "mapping": [0, 1, -1, -1] if i == 0 else [-1, -1, 0, 1],
                     "counts": [3, 1, 0, 0, 8, 0],
                 }
-                for name in ("layer.0", "layer.1")
+                for name in (("layer.0", "layer.1") if two_layers else ("layer.0",))
             ],
         }
         for i, rank in enumerate((2, 5))
     ]
 
 
-def test_aggregate_all_layers_and_real_owners(api):
-    result, reason = api.runtime.aggregate_work(rows(), 8)
+def test_layer_work_and_real_owners(api):
+    result, reason = api.runtime.layer_work(rows(), 8)
     assert reason is None
-    assert result["total"] == 16
-    assert result["rank_work"] == [16, 0]
+    assert result["total"] == 8
+    assert result["rank_work"] == [8, 0]
     assert result["skew"] == 2
-    assert result["hot"] == {("layer.0", 0): 6, ("layer.1", 0): 6}
+    assert result["hot"] == {("layer.0", 0): 6}
 
 
 @pytest.mark.parametrize(
@@ -105,7 +105,7 @@ def test_incomplete_data_never_becomes_balance(api, problem, reason):
         layer["mapping"] = [0, 1, -1, -1]
     else:
         layer["top_k"] = 2
-    assert api.runtime.aggregate_work(data, 8) == (None, reason)
+    assert api.runtime.layer_work(data, 8) == (None, reason)
 
 
 def test_tp_shards_and_idle_dp_sources(api):
@@ -113,67 +113,118 @@ def test_tp_shards_and_idle_dp_sources(api):
     for row in data:
         row["tp_ranks"] = [2, 5]
         row["tokens"] = 8
-    assert api.runtime.aggregate_work(data, 8)[0]["total"] == 16
+    assert api.runtime.layer_work(data, 8)[0]["total"] == 8
     data = rows()
     data[1]["tokens"] = 0
     for layer in data[1]["layers"]:
         layer["counts"][:4] = [0] * 4
-    assert api.runtime.aggregate_work(data, 8)[0]["rank_work"] == [8, 0]
+    assert api.runtime.layer_work(data, 8)[0]["rank_work"] == [4, 0]
     for row in data:
         row["tokens"] = 0
         for layer in row["layers"]:
             layer["counts"][:4] = [0] * 4
-    assert api.runtime.aggregate_work(data, 8) == (None, "no_real_work")
+    assert api.runtime.layer_work(data, 8) == (None, "no_real_work")
 
 
-def test_print_one_overall_line_and_persistence(api, caplog):
+def diagnostics(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("[EPLB diagnostic]")]
+
+
+def test_rank_expert_totals_and_layer_persistence(api, caplog):
     caplog.set_level(logging.INFO)
     summary = api.runtime.WorkloadLogger([2, 5], 1)
     summary.log(rows(), 1, 8)
-    assert "hint=collecting" in caplog.text
     summary.log(rows(), 2, 8)
-    assert len(caplog.records) == 2
-    assert "valid_assignments=16 rank_work=[16, 0]" in caplog.text
-    assert "persistent_hot_count=2" in caplog.text
-    assert "hint=consider_eplb" in caplog.text
-    # A missing window cannot extend a hotspot's persistence.
+    assert len(diagnostics(caplog)) == 2
+    assert "valid_assignments=8 rank_work=[8, 0]" in caplog.text
+    assert "persistent_hot_experts=['0(2/2)']" in caplog.text
+    assert "cumulative_work=16 expert_work=['0:12', '1:4']" in caplog.text
+    assert "expert_work=['2:0', '3:0']" in caplog.text
+    assert "conclusion=consider_eplb_for_observed_layers" in caplog.text
     data = rows()
     data[1]["step"] = 9
     summary.log(data, 3, 8)
-    caplog.clear()
+    layer = summary.layers["layer.0"]
+    assert layer.invalid_windows == 1 and not layer.streaks
+    assert layer.valid_windows == 2
+    assert layer.hint == "insufficient_evidence"
     summary.log(rows(), 4, 8)
-    assert "hint=collecting" in caplog.text
+    assert layer.valid_windows == 3
     data = rows()
     data[0]["phases"] = [("prefill", "NONE")]
     summary.log(data, 5, 8)
-    assert len(summary.history) == 1
+    assert layer.streaks[("layer.0", 0)] == 1
 
 
-def test_aggregate_balance_can_hide_layer_skew(api, caplog):
+def test_opposite_layer_skew_does_not_cancel(api, caplog):
     caplog.set_level(logging.INFO)
-    data = rows()
+    data = rows(two_layers=True)
     for row in data:
         row["layers"][1]["counts"][:4] = [0, 0, 3, 1]
     summary = api.runtime.WorkloadLogger([2, 5], 0)
     summary.log(data, 1, 8)
+    caplog.clear()
     summary.log(data, 2, 8)
-    assert "rank_work=[8, 8]" in caplog.text
-    assert "hint=no_persistent_rank_skew" in caplog.text
+    first, second = diagnostics(caplog)
+    assert "layer=layer.0" in first and "rank_work=[8, 0]" in first
+    assert "layer=layer.1" in second and "rank_work=[0, 8]" in second
+    assert all("hint=consider_eplb" in line for line in (first, second))
+    assert "candidate_layers=['layer.0', 'layer.1']" in caplog.text
+    data[1]["layers"][1]["counts"][-1] = 1
+    caplog.clear()
+    summary.log(data, 3, 8)
+    assert "insufficient_evidence=" in diagnostics(caplog)[1]
+    assert summary.layers["layer.0"].valid_windows == 3
+    assert summary.layers["layer.1"].valid_windows == 2
+    assert summary.layers["layer.1"].invalid_windows == 1
 
 
-def test_hot_expert_rotation_is_not_persistence(api, caplog):
+def test_layer_hotspot_histories_are_independent(api, caplog):
+    caplog.set_level(logging.INFO)
+    summary = api.runtime.WorkloadLogger([2, 5], 0)
+    data = rows(two_layers=True)
+    summary.log(data, 1, 8)
+    for row in data:
+        row["layers"][1]["counts"][:4] = [1, 3, 0, 0]
+    caplog.clear()
+    summary.log(data, 2, 8)
+    assert "hint=consider_eplb" in diagnostics(caplog)[0]
+    assert "hint=insufficient_hotspot_evidence" in diagnostics(caplog)[1]
+
+
+def test_run_history_is_cumulative_not_last_four_windows(api, caplog):
     caplog.set_level(logging.INFO)
     summary = api.runtime.WorkloadLogger([2, 5], 0)
     summary.log(rows(), 1, 8)
     data = rows()
     for row in data:
-        for layer in row["layers"]:
-            layer["counts"][:4] = [1, 3, 0, 0]
+        data_layer = row["layers"][0]
+        data_layer["counts"][:4] = [1, 3, 0, 0]
     summary.log(data, 2, 8)
     assert "hint=insufficient_hotspot_evidence" in caplog.text
     for window in range(3, 9):
         summary.log(data, window, 8)
-    assert len(summary.history) == 4
+    layer = summary.layers["layer.0"]
+    assert layer.valid_windows == 8
+    assert layer.hot_windows[("layer.0", 1)] == 7
+    assert sum(sum(counts.values()) for counts in layer.expert_totals) == 64
+
+
+def test_partial_window_counts_work_but_not_persistence(api, caplog):
+    caplog.set_level(logging.INFO)
+    summary = api.runtime.WorkloadLogger([2, 5], 0)
+    summary.log(rows(), 1, 8)
+    data = rows()
+    for row in data:
+        row["layers"][0]["counts"][-2] = 1
+    summary.log(data, 2, 1, complete=False)
+    layer = summary.layers["layer.0"]
+    assert layer.valid_windows == 1 and layer.observed_calls == 9
+    assert not layer.persistent
+    assert sum(sum(counts.values()) for counts in layer.expert_totals) == 16
+    summary.summarize(2, final=True)
+    assert "final=True" in caplog.text
+    assert "conclusion=insufficient_evidence" in caplog.text
 
 
 def test_probe_padding_source_offset_dummy_and_stable_storage(api):
@@ -223,6 +274,37 @@ def test_window_collection_limits_and_dummy(api, monkeypatch, caplog):
     assert calls[0]["layers"][0]["counts"] == [1, 0, 2, 0]
     assert "valid_assignments=1" in caplog.text
     assert source.item() == 0
+
+
+@pytest.mark.parametrize("steps", [1, 3, 6])
+def test_finish_collects_tail_once_and_stops(api, monkeypatch, caplog, steps):
+    caplog.set_level(logging.INFO)
+    config = api.config.EplbDiagnosticsConfig(mode="observe", warmup_steps=0, window_size=2, max_windows=0)
+    probe = api.probe.ExpertLoadProbe(2, "cpu")
+    source = torch.tensor(0)
+    probe.source_token_count, probe.source_positions = source, torch.arange(1)
+    layer = SimpleNamespace(
+        eplb_diagnostic_probe=probe,
+        ascend_expert_map=torch.tensor([0, 1]),
+        moe_config=SimpleNamespace(experts_per_token=1),
+        local_num_experts=2,
+    )
+    group = SimpleNamespace(ranks=[0], rank_in_group=0, cpu_group=None)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", lambda out, row, group: out.__setitem__(0, row))
+    recorder = api.runtime.DiagnosticsRecorder(config, [("layer", layer)], group, [0], 0, source)
+    for _ in range(steps):
+        recorder.begin(1)
+        probe.record_routes(torch.tensor([[0]]), torch.tensor([True]))
+        recorder.end()
+    recorder.finish()
+    recorder.finish()
+    summary = recorder.summary.layers["layer"]
+    assert summary.observed_calls == steps
+    assert summary.valid_windows == steps // 2
+    assert summary.expert_totals[0][0] == steps
+    assert caplog.text.count("final=True") == 1
+    recorder.begin(1)
+    assert not recorder.collecting and source.item() == 0
 
 
 def test_wrapper_nested_dummy_and_failure(api, monkeypatch):
