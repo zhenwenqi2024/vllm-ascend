@@ -397,7 +397,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             get_tensor_model_parallel_rank() if ascend_config.eplb_diagnostics.mode != "off" else 0
         )
         self.eplb_diagnostic_probe = (
-            ExpertLoadProbe(self.local_num_experts, "npu", self.moe_config.num_experts)
+            ExpertLoadProbe(self.moe_config.num_experts, "npu")
             if ascend_config.eplb_diagnostics.mode != "off"
             else None
         )
@@ -713,13 +713,6 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         finally:
             self.ascend_pertoken_scale = None
             self.ascend_mc2_mask = None
-
-        if self.eplb_diagnostic_probe is not None:
-            self.eplb_diagnostic_probe.record(
-                fused_experts_results.expert_tokens,
-                fused_experts_results.group_list_type,
-                type(_EXTRA_CTX.moe_comm_method).__name__,
-            )
 
         if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
             expert_tokens = fused_experts_results.expert_tokens

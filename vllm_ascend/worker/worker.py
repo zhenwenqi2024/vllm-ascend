@@ -364,14 +364,6 @@ class NPUWorker(WorkerBase):
         self._weight_update_active = False
 
     def shutdown(self) -> None:
-        model_runner = getattr(self, "model_runner", None)
-        diagnostics = getattr(model_runner, "_eplb_diagnostics_recorder", None)
-        if diagnostics is not None:
-            try:
-                diagnostics.close()
-            except Exception:
-                logger.exception("Failed to drain EPLB diagnostic samples during shutdown")
-
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
 

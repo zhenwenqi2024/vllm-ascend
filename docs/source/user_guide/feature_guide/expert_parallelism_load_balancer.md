@@ -1,7 +1,7 @@
 # Expert Parallelism Load Balancer (EPLB)
 
-For experimental passive load diagnostics, including ACL graph collection and
-offline analysis, see [EPLB diagnostics](eplb_diagnostics.md).
+For runtime logs of aggregate MoE work and persistent hot experts with EPLB
+disabled, see [EPLB diagnostics](eplb_diagnostics.md).
 
 ## Overview
 

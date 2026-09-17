@@ -1,291 +1,233 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Local, bounded asynchronous snapshots outside eager/ACL graph execution."""
+"""Bounded, window-level logging of aggregate workload across one EP group."""
 
 import functools
-import json
 import logging
-import os
-import socket
-import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
-from pathlib import Path
+from collections import Counter, deque
 from types import SimpleNamespace
 
 import torch
 
 from vllm_ascend.eplb_diagnostics.probe import ExpertLoadProbe
-from vllm_ascend.eplb_diagnostics.schema import decode_sample, fingerprint, local_logical_ids
 
 
-def _layout_tensors(layer) -> tuple[dict, dict[str, torch.Tensor]]:
-    v2 = layer._use_v2_model_runner
-    state = getattr(getattr(layer, "router", None), "eplb_state", None)
-    logical_map = getattr(state, "logical_to_physical_map", None) if v2 else None
-    metadata = {
-        "map_semantics": "physical_to_local" if v2 else "logical_to_local",
-        "dynamic_eplb": bool(logical_map is not None) if v2 else layer.dynamic_eplb,
-        "num_logical_experts": layer.moe_config.num_logical_experts,
-        "experts_per_token": getattr(layer.moe_config, "experts_per_token", None),
-        "num_shared_experts": layer.n_shared_experts,
-        "mixed_shared_placement": layer.mix_placement,
-        "ep_size": layer.moe_config.ep_size,
-        "ep_rank": layer.moe_config.ep_rank,
-    }
-    tensors = {}
-    if layer.ascend_expert_map is not None:
-        tensors["global_to_local"] = layer.ascend_expert_map
-    if logical_map is not None:
-        # Upstream reserves 1024 replica slots per logical expert. Only
-        # 1 + total redundant experts can be populated for any one expert.
-        # Use the host configuration bound; reading the device max would sync.
-        physical_experts = getattr(layer.moe_config, "num_experts", None)
-        if physical_experts is not None and physical_experts >= layer.moe_config.num_logical_experts:
-            max_replicas = physical_experts - layer.moe_config.num_logical_experts + 1
-            metadata["logical_to_physical_storage_shape"] = list(logical_map.shape)
-            logical_map = logical_map[:, :max_replicas]
-        tensors["logical_to_physical"] = logical_map
-    replica_count = getattr(state, "logical_replica_count", None)
-    if v2 and replica_count is not None:
-        tensors["logical_replica_count"] = replica_count
-    replica_table = getattr(state, "expert_replica_routing_table", None)
-    if v2 and replica_table is not None:
-        # This expanded lookup is derived from the compact map/count and EP rank.
-        # Copying it for every layer can exceed the entire snapshot budget.
-        metadata["replica_routing_table_shape"] = list(replica_table.shape)
-        metadata["replica_routing_table_snapshot"] = "omitted_derived_lookup"
-    if not v2 and layer.log2phy is not None:
-        tensors["selected_physical_map"] = layer.log2phy
-    return metadata, tensors
+def aggregate_work(rows, window_size):
+    """Validate source conservation and map valid routes to actual expert owners."""
+    if len({r["step"] for r in rows}) != 1:
+        return None, "unaligned_windows"
+    names = [x["name"] for x in rows[0]["layers"]]
+    if not names or any([x["name"] for x in r["layers"]] != names for r in rows):
+        return None, "incomplete_layer_set"
+    ranks = [r["rank"] for r in rows]
+    if len(set(ranks)) != len(ranks):
+        return None, "duplicate_rank"
+    sources = {}
+    for row in rows:
+        sources.setdefault(tuple(row["tp_ranks"]), []).append(row)
+    for tp, members in sources.items():
+        if set(tp) != {r["rank"] for r in members} or len({r["tokens"] for r in members}) != 1:
+            return None, "source_tp_mismatch"
+    rank_work, hot = [0] * len(rows), {}
+    for index, name in enumerate(names):
+        layers = [r["layers"][index] for r in rows]
+        n = len(layers[0]["counts"]) - 2
+        top_k = layers[0]["top_k"]
+        if n <= 0 or top_k <= 0 or any(len(x["counts"]) != n + 2 or x["top_k"] != top_k for x in layers):
+            return None, "expert_space_mismatch"
+        if any(x["counts"][-2] != window_size or x["counts"][-1] or min(x["counts"]) < 0 for x in layers):
+            return None, "unsupported_routing_or_call_count"
+        for members in sources.values():
+            actual = sum(sum(r["layers"][index]["counts"][:-2]) for r in members)
+            if actual != members[0]["tokens"] * top_k:
+                return None, "source_conservation_failure"
+        owners = {}
+        for owner, layer in enumerate(layers):
+            mapping = layer["mapping"]
+            local_slots = [slot for slot in mapping if slot >= 0]
+            if (
+                len(mapping) != n
+                or len(local_slots) != layer["local_experts"]
+                or set(local_slots) != set(range(layer["local_experts"]))
+            ):
+                return None, "invalid_expert_mapping"
+            for expert, slot in enumerate(mapping):
+                if slot >= 0:
+                    if expert in owners:
+                        return None, "duplicate_expert_owner"
+                    owners[expert] = owner
+        if len(owners) != n:
+            return None, "missing_expert_owner"
+        loads = [sum(x["counts"][e] for x in layers) for e in range(n)]
+        for expert, count in enumerate(loads):
+            rank_work[owners[expert]] += count
+        mean = sum(loads) / n
+        cutoff = sorted(loads, reverse=True)[min(4, n) - 1]
+        hot.update(
+            {(name, e): count for e, count in enumerate(loads) if count > 0 and count >= max(cutoff, 1.2 * mean)}
+        )
+    total = sum(rank_work)
+    if not total:
+        return None, "no_real_work"
+    return {"rank_work": rank_work, "total": total, "skew": max(rank_work) * len(rows) / total, "hot": hot}, None
 
 
-class NpuSnapshotBackend:
-    """D2H is enqueued on the inference stream; only the writer waits for its event."""
+class WorkloadLogger:
+    """Print one aggregate line per window, with at most four windows of history."""
 
-    def __init__(self, device):
-        self.device = device
+    def __init__(self, ranks, stage):
+        self.ranks, self.stage = ranks, stage
+        self.history = deque(maxlen=4)
+        self.signature = None
 
-    def copy(self, source: torch.Tensor) -> torch.Tensor:
-        if source.device.type == "cpu":
-            return source.clone()
-        target = torch.empty(source.shape, dtype=source.dtype, device="cpu", pin_memory=True)
-        target.copy_(source, non_blocking=True)
-        return target
-
-    def event(self, timing: bool = False):
-        event = torch.npu.Event(enable_timing=timing)
-        event.record()
-        return event
-
-    def finish(self, ready, start, end) -> float:
-        # This method only runs on the writer thread. This is event-specific, not a
-        # device-wide synchronize, and adds no barrier between inference ranks.
-        with torch.npu.device(self.device):
-            ready.synchronize()
-            return start.elapsed_time(end)
+    def log(self, rows, window, window_size):
+        result, reason = aggregate_work(rows, window_size)
+        logger = logging.getLogger(__name__)
+        if reason:
+            self.history.clear()
+            logger.info(
+                "[EPLB diagnostic] stage=%s window=%s ranks=%s insufficient_evidence=%s",
+                self.stage,
+                window,
+                self.ranks,
+                reason,
+            )
+            return
+        # Reset persistence when source participation, phase, graph mode or
+        # placement changes. Windows contain aggregate work, not per-call peaks.
+        signature = [(r["phases"], [x["mapping"] for x in r["layers"]]) for r in rows]
+        if signature != self.signature:
+            self.history.clear()
+        self.signature = signature
+        self.history.append((set(result["hot"]), result["skew"] >= 1.2))
+        hits = Counter(expert for hot, _ in self.history for expert in hot)
+        previous_hot = self.history[-2][0] if len(self.history) >= 2 else set()
+        persistent = {e for e in result["hot"] if e in previous_hot and hits[e] / len(self.history) >= 0.8}
+        imbalanced = sum(skew for _, skew in self.history)
+        hint = "collecting"
+        if len(self.history) >= 2:
+            hint = (
+                ("consider_eplb" if persistent else "insufficient_hotspot_evidence")
+                if (imbalanced / len(self.history) >= 0.8)
+                else "no_persistent_rank_skew"
+            )
+        hottest = sorted(result["hot"], key=lambda e: (-result["hot"][e], e))
+        hot_text = [f"{name}:{expert}({result['hot'][(name, expert)]})" for name, expert in hottest[:4]]
+        stable_text = [
+            f"{name}:{expert}({hits[(name, expert)]}/{len(self.history)})"
+            for name, expert in hottest
+            if (name, expert) in persistent
+        ][:4]
+        logger.info(
+            "[EPLB diagnostic] stage=%s window=%s calls=%s ranks=%s valid_assignments=%s rank_work=%s "
+            "window_rank_max_mean=%.3f imbalanced_windows=%s/%s hot_experts=%s "
+            "persistent_hot_count=%s persistent_hot_experts=%s hint=%s",
+            self.stage,
+            window,
+            window_size,
+            self.ranks,
+            result["total"],
+            result["rank_work"],
+            result["skew"],
+            imbalanced,
+            len(self.history),
+            hot_text,
+            len(persistent),
+            stable_text,
+            hint,
+        )
 
 
 class DiagnosticsRecorder:
-    def __init__(self, config, layers, metadata: dict, backend):
-        self.config = config
-        self.layers = layers
-        self.metadata = metadata
-        self.backend = backend
-        self.step = 0
-        self.model_step = 0
-        self.dropped = 0
-        self.collected = 0
-        self.drop_reasons: dict[str, int] = {}
-        self.pending: list[Future] = []
-        self.active: dict | None = None
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eplb-diagnostics")
-        directory = Path(config.output_dir)
-        directory.mkdir(parents=True, exist_ok=True)
-        # An exclusive per-process file prevents duplicate ranks/restarts overwriting logs.
-        name = f"{config.run_id}-rank{metadata['rank']}-{uuid.uuid4().hex[:12]}.jsonl"
-        self.path = directory / name
-        self.path.touch(exist_ok=False)
-
-    def _snapshots(self, descriptions):
-        return [
+    def __init__(self, config, layers, group, tp_ranks, stage, source_tokens):
+        self.config, self.layers, self.group = config, layers, group
+        self.tp_ranks, self.source_tokens = list(tp_ranks), source_tokens
+        self.summary = WorkloadLogger(list(group.ranks), stage)
+        self.step = self.tokens = 0
+        self.phases = set()
+        self.collecting = self.real = False
+        self.layout = [
             {
-                "layer": name,
-                "num_experts": layer.eplb_diagnostic_probe.num_experts,
-                "counts": self.backend.copy(layer.eplb_diagnostic_probe.totals),
-                "routes": self.backend.copy(layer.eplb_diagnostic_probe.route_totals),
-                "layout_metadata": metadata.copy(),
-                "layout_tensors": {key: self.backend.copy(value) for key, value in tensors.items()},
+                "name": name,
+                "mapping": layer.ascend_expert_map.cpu().tolist(),
+                "top_k": layer.moe_config.experts_per_token,
+                "local_experts": layer.local_num_experts,
             }
-            for (name, layer), (metadata, tensors) in zip(self.layers, descriptions)
+            for name, layer in layers
         ]
 
-    def begin(self, batch: dict) -> bool:
+    def begin(self, tokens, dummy=False):
         self.step += 1
-        # Propagate writer failures at the next boundary, where the wrapper can
-        # disable collection and report the error without masking inference errors.
-        running = []
-        for future in self.pending:
-            if future.done():
-                future.result()
-            else:
-                running.append(future)
-        self.pending = running
-        # Empty scheduler boundaries do not execute the model. Idle DP dummy
-        # work does execute collectives and must advance the expected ordinal.
-        if batch.get("scheduled_tokens", 1) == 0 and not batch.get("dummy_run"):
-            return False
-        self.model_step += 1
-        # Dummy collectives still advance the device call counters. Track only
-        # that ordinal on the host: no snapshots, timing, rows, or sample budget.
-        if batch.get("dummy_run") or batch.get("phase") == "dummy":
-            return False
-        if self.collected >= self.config.max_samples:
-            return False
-        if self.model_step <= self.config.warmup_steps:
-            return False
-        if (self.model_step - self.config.warmup_steps - 1) % self.config.sample_interval >= self.config.burst_size:
-            return False
-        if len(self.pending) >= self.config.max_pending:
-            self._drop("writer_backpressure")
-            return False
-        descriptions = [_layout_tensors(layer) for _, layer in self.layers]
-        size = sum(
-            (layer.eplb_diagnostic_probe.totals.numel() + layer.eplb_diagnostic_probe.route_totals.numel()) * 8
-            + sum(t.numel() * t.element_size() for t in tensors.values())
-            for (_, layer), (_, tensors) in zip(self.layers, descriptions)
-        )
-        if 2 * size > self.config.max_snapshot_mb * 1024 * 1024:
-            self._drop("snapshot_memory_budget")
-            return False
-        before = self._snapshots(descriptions)
-        self.collected += 1
-        self.active = {
+        offset = self.step - self.config.warmup_steps - 1
+        self.collecting = 0 <= offset < self.config.window_size * self.config.max_windows
+        self.real = not dummy
+        if self.collecting and offset % self.config.window_size == 0:
+            self.tokens = 0
+            self.phases.clear()
+            for _, layer in self.layers:
+                layer.eplb_diagnostic_probe.totals.zero_()
+        self.source_tokens.fill_(tokens if self.collecting and self.real else 0)
+        if self.collecting and self.real:
+            self.tokens += tokens
+
+    def end(self):
+        if not self.collecting or (self.step - self.config.warmup_steps) % self.config.window_size:
+            return
+        # Deliberately synchronous only once per window. All group members,
+        # including idle DP participants, must join in model-collective order.
+        # Dummy requests contribute no routes/tokens or timing; their participation
+        # is control bookkeeping. No world/PP collective is added here.
+        counters = [layer.eplb_diagnostic_probe.totals for _, layer in self.layers]
+        snapshots = torch.cat(counters).cpu().split([counter.numel() for counter in counters])
+        row = {
             "step": self.step,
-            "model_step": self.model_step,
-            "batch": batch,
-            "before": before,
-            "start": self.backend.event(timing=True),
-            "dropped_samples": self.dropped,
-            "drop_reasons": self.drop_reasons.copy(),
+            "rank": self.group.ranks[self.group.rank_in_group],
+            "tp_ranks": self.tp_ranks,
+            "tokens": self.tokens,
+            "phases": sorted(self.phases),
+            "layers": [dict(layout, counts=counts.tolist()) for layout, counts in zip(self.layout, snapshots)],
         }
-        return True
-
-    def _drop(self, reason: str) -> None:
-        self.dropped += 1
-        self.drop_reasons[reason] = self.drop_reasons.get(reason, 0) + 1
-        if self.drop_reasons[reason] == 1:
-            logging.getLogger(__name__).warning("EPLB diagnostic samples dropped: %s", reason)
-
-    def annotate(self, **metadata) -> None:
-        if self.active is not None:
-            self.active["batch"].update(metadata)
-
-    def end(self) -> None:
-        sample = self.active
-        if sample is not None and (sample["batch"].get("dummy_run") or sample["batch"].get("phase") == "dummy"):
-            # Defensive fallback if the runner identifies synthetic work late.
-            # Drain an already queued before-copy, but never export this sample.
-            self.collected -= 1
-            self.abort()
-            return
-        self.active = None
-        if sample is None:
-            return
-        sample["end"] = self.backend.event(timing=True)
-        sample["after"] = self._snapshots([_layout_tensors(layer) for _, layer in self.layers])
-        sample["ready"] = self.backend.event()
-        self.pending.append(self.executor.submit(self._write, sample))
-
-    def abort(self) -> None:
-        # Inference errors still propagate. Drain outstanding copies in a background
-        # task before releasing their pinned destinations.
-        sample = self.active
-        self.active = None
-        if sample is not None:
-            end = self.backend.event(timing=True)
-            ready = self.backend.event()
-            self.pending.append(self.executor.submit(self._discard, sample, ready, end))
-
-    def _discard(self, sample, ready, end) -> None:
-        self.backend.finish(ready, sample["start"], end)
-
-    @staticmethod
-    def _decode_layout(snapshot: dict) -> dict:
-        layout = snapshot["layout_metadata"].copy()
-        layout.update({key: value.tolist() for key, value in snapshot["layout_tensors"].items()})
-        return layout
-
-    def _write(self, sample) -> None:
-        elapsed_ms = self.backend.finish(sample["ready"], sample["start"], sample["end"])
-        record = {
-            "schema_version": 1,
-            "run_id": self.config.run_id,
-            **self.metadata,
-            "local_step": sample["step"],
-            "expected_model_calls": sample["model_step"],
-            "batch": sample["batch"],
-            "execute_stream_ms": elapsed_ms,
-            "timing_scope": "execute_model_current_stream_including_instrumentation",
-            "dropped_samples": sample["dropped_samples"],
-            "drop_reasons": sample["drop_reasons"],
-            "layers": [],
-        }
-        for before, after in zip(sample["before"], sample["after"]):
-            info = decode_sample(before["counts"].tolist(), after["counts"].tolist(), before["num_experts"])
-            routes = (after["routes"] - before["routes"]).tolist()
-            route_valid = (
-                len(routes) > 2
-                and routes[-2] == info["calls"] == 1
-                and routes[-1] == 0
-                and all(value >= 0 for value in routes)
+        rows = [None] * len(self.group.ranks)
+        # Gloo writes its temporary receive tensors from a background thread.
+        with torch.inference_mode(False):
+            torch.distributed.all_gather_object(rows, row, group=self.group.cpu_group)
+        if self.group.rank_in_group == 0:
+            self.summary.log(
+                rows, (self.step - self.config.warmup_steps) // self.config.window_size, self.config.window_size
             )
-            info["routing"] = {
-                "semantics": "valid_scheduled_mc2_source_destinations" if route_valid else "unavailable",
-                "physical_assignments": routes[:-2] if route_valid else None,
-                "recorded_calls": routes[-2],
-                "invalid_ids": routes[-1],
-            }
-            info["alignment_eligible"] = (
-                self.metadata.get("alignment_contract") == "post_warmup_executed_collective_v2"
-                and info["call_start"] == sample["model_step"] - 1
-                and info["call_end"] == sample["model_step"]
-            )
-            layout_start = self._decode_layout(before)
-            layout_end = self._decode_layout(after)
-            info.update(
-                layer=before["layer"],
-                layout_start=layout_start,
-                layout_end=layout_end,
-                layout_changed=layout_start != layout_end,
-                layout_fingerprint=fingerprint(layout_end),
-                local_logical_ids=local_logical_ids(layout_end, before["num_experts"]),
-                moe_device_ms=None,
-                moe_timing_missing_reason="requires_graph_aware_device_profiler",
-                comm_methods=list(ExpertLoadProbe.COMM_METHODS),
-            )
-            record["layers"].append(info)
-        with self.path.open("a", encoding="utf-8") as output:
-            output.write(json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n")
-
-    def close(self) -> None:
-        """Drain after inference stops; never call this from the inference hot path."""
-        self.executor.shutdown(wait=True)
-        for future in self.pending:
-            future.result()
 
 
-def _create_recorder(runner):
-    # Lazy imports isolate the portable probe/schema tests from vLLM initialization.
-    from vllm.distributed.parallel_state import (
-        get_dcp_group,
-        get_dp_group,
-        get_ep_group,
-        get_etp_group,
-        get_pcp_group,
-        get_pp_group,
-        get_tp_group,
-        get_world_group,
+def annotate_batch(runner, **metadata):
+    recorder = getattr(runner, "_eplb_diagnostics_recorder", None)
+    if recorder is not None and recorder.collecting and recorder.real:
+        recorder.phases.add((metadata["phase"], metadata["graph_mode"]))
+
+
+@torch.inference_mode()
+def initialize_diagnostics(runner):
+    if runner.ascend_config.eplb_diagnostics.mode == "off":
+        return
+    parallel = runner.vllm_config.parallel_config
+    if not parallel.enable_expert_parallel or parallel.enable_eplb or runner.ascend_config.eplb_config.dynamic_eplb:
+        raise ValueError("EPLB diagnostics requires EP enabled and EPLB disabled.")
+    config = runner.vllm_config
+    capacity = max(
+        config.scheduler_config.max_num_batched_tokens, max(config.compilation_config.cudagraph_capture_sizes or [0])
     )
+    source_tokens = torch.zeros((), dtype=torch.int64, device=runner.device)
+    positions = torch.arange(capacity, device=runner.device)
+    for layer in runner.model.modules():
+        probe = getattr(layer, "eplb_diagnostic_probe", None)
+        if isinstance(probe, ExpertLoadProbe):
+            probe.source_token_count, probe.source_positions = source_tokens, positions
+    runner._eplb_diagnostics_source_tokens = source_tokens
+
+
+def start_diagnostics(runner):
+    if runner.ascend_config.eplb_diagnostics.mode == "off":
+        return
+    # Import after worker initialization; portable tests do not initialize vLLM.
+    from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 
     from vllm_ascend.distributed.parallel_state import get_mc2_group
 
@@ -294,182 +236,56 @@ def _create_recorder(runner):
         for name, layer in runner.model.named_modules()
         if isinstance(getattr(layer, "eplb_diagnostic_probe", None), ExpertLoadProbe)
     ]
-    if not layers:
-        raise ValueError("No AscendRoutedExperts diagnostic probes found in the target model.")
-    groups = {}
-    for name, getter in (
-        ("world", get_world_group),
-        ("ep", get_ep_group),
-        ("tp", get_tp_group),
-        ("etp", get_etp_group),
-        ("dp", get_dp_group),
-        ("pp", get_pp_group),
-        ("pcp", get_pcp_group),
-        ("dcp", get_dcp_group),
-        ("mc2", get_mc2_group),
+    if not layers or any(
+        layer.ascend_expert_map is None or layer.moe_config.num_experts != layer.moe_config.num_logical_experts
+        for _, layer in layers
     ):
-        try:
-            group = getter()
-        except AssertionError:
-            continue
-        groups[name] = {"ranks": list(group.ranks), "rank_in_group": group.rank_in_group}
-    parallel = runner.vllm_config.parallel_config
-    metadata = {
-        "rank": get_world_group().rank,
-        "host": socket.gethostname(),
-        "pid": os.getpid(),
-        "groups": groups,
-        "runner": type(runner).__module__,
-        "configured_graph_mode": str(runner.vllm_config.compilation_config.cudagraph_mode),
-        "enforce_eager": runner.vllm_config.model_config.enforce_eager,
-        "eplb_enabled": bool(parallel.enable_eplb or runner.ascend_config.eplb_config.dynamic_eplb),
-        "static_placement": runner.ascend_config.eplb_config.expert_map_path is not None,
-        "data_parallel_size": parallel.data_parallel_size,
-        "speculative_decoding": runner.vllm_config.speculative_config is not None,
-        "alignment": "rank_local_call_spans_require_collective_order_validation",
-        "counter_origin": "after_worker_warmup",
-        "alignment_contract": "post_warmup_executed_collective_v2",
-    }
-    return DiagnosticsRecorder(
-        runner.ascend_config.eplb_diagnostics, layers, metadata, NpuSnapshotBackend(runner.device)
+        raise ValueError("EPLB diagnostics requires explicit expert ownership without redundant experts.")
+    runner._eplb_diagnostics_recorder = DiagnosticsRecorder(
+        runner.ascend_config.eplb_diagnostics,
+        layers,
+        get_mc2_group(),
+        get_tp_group().ranks,
+        get_pp_group().rank_in_group,
+        runner._eplb_diagnostics_source_tokens,
     )
-
-
-def annotate_batch(runner, **metadata) -> None:
-    recorder = getattr(runner, "_eplb_diagnostics_recorder", None)
-    if recorder is not None:
-        recorder.annotate(**metadata)
-
-
-@torch.inference_mode()
-def initialize_diagnostics(runner) -> None:
-    """Bind shared source validity before capture; never modify inference masks."""
-    if runner.ascend_config.eplb_diagnostics.mode == "off":
-        return
-    config = runner.vllm_config
-    capacity = max(
-        config.scheduler_config.max_num_batched_tokens, max(config.compilation_config.cudagraph_capture_sizes or [0])
+    logging.getLogger(__name__).info(
+        "EPLB diagnostics: aggregate valid MoE assignments per EP group/stage; synchronous window summaries; "
+        "dummy/padding excluded. consider_eplb is a load signal, not a speedup prediction."
     )
-    source_tokens = torch.full((), capacity, dtype=torch.int64, device=runner.device)
-    positions = torch.arange(capacity, device=runner.device)
-    for layer in runner.model.modules():
-        probe = getattr(layer, "eplb_diagnostic_probe", None)
-        if isinstance(probe, ExpertLoadProbe):
-            probe.source_token_count = source_tokens
-            probe.source_positions = positions
-    runner._eplb_diagnostics_source_tokens = source_tokens
-
-
-@torch.inference_mode()
-def start_diagnostics(runner) -> None:
-    """Arm after warmup, so capture/profile work cannot exhaust the sample budget."""
-    if runner.ascend_config.eplb_diagnostics.mode == "off":
-        return
-    if getattr(runner, "_eplb_diagnostics_recorder", None) is not None:
-        return
-    try:
-        recorder = _create_recorder(runner)
-        runner._eplb_diagnostics_recorder = recorder
-        for _, layer in recorder.layers:
-            layer.eplb_diagnostic_probe.totals.zero_()
-            layer.eplb_diagnostic_probe.route_totals.zero_()
-        runner._eplb_diagnostics_ready = True
-        logging.getLogger(__name__).info("EPLB diagnostics output: %s", recorder.path)
-    except Exception:
-        runner._eplb_diagnostics_failed = True
-        logging.getLogger(__name__).exception("EPLB diagnostics initialization disabled")
-
-
-def _abort_safely(recorder) -> None:
-    if recorder is not None:
-        try:
-            recorder.abort()
-        except Exception:
-            logging.getLogger(__name__).exception("Failed to discard an EPLB diagnostic snapshot")
 
 
 def record_diagnostics(func):
-    """Wrap both runners; graph replay itself remains untouched."""
-
     @functools.wraps(func)
     def wrapped(runner, scheduler_output, *args, **kwargs):
-        if runner.ascend_config.eplb_diagnostics.mode == "off" or getattr(
-            runner, "_eplb_diagnostics_in_execution", False
+        recorder = getattr(runner, "_eplb_diagnostics_recorder", None)
+        dummy = kwargs.get("dummy_run", False)
+        if (
+            recorder is None
+            or getattr(runner, "_eplb_diagnostics_in_execution", False)
+            or kwargs.get("is_profile", False)
+            or torch.npu.is_current_stream_capturing()
+            or (scheduler_output.total_num_scheduled_tokens == 0 and not dummy)
         ):
             return func(runner, scheduler_output, *args, **kwargs)
-        # MRv2 worker dummy execution re-enters the decorated execute_model.
-        # Guard every boundary, including warmup/skipped/dropped samples: active
-        # snapshots alone cannot prevent double-counting unsampled boundaries.
         runner._eplb_diagnostics_in_execution = True
         try:
-            return execute_with_diagnostics(runner, scheduler_output, *args, **kwargs)
+            with torch.inference_mode():
+                recorder.begin(scheduler_output.total_num_scheduled_tokens, dummy)
+            result = func(runner, scheduler_output, *args, **kwargs)
+            recorder.end()
+            return result
         finally:
             runner._eplb_diagnostics_in_execution = False
-
-    def execute_with_diagnostics(runner, scheduler_output, *args, **kwargs):
-        config = runner.ascend_config.eplb_diagnostics
-        if config.mode == "off" or getattr(runner, "_eplb_diagnostics_failed", False):
-            return func(runner, scheduler_output, *args, **kwargs)
-        if not getattr(runner, "_eplb_diagnostics_ready", False):
-            return func(runner, scheduler_output, *args, **kwargs)
-        if kwargs.get("is_profile", False) or torch.npu.is_current_stream_capturing():
-            return func(runner, scheduler_output, *args, **kwargs)
-        recorder = getattr(runner, "_eplb_diagnostics_recorder", None)
-        if recorder is not None and recorder.active is not None:
-            return func(runner, scheduler_output, *args, **kwargs)
-        try:
-            if recorder is None:
-                recorder = _create_recorder(runner)
-                runner._eplb_diagnostics_recorder = recorder
-                logging.getLogger(__name__).info("EPLB diagnostics output: %s", recorder.path)
-            dummy_run = kwargs.get("dummy_run", False)
-            source_tokens = getattr(runner, "_eplb_diagnostics_source_tokens", None)
-            if source_tokens is not None:
-                # Worker dummy entry is outside the runner's inference-mode decorator.
-                with torch.inference_mode():
-                    source_tokens.fill_(0 if dummy_run else scheduler_output.total_num_scheduled_tokens)
-            recorder.begin(
-                {
-                    "scheduled_tokens": 0 if dummy_run else scheduler_output.total_num_scheduled_tokens,
-                    "scheduled_requests": 0 if dummy_run else len(scheduler_output.num_scheduled_tokens),
-                    "dummy_tokens": scheduler_output.total_num_scheduled_tokens if dummy_run else 0,
-                    "dummy_run": dummy_run,
-                    "phase": "dummy" if dummy_run else "unknown",
-                    "graph_mode": "unknown",
-                }
-            )
-        except Exception:
-            runner._eplb_diagnostics_failed = True
-            logging.getLogger(__name__).exception("EPLB diagnostics collection disabled")
-            # If collection failed after enqueuing a snapshot, keep its buffers alive.
-            _abort_safely(recorder)
-        try:
-            result = func(runner, scheduler_output, *args, **kwargs)
-        except BaseException:
-            _abort_safely(recorder)
-            raise
-        if recorder is not None and not getattr(runner, "_eplb_diagnostics_failed", False):
-            try:
-                recorder.end()
-            except Exception:
-                runner._eplb_diagnostics_failed = True
-                logging.getLogger(__name__).exception("EPLB diagnostics collection disabled")
-        return result
 
     return wrapped
 
 
 @record_diagnostics
 def _record_dummy_batch(runner, scheduler_output, num_tokens, *, dummy_run):
-    # DP dispatch may pad this synthetic input to another rank's batch size.
-    # Its actual padded size is not exposed here; do not label the input as it.
-    annotate_batch(runner, dummy_run=True, phase="dummy", dummy_tokens=num_tokens)
     return runner._dummy_run(num_tokens, uniform_decode=True)
 
 
 def run_dummy_batch(runner, num_tokens):
-    """Advance collective bookkeeping for idle DP without collecting a sample."""
-    if runner.ascend_config.eplb_diagnostics.mode == "off":
-        return runner._dummy_run(num_tokens, uniform_decode=True)
-    metadata = SimpleNamespace(total_num_scheduled_tokens=0, num_scheduled_tokens={})
+    metadata = SimpleNamespace(total_num_scheduled_tokens=0)
     return _record_dummy_batch(runner, metadata, num_tokens, dummy_run=True)
