@@ -990,17 +990,6 @@ class FinegrainedTPConfig:
     mlp_tensor_parallel_size: int = 0
     olora_tensor_parallel_size: int = 0
 
-    @property
-    def max_finegrained_tp_size(self) -> int:
-        return max(
-            1,
-            self.oproj_tensor_parallel_size,
-            self.lmhead_tensor_parallel_size,
-            self.embedding_tensor_parallel_size,
-            self.mlp_tensor_parallel_size,
-            self.olora_tensor_parallel_size,
-        )
-
     @model_validator(mode="after")
     def _validate_sizes(self):
         size_fields = (

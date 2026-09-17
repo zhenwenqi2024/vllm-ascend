@@ -752,7 +752,17 @@ class NPUModelRunner(GPUModelRunner):
         comm_method = select_moe_comm_method(max_tokens_across_dp, self.vllm_config)
         needs_uniform_moe_input = comm_method in {MoECommType.ALLGATHER, MoECommType.MC2}
         needs_uniform_mega_moe_input = comm_method == MoECommType.FUSED_MC2 and use_cann_megamoe(self.vllm_config)
-        needs_finegrained_tp = self.ascend_config.finegrained_tp_config.max_finegrained_tp_size > 1
+        finegrained_tp = self.ascend_config.finegrained_tp_config
+        needs_finegrained_tp = any(
+            size > 1
+            for size in (
+                finegrained_tp.oproj_tensor_parallel_size,
+                finegrained_tp.lmhead_tensor_parallel_size,
+                finegrained_tp.embedding_tensor_parallel_size,
+                finegrained_tp.mlp_tensor_parallel_size,
+                finegrained_tp.olora_tensor_parallel_size,
+            )
+        )
         # Graph replay, MoE communication and cross-DP fine-grained TP still
         # require uniform runner inputs. Draft models retain their existing
         # padding until their communication policy is selected independently.
