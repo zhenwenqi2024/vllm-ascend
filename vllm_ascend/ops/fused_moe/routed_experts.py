@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.utils import is_weak_contiguous
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
@@ -34,6 +35,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
+from vllm_ascend.eplb_diagnostics.probe import ExpertLoadProbe
 from vllm_ascend.lora.fused_moe import sync_lora_context
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
@@ -388,6 +390,17 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if not self._use_v2_model_runner:
             self.init_eplb(n_shared_experts)
         self.return_with_event = False
+        self._diagnostic_route_ownership_supported = (
+            self.moe_config.pcp_size == 1 and vllm_config.parallel_config.decode_context_parallel_size == 1
+        )
+        self._diagnostic_tp_rank = (
+            get_tensor_model_parallel_rank() if ascend_config.eplb_diagnostics.mode != "off" else 0
+        )
+        self.eplb_diagnostic_probe = (
+            ExpertLoadProbe(self.local_num_experts, "npu", self.moe_config.num_experts)
+            if ascend_config.eplb_diagnostics.mode != "off"
+            else None
+        )
 
         runner_type = getattr(vllm_config.model_config, "runner_type", None)
         if runner_type is None:
@@ -653,6 +666,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if lora_context is not None:
             sync_lora_context(self.quant_method, lora_context)
 
+        source_shard_tokens = hidden_states.shape[0]
         prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -675,6 +689,18 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         )
         self.ascend_pertoken_scale = pertoken_scale
         self.ascend_mc2_mask = mc2_mask
+        if (
+            self.eplb_diagnostic_probe is not None
+            and self.eplb_diagnostic_probe.source_token_count is not None
+            and type(_EXTRA_CTX.moe_comm_method).__name__ == "MC2CommImpl"
+            and not self.mix_placement
+            and (self._use_v2_model_runner or not self.dynamic_eplb)
+            and not enable_force_load_balance
+            and not get_ascend_config().enable_force_eplb
+            and self._diagnostic_route_ownership_supported
+        ):
+            source_stride = source_shard_tokens if self.moe_config.is_sequence_parallel else topk_ids.shape[0]
+            self.eplb_diagnostic_probe.record_routes(topk_ids, mc2_mask, self._diagnostic_tp_rank * source_stride)
         try:
             fused_experts_results: FusedExpertsResult = self.quant_method.apply(
                 layer=self,
@@ -687,6 +713,13 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         finally:
             self.ascend_pertoken_scale = None
             self.ascend_mc2_mask = None
+
+        if self.eplb_diagnostic_probe is not None:
+            self.eplb_diagnostic_probe.record(
+                fused_experts_results.expert_tokens,
+                fused_experts_results.group_list_type,
+                type(_EXTRA_CTX.moe_comm_method).__name__,
+            )
 
         if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
             expert_tokens = fused_experts_results.expert_tokens

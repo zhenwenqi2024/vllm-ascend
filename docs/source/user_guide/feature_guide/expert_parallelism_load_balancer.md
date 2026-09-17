@@ -1,5 +1,8 @@
 # Expert Parallelism Load Balancer (EPLB)
 
+For experimental passive load diagnostics, including ACL graph collection and
+offline analysis, see [EPLB diagnostics](eplb_diagnostics.md).
+
 ## Overview
 
 Expert balancing for MoE (Mixture of Experts) models in LLM (Large Language) serving is essential for optimal performance. Dynamically changing experts during inference can negatively impact TTFT (Time To First Token) and TPOT (Time Per Output Token) due to stop-the-world operations. Our solution aims to minimize the negative impacts caused by the operation.
