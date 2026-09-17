@@ -2106,8 +2106,8 @@ class NPUModelRunner(GPUModelRunner):
         # this width can change step to step (mirrors vLLM's GPUModelRunner
         # ``prev_num_spec_tokens`` bookkeeping). Kept before the early returns so
         # it is updated even when the CPU copy itself is skipped.
-        if torch.is_tensor(self._draft_token_ids):  # type: ignore[has-type]
-            self.prev_num_spec_tokens = self._draft_token_ids.shape[1]  # type: ignore[has-type]
+        if isinstance(self._draft_token_ids, torch.Tensor):
+            self.prev_num_spec_tokens = self._draft_token_ids.shape[1]
         if not self.num_spec_tokens:
             return
         if self.use_async_scheduling and not (
@@ -2118,8 +2118,8 @@ class NPUModelRunner(GPUModelRunner):
             return
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
 
-        draft_token_ids: torch.Tensor = self._draft_token_ids  # type: ignore[has-type]
-        if not torch.is_tensor(draft_token_ids):
+        draft_token_ids = self._draft_token_ids
+        if not isinstance(draft_token_ids, torch.Tensor):
             return
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_copy_stream is not None
@@ -2676,7 +2676,9 @@ class NPUModelRunner(GPUModelRunner):
                 # drafter DP synchronization pads it to the busiest rank.
                 self.drafter.dummy_run(num_tokens=1)
 
-        self._draft_token_ids = [[] for _ in self.input_batch.req_ids]
+        self._draft_token_ids: list[list[int]] | torch.Tensor | None = [
+            [] for _ in self.input_batch.req_ids
+        ]
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
         self._draft_probs = None
         self._draft_prob_req_ids = None
