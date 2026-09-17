@@ -139,7 +139,13 @@ class TestDPPaddingPolicy(unittest.TestCase):
                 runner.dp_rank = 0
                 runner.vllm_config = SimpleNamespace()
                 runner.ascend_config = SimpleNamespace(
-                    finegrained_tp_config=SimpleNamespace(max_finegrained_tp_size=finegrained_size)
+                    finegrained_tp_config=SimpleNamespace(
+                        oproj_tensor_parallel_size=finegrained_size,
+                        lmhead_tensor_parallel_size=0,
+                        embedding_tensor_parallel_size=0,
+                        mlp_tensor_parallel_size=0,
+                        olora_tensor_parallel_size=0,
+                    )
                 )
 
                 def all_reduce(packed_tensor, group, graph_mode=graph_mode):
