@@ -3,6 +3,7 @@
 """Portable diagnostics checks: pytest --noconftest tests/ut/eplb/test_diagnostics.py."""
 
 import importlib
+import io
 import logging
 import sys
 from copy import deepcopy
@@ -31,6 +32,13 @@ def api():
         for name in set(sys.modules) - original:
             if name == "vllm_ascend" or name.startswith("vllm_ascend."):
                 del sys.modules[name]
+
+
+@pytest.fixture(autouse=True)
+def capture_worker_logs(api, monkeypatch):
+    # vLLM installs a non-propagating handler when available. Let pytest's
+    # root capture handler also receive these records for output assertions.
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
 
 
 def rows(two_layers=False):
@@ -73,6 +81,24 @@ def test_window_reports_prefill_and_decode_coverage(api, caplog):
     data[0]["phases"].append(("prefill", "NONE"))
     api.runtime.WorkloadLogger([2, 5], 0).log(data, 1, 8)
     assert "phases=['decode', 'prefill']" in caplog.text
+
+
+def test_diagnostics_use_worker_logging_namespace(api, monkeypatch, caplog):
+    # Spawned workers may configure only vLLM; the root remains at WARNING.
+    output = io.StringIO()
+    parent = logging.getLogger("vllm")
+    monkeypatch.setattr(parent, "handlers", [logging.StreamHandler(output)])
+    monkeypatch.setattr(parent, "propagate", False)
+    with (
+        caplog.at_level(logging.WARNING),
+        caplog.at_level(logging.INFO, logger="vllm"),
+        caplog.at_level(logging.WARNING, logger="vllm_ascend"),
+    ):
+        api.runtime.WorkloadLogger([2, 5], 0).log(rows(), 1, 8)
+    text = output.getvalue()
+    assert "[EPLB experts]" in text
+    assert "[EPLB diagnostic]" in text
+    assert "[EPLB summary]" in text
 
 
 def test_routes_without_comm_mask_and_empty_replica(api):

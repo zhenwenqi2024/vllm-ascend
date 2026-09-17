@@ -57,7 +57,7 @@ def _worker(rank, rendezvous):
         )
         output = io.StringIO()
         handler = logging.StreamHandler(output)
-        logger = logging.getLogger("vllm_ascend.eplb.diagnostics.runtime")
+        logger = logging.getLogger("vllm.eplb.diagnostics")
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
         try:

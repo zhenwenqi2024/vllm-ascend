@@ -11,6 +11,8 @@ import torch
 
 from vllm_ascend.eplb.diagnostics.probe import ExpertLoadProbe
 
+_LOG_NAME = "vllm.eplb.diagnostics"
+
 
 def layer_work(rows, window_size):
     """Validate source conservation and map valid routes to actual expert owners."""
@@ -92,7 +94,8 @@ class LayerLogger:
 
     def log(self, rows, window, window_size, complete=True):
         result, reason = layer_work(rows, window_size)
-        logger = logging.getLogger(__name__)
+        # Spawned workers configure the vLLM logging namespace.
+        logger = logging.getLogger(_LOG_NAME)
         if reason:
             self.streaks.clear()
             self.invalid_windows += 1
@@ -197,7 +200,7 @@ class WorkloadLogger:
             conclusion = "consider_eplb_for_observed_layers"
         elif counts["no_persistent_rank_skew"] == len(names) and names:
             conclusion = "no_persistent_rank_skew_observed"
-        logging.getLogger(__name__).info(
+        logging.getLogger(_LOG_NAME).info(
             "[EPLB summary] stage=%s window=%s final=%s ranks=%s layers=%s layer_assessments=%s candidate_layers=%s "
             "invalid_layer_windows=%s conclusion=%s scope=observed_valid_windows speedup=not_estimated",
             self.stage,
@@ -345,7 +348,7 @@ def start_diagnostics(runner):
         get_pp_group().rank_in_group,
         runner._eplb_diagnostics_source_tokens,
     )
-    logging.getLogger(__name__).info(
+    logging.getLogger(_LOG_NAME).info(
         "EPLB diagnostics: per-layer valid MoE assignments across each EP group/stage; synchronous window summaries; "
         "dummy/padding excluded. consider_eplb is a load signal, not a speedup prediction."
     )
