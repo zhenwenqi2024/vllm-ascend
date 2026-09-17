@@ -21,7 +21,6 @@ from types import SimpleNamespace
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.utils import is_weak_contiguous
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
@@ -393,9 +392,6 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         self._diagnostic_route_ownership_supported = (
             self.moe_config.pcp_size == 1 and vllm_config.parallel_config.decode_context_parallel_size == 1
         )
-        self._diagnostic_tp_rank = (
-            get_tensor_model_parallel_rank() if ascend_config.eplb_diagnostics.mode != "off" else 0
-        )
         self.eplb_diagnostic_probe = (
             ExpertLoadProbe(self.moe_config.num_experts, "npu")
             if ascend_config.eplb_diagnostics.mode != "off"
@@ -692,15 +688,18 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if (
             self.eplb_diagnostic_probe is not None
             and self.eplb_diagnostic_probe.source_token_count is not None
-            and type(_EXTRA_CTX.moe_comm_method).__name__ == "MC2CommImpl"
+            and type(_EXTRA_CTX.moe_comm_method).__name__ in {"MC2CommImpl", "AlltoAllCommImpl", "AllGatherCommImpl"}
             and not self.mix_placement
             and (self._use_v2_model_runner or not self.dynamic_eplb)
             and not enable_force_load_balance
             and not get_ascend_config().enable_force_eplb
             and self._diagnostic_route_ownership_supported
         ):
-            source_stride = source_shard_tokens if self.moe_config.is_sequence_parallel else topk_ids.shape[0]
-            self.eplb_diagnostic_probe.record_routes(topk_ids, mc2_mask, self._diagnostic_tp_rank * source_stride)
+            routes = _EXTRA_CTX.moe_comm_method.prepare_finalize.diagnostic_source_routes(
+                topk_ids, source_shard_tokens, mc2_mask, padded_hidden_states_shape
+            )
+            if routes is not None:
+                self.eplb_diagnostic_probe.record_routes(*routes)
         try:
             fused_experts_results: FusedExpertsResult = self.quant_method.apply(
                 layer=self,

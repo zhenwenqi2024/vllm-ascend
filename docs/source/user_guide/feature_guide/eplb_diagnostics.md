@@ -87,16 +87,25 @@ world/PP barrier inside model execution and no claim of whole-pipeline speedup.
 
 ## Collection scope and cost
 
-Fixed device counters execute in eager mode and graph replay. Scheduler validity
-and MC2 masks exclude padding. Dummy requests contribute no workload or timing;
+Fixed device counters execute in eager mode and graph replay for both prefill
+and decode. `phases` lists the phases seen in the window; mixed batches remain
+mixed rather than being attributed entirely to prefill or decode. This is a
+combined workload assessment, not separate per-phase histograms.
+
+MC2, AllToAll and AllGather use the same valid-source counting rule. AllToAll
+restores the original TP split offset, including uneven splits. AllGather counts
+only each rank's source segment: non-SP TP replicas count on TP rank zero, while
+SP ranks count their own shard using the gather's actual DP/EP layout. No extra
+device collective is added for diagnostics. Scheduler validity and MC2 masks
+exclude padding. Dummy requests contribute no workload or timing;
 idle DP workers still join window coordination and advance call bookkeeping.
 At window boundaries counters are copied to CPU and gathered on the existing MC2
 CPU group. Matching windows/layers, TP source conservation and unique expert
 ownership are checked. This synchronous diagnostic adds overhead.
 
-MRv1/MRv2 hooks currently support valid routing for MC2, PCP=1, DCP=1, no mixed
+MRv1/MRv2 hooks support valid routing for these three paths, PCP=1, DCP=1, no mixed
 shared-expert placement, no redundant experts, and no synthetic forced routing.
-EP must be enabled and EPLB disabled. Unsupported paths report insufficient
+EP must be enabled and EPLB disabled. FusedMC2/MegaMoE and other unsupported paths report insufficient
 evidence. Ownership is read after warmup and must stay fixed; replacement of a
 model or placement requires a restart. No layout simulation or kernel timing is
 performed. Per-window totals can still hide imbalance that alternates between

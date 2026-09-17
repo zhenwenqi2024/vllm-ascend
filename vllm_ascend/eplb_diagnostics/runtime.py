@@ -152,7 +152,7 @@ class LayerLogger:
         logger.info(
             "[EPLB diagnostic] stage=%s layer=%s window=%s calls=%s ranks=%s valid_assignments=%s rank_work=%s "
             "window_rank_max_mean=%.3f imbalanced_windows=%s/%s invalid_windows=%s observed_calls=%s "
-            "hot_experts=%s persistent_hot_experts=%s hint=%s",
+            "hot_experts=%s persistent_hot_experts=%s hint=%s phases=%s",
             self.stage,
             self.layer,
             window,
@@ -168,6 +168,7 @@ class LayerLogger:
             hot_text,
             stable_text,
             self.hint,
+            sorted({phase for row in rows for phase, _ in row["phases"]}),
         )
 
 

@@ -67,6 +67,26 @@ def test_layer_work_and_real_owners(api):
     assert result["hot"] == {("layer.0", 0): 6}
 
 
+def test_window_reports_prefill_and_decode_coverage(api, caplog):
+    caplog.set_level(logging.INFO)
+    data = rows()
+    data[0]["phases"].append(("prefill", "NONE"))
+    api.runtime.WorkloadLogger([2, 5], 0).log(data, 1, 8)
+    assert "phases=['decode', 'prefill']" in caplog.text
+
+
+def test_routes_without_comm_mask_and_empty_replica(api):
+    probe = api.probe.ExpertLoadProbe(2, "cpu")
+    probe.source_positions = torch.arange(4)
+    probe.source_token_count = torch.tensor(3)
+    ids = torch.tensor([[0], [1], [0], [1]])
+    probe.record_routes(ids, source_offset=2)
+    probe.record_routes(ids[:0])
+    probe.source_token_count.zero_()
+    probe.record_routes(ids)
+    assert probe.totals.tolist() == [1, 0, 3, 0]
+
+
 @pytest.mark.parametrize(
     "problem,reason",
     [

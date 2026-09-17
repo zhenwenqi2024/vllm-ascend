@@ -15,20 +15,25 @@ class ExpertLoadProbe(torch.nn.Module):
         # alignment bookkeeping, including dummy collective participation.
         self.register_buffer("totals", torch.zeros(num_experts + 2, dtype=torch.int64, device=device), persistent=False)
 
-    def record_routes(self, physical_ids, valid_mask, source_offset=0):
+    def record_routes(self, physical_ids, valid_mask=None, source_offset=0):
         if (
-            valid_mask is None
-            or valid_mask.dtype != torch.bool
-            or physical_ids.ndim != 2
-            or valid_mask.shape != physical_ids.shape[:1]
+            physical_ids.ndim != 2
+            or (
+                valid_mask is not None
+                and (valid_mask.dtype != torch.bool or valid_mask.shape != physical_ids.shape[:1])
+            )
             or self.source_positions is None
             or physical_ids.shape[0] > self.source_positions.numel()
         ):
             return
+        # AllGather replicas without source ownership still count the call.
+        if physical_ids.shape[0] == 0:
+            self.totals[-2].add_(1)
+            return
         # The shared scalar is zero for dummy, warmup and stopped collection.
-        active = valid_mask[:, None] & (
-            self.source_positions[: physical_ids.shape[0], None] + source_offset < self.source_token_count
-        )
+        active = self.source_positions[: physical_ids.shape[0], None] + source_offset < self.source_token_count
+        if valid_mask is not None:
+            active = active & valid_mask[:, None]
         valid = (physical_ids >= 0) & (physical_ids < self.num_experts)
         self.totals[: self.num_experts].scatter_add_(
             0,
