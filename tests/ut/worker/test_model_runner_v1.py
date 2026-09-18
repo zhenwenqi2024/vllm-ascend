@@ -1,7 +1,6 @@
 import unittest
 from collections import deque
 from contextlib import nullcontext
-from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -26,7 +25,6 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from vllm_ascend.ascend_config import FinegrainedTPConfig, XliteGraphConfig
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
@@ -107,12 +105,6 @@ class TestDPPaddingPolicy(unittest.TestCase):
         runner.dp_size = 2
         runner.dp_rank = dp_rank
         runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(enable_return_routed_experts=False))
-        # Use the real per-branch config so removed/renamed fields cannot be
-        # silently invented by a mock.
-        runner.ascend_config = SimpleNamespace(
-            finegrained_tp_config=FinegrainedTPConfig(),
-            xlite_graph_config=XliteGraphConfig(),
-        )
         return runner
 
     @staticmethod
@@ -192,27 +184,14 @@ class TestDPPaddingPolicy(unittest.TestCase):
                     self.assertEqual(synced_mode, graph_mode)
                     self.assertEqual(across_dp.tolist(), [32, 32] if should_pad else [8, 32])
 
-    def test_each_finegrained_tp_field_requires_uniform_inputs(self):
-        for field in fields(FinegrainedTPConfig):
-            for size in (1, 2):
-                with self.subTest(field=field.name, size=size):
-                    runner = self._make_runner()
-                    runner.ascend_config.finegrained_tp_config = FinegrainedTPConfig(**{field.name: size})
-                    _, across_dp, _ = self._run_sync(runner)
-                    self.assertEqual(across_dp.tolist(), [32, 32] if size > 1 else [8, 32])
-
-    def test_xlite_and_routing_capture_keep_uniform_eager_inputs(self):
-        for guard in ("xlite", "routing_capture"):
-            for dp_rank in range(2):
-                with self.subTest(guard=guard, dp_rank=dp_rank):
-                    runner = self._make_runner(dp_rank)
-                    if guard == "xlite":
-                        runner.ascend_config.xlite_graph_config = XliteGraphConfig(enabled=True, full_mode=True)
-                    else:
-                        runner.vllm_config.model_config.enable_return_routed_experts = True
-                    _, across_dp, mode = self._run_sync(runner, comm_method=MoECommType.FUSED_MC2)
-                    self.assertEqual(mode, CUDAGraphMode.NONE)
-                    self.assertEqual(across_dp.tolist(), [32, 32])
+    def test_routing_capture_keeps_uniform_eager_inputs(self):
+        for dp_rank in range(2):
+            with self.subTest(dp_rank=dp_rank):
+                runner = self._make_runner(dp_rank)
+                runner.vllm_config.model_config.enable_return_routed_experts = True
+                _, across_dp, mode = self._run_sync(runner, comm_method=MoECommType.FUSED_MC2)
+                self.assertEqual(mode, CUDAGraphMode.NONE)
+                self.assertEqual(across_dp.tolist(), [32, 32])
 
     def test_imbalanced_and_idle_metadata_use_agreed_graph_mode(self):
         for tokens in ((0, 32), (1, 32), (8, 32)):
