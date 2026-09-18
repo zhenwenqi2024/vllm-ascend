@@ -36,8 +36,15 @@ After the rank details, print that layer's current rank distribution and
 cumulative persistence evidence. Example:
 
 ```text
-[EPLB diagnostic] stage=0 layer=model.layers.10.mlp.experts window=3 calls=32 ranks=[0,1] valid_assignments=1000 rank_work=[800,200] window_rank_max_mean=1.600 imbalanced_windows=3/3 invalid_windows=0 observed_calls=96 hot_experts=['46(700)'] persistent_hot_experts=['46(3/3)'] hint=consider_eplb
+[EPLB diagnostic] stage=0 layer=model.layers.10.mlp.experts window=3 calls=32 ranks=[0,1] valid_assignments=1000 rank_work=[200,800] window_rank_max_mean=1.600 cumulative_rank_max_mean=1.400 busiest_rank=1 imbalanced_windows=3/3 invalid_windows=0 observed_calls=96 hot_experts=['46(700)'] persistent_hot_experts=['46(3/3)'] hint=consider_eplb
 ```
+
+`window_rank_max_mean` is the busiest rank's work divided by the mean rank work
+in this window. `cumulative_rank_max_mean` uses each rank's accumulated work
+across all valid observed windows, including the final partial window. It is
+not the average of window ratios. `busiest_rank` is the global rank with the
+largest cumulative workload; ties select the first rank in `ranks`. Zero-load
+ranks are included in the mean. Invalid windows do not update these totals.
 
 Rank work is calculated independently for each layer. Opposite hotspots in two
 layers cannot cancel each other. Max/mean at least 1.2 marks an imbalanced window.

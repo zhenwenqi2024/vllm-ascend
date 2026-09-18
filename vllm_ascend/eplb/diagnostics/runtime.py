@@ -147,6 +147,8 @@ class LayerLogger:
                 sum(total.values()),
                 [f"{e}:{count}" for e, count in sorted(total.items())],
             )
+        cumulative_rank_work = [sum(counts.values()) for counts in self.expert_totals]
+        cumulative_peak = max(cumulative_rank_work)
         hottest = sorted(hot, key=lambda e: (-result["hot"][e], e))
         hot_text = [f"{e}({result['hot'][(name, e)]})" for name, e in hottest[:4]]
         stable_text = [
@@ -154,7 +156,8 @@ class LayerLogger:
         ]
         logger.info(
             "[EPLB diagnostic] stage=%s layer=%s window=%s calls=%s ranks=%s valid_assignments=%s rank_work=%s "
-            "window_rank_max_mean=%.3f imbalanced_windows=%s/%s invalid_windows=%s observed_calls=%s "
+            "window_rank_max_mean=%.3f cumulative_rank_max_mean=%.3f busiest_rank=%s "
+            "imbalanced_windows=%s/%s invalid_windows=%s observed_calls=%s "
             "hot_experts=%s persistent_hot_experts=%s hint=%s phases=%s",
             self.stage,
             self.layer,
@@ -164,6 +167,8 @@ class LayerLogger:
             result["total"],
             result["rank_work"],
             result["skew"],
+            cumulative_peak * len(self.ranks) / sum(cumulative_rank_work),
+            self.ranks[cumulative_rank_work.index(cumulative_peak)],
             self.imbalanced_windows,
             self.valid_windows,
             self.invalid_windows,

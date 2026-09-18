@@ -202,6 +202,31 @@ def test_rank_expert_totals_and_layer_persistence(api, caplog):
     assert layer.streaks[("layer.0", 0)] == 1
 
 
+def test_cumulative_rank_skew_uses_work_and_includes_partial_windows(api, caplog):
+    caplog.set_level(logging.INFO)
+    summary = api.runtime.WorkloadLogger([2, 5], 0)
+    summary.log(rows(), 1, 8)
+    assert "cumulative_rank_max_mean=2.000 busiest_rank=2" in diagnostics(caplog)[-1]
+    data = rows()
+    for row in data:
+        row["tokens"] = 12
+        row["layers"][0]["counts"][:4] = [0, 0, 9, 3]
+    summary.log(data, 2, 8)
+    assert "window_rank_max_mean=2.000 cumulative_rank_max_mean=1.500 busiest_rank=5" in diagnostics(caplog)[-1]
+    # Invalid work must not enter the cumulative denominator or change the peak.
+    data[0]["tokens"] += 1
+    summary.log(data, 3, 8)
+    assert "cumulative_rank_max_mean" not in diagnostics(caplog)[-1]
+    assert [sum(c.values()) for c in summary.layers["layer.0"].expert_totals] == [8, 24]
+    # The tail balances cumulative work. Ties use the first global rank in ranks.
+    for row in data:
+        row["tokens"] = 8
+        row["layers"][0]["counts"] = [6, 2, 0, 0, 1, 0]
+    summary.log(data, 4, 1, complete=False)
+    assert "window_rank_max_mean=2.000 cumulative_rank_max_mean=1.000 busiest_rank=2" in diagnostics(caplog)[-1]
+    assert summary.layers["layer.0"].valid_windows == 2
+
+
 def test_opposite_layer_skew_does_not_cancel(api, caplog):
     caplog.set_level(logging.INFO)
     data = rows(two_layers=True)
@@ -214,6 +239,8 @@ def test_opposite_layer_skew_does_not_cancel(api, caplog):
     first, second = diagnostics(caplog)
     assert "layer=layer.0" in first and "rank_work=[8, 0]" in first
     assert "layer=layer.1" in second and "rank_work=[0, 8]" in second
+    assert "cumulative_rank_max_mean=2.000 busiest_rank=2" in first
+    assert "cumulative_rank_max_mean=2.000 busiest_rank=5" in second
     assert all("hint=consider_eplb" in line for line in (first, second))
     assert "candidate_layers=['layer.0', 'layer.1']" in caplog.text
     data[1]["layers"][1]["counts"][-1] = 1
