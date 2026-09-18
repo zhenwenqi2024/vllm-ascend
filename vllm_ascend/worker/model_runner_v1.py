@@ -763,6 +763,11 @@ class NPUModelRunner(GPUModelRunner):
                 finegrained_tp.olora_tensor_parallel_size,
             )
         )
+        # Xlite can run its own graph with CUDAGraphMode.NONE. Routing capture
+        # also assumes padding is at the end of the full DP batch, not inside
+        # each SP shard after MC2 prepare. Keep both on the uniform-input path.
+        needs_uniform_xlite_input = self.ascend_config.xlite_graph_config.enabled
+        needs_uniform_routing_capture = self.vllm_config.model_config.enable_return_routed_experts
         # Graph replay, MoE communication and cross-DP fine-grained TP still
         # require uniform runner inputs. Draft models retain their existing
         # padding until their communication policy is selected independently.
@@ -772,6 +777,8 @@ class NPUModelRunner(GPUModelRunner):
             or needs_uniform_moe_input
             or needs_uniform_mega_moe_input
             or needs_finegrained_tp
+            or needs_uniform_xlite_input
+            or needs_uniform_routing_capture
         ):
             num_tokens_after_padding = torch.tensor(
                 [max_tokens_across_dp] * self.dp_size, device="cpu", dtype=torch.int32
@@ -2267,7 +2274,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
                 if self.dynamic_eplb:
-                    self.update_eplb_heat_collection_status(num_tokens_padded)
+                    self.update_eplb_heat_collection_status(num_tokens_padded, num_tokens_across_dp)
 
                 pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
@@ -3642,7 +3649,7 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
 
         if self.dynamic_eplb:
-            self.update_eplb_heat_collection_status(num_tokens_padded)
+            self.update_eplb_heat_collection_status(num_tokens_padded, num_tokens_across_dp)
 
         # vllm-ascend does not support ubatch now
         ubatch_slices, ubatch_slices_padded = None, None
@@ -3917,7 +3924,14 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_updator.set_adaptor(self.eplb_adaptor)
             self.eplb_updator.warm_up_eplb()
 
-    def update_eplb_heat_collection_status(self, num_tokens_padded: int):
+    def update_eplb_heat_collection_status(
+        self, num_tokens_padded: int, num_tokens_across_dp: torch.Tensor | None = None
+    ):
+        # Stage-specific collection controls the EPLB iteration counter and
+        # therefore when ranks enter its collectives. Use the common CPU DP
+        # metadata even when eager computation keeps different local lengths.
+        if num_tokens_across_dp is not None and self.eplb_heat_collection_stage in {"prefill", "decode"}:
+            num_tokens_padded = int(num_tokens_across_dp.max().item())
         if self.eplb_heat_collection_stage == "prefill":
             # collect eplb heat for prefill requests.
             self.eplb_heat_collection_status = num_tokens_padded > self.eplb_pd_thresholds
