@@ -26,7 +26,6 @@ from vllm.v1.kv_cache_interface import (
 )
 
 import vllm_ascend.compilation.acl_graph as acl_graph
-from vllm_ascend.ascend_config import FinegrainedTPConfig, XliteGraphConfig
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -445,10 +444,6 @@ def test_stateful_handoff_preserves_decode_graph(
     )
     runner.model_config = SimpleNamespace(is_encoder_decoder=False, enable_return_routed_experts=False)
     runner.vllm_config.model_config = runner.model_config
-    runner.ascend_config = SimpleNamespace(
-        finegrained_tp_config=FinegrainedTPConfig(),
-        xlite_graph_config=XliteGraphConfig(),
-    )
     runner.uniform_decode_query_len = 1 + num_spec_tokens
     runner.input_batch = SimpleNamespace(
         num_computed_tokens_cpu=np.array(computed),
