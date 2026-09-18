@@ -1221,6 +1221,23 @@ class NPUWorker(WorkerBase):
         if recorder is not None:
             recorder.finish()
 
+    def calibrate_eplb_diagnostics(
+        self, update_interval: int, samples: int = 4, repeats: int = 3, max_scratch_bytes: int = 134217728
+    ) -> None:
+        """Run isolated calibration collectively, after all requests have finished."""
+        from vllm_ascend.eplb.diagnostics.assessment import calibrate
+
+        recorder = getattr(self.model_runner, "_eplb_diagnostics_recorder", None)
+        if recorder is None:
+            raise ValueError("EPLB diagnostics observe mode is required for calibration")
+        calibrate(
+            recorder,
+            update_interval=update_interval,
+            samples=samples,
+            repeats=repeats,
+            max_scratch_bytes=max_scratch_bytes,
+        )
+
     def execute_dummy_batch(self) -> None:
         self.log_memory_stats()
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)

@@ -186,7 +186,7 @@ def test_rank_expert_totals_and_layer_persistence(api, caplog):
     assert "persistent_hot_experts=['0(2/2)']" in caplog.text
     assert "cumulative_work=16 expert_work=['0:12', '1:4']" in caplog.text
     assert "expert_work=['2:0', '3:0']" in caplog.text
-    assert "conclusion=consider_eplb_for_observed_layers" in caplog.text
+    assert "conclusion=insufficient_benefit_evidence" in caplog.text
     data = rows()
     data[1]["step"] = 9
     summary.log(data, 3, 8)
@@ -241,8 +241,8 @@ def test_opposite_layer_skew_does_not_cancel(api, caplog):
     assert "layer=layer.1" in second and "rank_work=[0, 8]" in second
     assert "cumulative_rank_max_mean=2.000 busiest_rank=2" in first
     assert "cumulative_rank_max_mean=2.000 busiest_rank=5" in second
-    assert all("hint=consider_eplb" in line for line in (first, second))
-    assert "candidate_layers=['layer.0', 'layer.1']" in caplog.text
+    assert all("hint=persistent_load_skew" in line for line in (first, second))
+    assert "skewed_layers=['layer.0', 'layer.1']" in caplog.text
     data[1]["layers"][1]["counts"][-1] = 1
     caplog.clear()
     summary.log(data, 3, 8)
@@ -261,7 +261,7 @@ def test_layer_hotspot_histories_are_independent(api, caplog):
         row["layers"][1]["counts"][:4] = [1, 3, 0, 0]
     caplog.clear()
     summary.log(data, 2, 8)
-    assert "hint=consider_eplb" in diagnostics(caplog)[0]
+    assert "hint=persistent_load_skew" in diagnostics(caplog)[0]
     assert "hint=insufficient_hotspot_evidence" in diagnostics(caplog)[1]
 
 
@@ -297,7 +297,7 @@ def test_partial_window_counts_work_but_not_persistence(api, caplog):
     assert sum(sum(counts.values()) for counts in layer.expert_totals) == 16
     summary.summarize(2, final=True)
     assert "final=True" in caplog.text
-    assert "conclusion=insufficient_evidence" in caplog.text
+    assert "conclusion=insufficient_benefit_evidence" in caplog.text
 
 
 def test_probe_padding_source_offset_dummy_and_stable_storage(api):
@@ -412,3 +412,107 @@ def test_wrapper_nested_dummy_and_failure(api, monkeypatch):
 def test_config_bounds(api, field):
     with pytest.raises(ValueError):
         api.config.EplbDiagnosticsConfig(**{field: -1})
+
+
+def history_rows(per_source_steps):
+    data = rows()
+    for row, steps in zip(data, per_source_steps):
+        row["token_steps"] = [sum(step) for step in steps]
+        row["tokens"] = sum(row["token_steps"])
+        row["step_metadata"] = [dict(phase="decode", graph_mode="FULL", padded_tokens=8) for _ in steps]
+        layer = row["layers"][0]
+        layer["history"] = [step + [1, 0] for step in steps]
+        layer["counts"] = list(map(sum, zip(*layer["history"])))
+        layer["comm_codes"] = [1] * len(steps)
+    return data
+
+
+def test_projection_uses_step_peaks_and_retains_complete_calibration_job(api, caplog):
+    caplog.set_level(logging.INFO)
+    summary = api.runtime.WorkloadLogger([2, 5], 0)
+    training = history_rows([[[4, 4, 0, 0]] * 2] * 2)
+    summary.log(training, 1, 2)
+    assert summary.layers["layer.0"].calibration_job is None
+    evaluation = history_rows([[[4, 0, 0, 0], [0, 4, 0, 0]]] * 2)
+    summary.log(evaluation, 2, 2)
+    layer = summary.layers["layer.0"]
+    assert layer.projection["candidate_rank_work"] == [8, 8]
+    assert layer.projection["step_peak_work"] == 16
+    assert layer.projection["candidate_step_peak_work"] == 16
+    assert layer.projection["step_peak_reduction"] == 0
+    assert layer.calibration_job["plan"].source_window == 1
+    assert layer.calibration_job["window"] == 2
+    tail = history_rows([[[1, 0, 0, 0]]] * 2)
+    summary.log(tail, 3, 1, complete=False)
+    assert layer.pending_plan is None
+    assert layer.calibration_job["window"] == 2
+    assert "conclusion=insufficient_benefit_evidence" in caplog.text
+    assert "consider_eplb" not in caplog.text
+
+
+def test_projection_rejects_shifted_source_steps_even_when_window_sums_match(api, caplog):
+    caplog.set_level(logging.INFO)
+    summary = api.runtime.WorkloadLogger([2, 5], 0)
+    data = history_rows([[[3, 1, 0, 0], [6, 2, 0, 0]]] * 2)
+    summary.log(data, 1, 2)
+    data[0]["layers"][0]["history"].reverse()
+    summary.log(data, 2, 2)
+    assert summary.layers["layer.0"].calibration_job is None
+    assert "per_step_source_conservation_failure" in caplog.text
+
+
+def test_history_device_slot_tracks_padding_dummy_and_communication(api):
+    probe = api.probe.ExpertLoadProbe(2, "cpu")
+    probe.source_positions = torch.arange(3)
+    probe.source_token_count = torch.tensor(0)
+    probe.history = torch.zeros((3, 4), dtype=torch.int64)
+    probe.history_slot = torch.zeros(1, dtype=torch.int64)
+    probe.comm_history = torch.zeros(3, dtype=torch.int64)
+    pointers = probe.totals.data_ptr(), probe.history.data_ptr(), probe.history_slot.data_ptr()
+    ids = torch.tensor([[0], [1], [99]])
+    for step, tokens in enumerate((1, 0, 2)):
+        probe.history_slot.fill_(step)
+        probe.source_token_count.fill_(tokens)
+        probe.record_routes(ids)
+        probe.record_comm(step + 1)
+    assert probe.history.tolist() == [[1, 0, 1, 0], [0, 0, 1, 0], [1, 1, 1, 0]]
+    assert probe.totals.tolist() == [2, 1, 3, 0]
+    assert probe.comm_history.tolist() == [1, 2, 3]
+    assert pointers == (probe.totals.data_ptr(), probe.history.data_ptr(), probe.history_slot.data_ptr())
+
+
+def test_history_recorder_resets_windows_and_finishes_partial(api, monkeypatch):
+    config = api.config.EplbDiagnosticsConfig(mode="observe", warmup_steps=0, window_size=2)
+    probe = api.probe.ExpertLoadProbe(2, "cpu")
+    probe.source_token_count, probe.source_positions = torch.tensor(0), torch.arange(2)
+    probe.history, probe.history_slot = torch.zeros((2, 4), dtype=torch.int64), torch.zeros(1, dtype=torch.int64)
+    probe.comm_history = torch.zeros(2, dtype=torch.int64)
+    layer = SimpleNamespace(
+        eplb_diagnostic_probe=probe,
+        ascend_expert_map=torch.tensor([0, 1]),
+        moe_config=SimpleNamespace(experts_per_token=1),
+        local_num_experts=2,
+    )
+    group = SimpleNamespace(ranks=[0], rank_in_group=0, cpu_group=None)
+    snapshots = []
+
+    def gather(out, row, group):
+        snapshots.append(deepcopy(row))
+        out[0] = row
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    recorder = api.runtime.DiagnosticsRecorder(config, [("layer", layer)], group, [0], 0, probe.source_token_count)
+    for tokens, dummy in ((2, False), (99, True), (1, False)):
+        recorder.begin(tokens, dummy)
+        probe.record_routes(torch.tensor([[0], [1]]))
+        probe.record_comm(1)
+        recorder.end()
+    recorder.finish()
+    recorder.finish()
+    assert len(snapshots) == 2
+    assert snapshots[0]["token_steps"] == [2, 0]
+    assert snapshots[0]["layers"][0]["history"] == [[1, 1, 1, 0], [0, 0, 1, 0]]
+    assert snapshots[1]["token_steps"] == [1]
+    assert snapshots[1]["layers"][0]["history"] == [[1, 0, 1, 0]]
+    recorder.begin(2)
+    assert not recorder.collecting and probe.source_token_count.item() == 0

@@ -26,6 +26,7 @@ from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.eplb.diagnostics.model_calibration import capture_template
 from vllm_ascend.ops.fused_moe import moe_utils
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEFusedExpertsInput
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput, build_mlp_compute_input
@@ -145,6 +146,9 @@ class MoECommMethod(ABC):
             token_dispatch_output=token_dispatch_output,
             moe_config=self.moe_config,
         )
+        probe = getattr(fused_experts_input.layer, "eplb_diagnostic_probe", None)
+        if probe is not None and quant_method is not None:
+            capture_template(probe, mlp_compute_input, quant_method, type(self).__name__)
         if quant_method is None:
             # Legacy path (310P): the comm method overrides ``_apply_mlp`` with
             # its own MLP implementation.

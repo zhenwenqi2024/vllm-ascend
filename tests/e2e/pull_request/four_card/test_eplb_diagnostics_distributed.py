@@ -76,11 +76,11 @@ def _worker(rank, rendezvous):
             if local == 0:
                 assert output.getvalue().count("[EPLB diagnostic]") == 6
                 assert output.getvalue().count("[EPLB experts]") == 12
-                assert "candidate_layers=['layer.0', 'layer.1']" in output.getvalue()
+                assert "skewed_layers=['layer.0', 'layer.1']" in output.getvalue()
                 assert "cumulative_work=17" in output.getvalue()
                 assert output.getvalue().count("final=True") == 1
                 assert "valid_assignments=8 rank_work=[8, 0]" in output.getvalue()
-                assert "hint=consider_eplb" in output.getvalue()
+                assert "hint=persistent_load_skew" in output.getvalue()
                 assert f"stage={stage}" in output.getvalue()
             else:
                 assert not output.getvalue()

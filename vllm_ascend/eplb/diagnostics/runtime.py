@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm_ascend.eplb.diagnostics.placement import build_plan, evaluate_plan
 from vllm_ascend.eplb.diagnostics.probe import ExpertLoadProbe
 
 _LOG_NAME = "vllm.eplb.diagnostics"
@@ -80,6 +81,26 @@ def layer_work(rows, window_size):
     }, None
 
 
+def validate_history_sources(rows, histories, calls):
+    sources = {}
+    for index, row in enumerate(rows):
+        tokens = row.get("token_steps", [])
+        if len(tokens) != calls or any(not isinstance(count, int) or count < 0 for count in tokens):
+            return False
+        sources.setdefault(tuple(row["tp_ranks"]), []).append(index)
+    for members in sources.values():
+        expected = rows[members[0]]["token_steps"]
+        if any(rows[index]["token_steps"] != expected for index in members):
+            return False
+        top_k = rows[members[0]]["layers"][0]["top_k"]
+        if any(
+            sum(sum(histories[index][step][:-2]) for index in members) != expected[step] * top_k
+            for step in range(calls)
+        ):
+            return False
+    return True
+
+
 class LayerLogger:
     """Keep cumulative evidence for one layer, with no retained sample history."""
 
@@ -91,6 +112,8 @@ class LayerLogger:
         self.expert_totals = [Counter() for _ in ranks]
         self.hint = "collecting"
         self.persistent = set()
+        self.pending_plan = self.calibration_job = None
+        self.projection = None
 
     def log(self, rows, window, window_size, complete=True):
         result, reason = layer_work(rows, window_size)
@@ -98,6 +121,7 @@ class LayerLogger:
         logger = logging.getLogger(_LOG_NAME)
         if reason:
             self.streaks.clear()
+            self.pending_plan = self.calibration_job = self.projection = None
             self.invalid_windows += 1
             self.hint = "insufficient_evidence"
             logger.info(
@@ -128,10 +152,11 @@ class LayerLogger:
             self.hint = "collecting"
             if self.valid_windows >= 2:
                 self.hint = (
-                    ("consider_eplb" if self.persistent else "insufficient_hotspot_evidence")
+                    ("persistent_load_skew" if self.persistent else "insufficient_hotspot_evidence")
                     if (self.imbalanced_windows / self.valid_windows >= 0.8)
                     else "no_persistent_rank_skew"
                 )
+        self.project(rows, result, window, window_size, signature, complete)
         for rank, counts, total, work in zip(
             self.ranks, result["expert_work"], self.expert_totals, result["rank_work"]
         ):
@@ -179,6 +204,78 @@ class LayerLogger:
             sorted({phase for row in rows for phase, _ in row["phases"]}),
         )
 
+    def project(self, rows, result, window, calls, signature, complete):
+        if not complete:
+            self.pending_plan = None
+            return
+        mappings = [row["layers"][0]["mapping"] for row in rows]
+        previous = self.pending_plan
+        self.projection, reason = evaluate_plan(previous, result["expert_work"], mappings, window, signature)
+        self.calibration_job = None
+        if self.projection is not None:
+            histories = [row["layers"][0].get("history") for row in rows]
+            if all(history is not None for history in histories):
+                experts = len(mappings[0])
+                if any(
+                    len(h) != calls or any(len(step) != experts + 2 or step[-2] != 1 or step[-1] for step in h)
+                    for h in histories
+                ):
+                    reason = "invalid_per_step_history"
+                elif any(
+                    [sum(step[e] for step in h) for e in range(experts + 2)] != row["layers"][0]["counts"]
+                    for h, row in zip(histories, rows)
+                ):
+                    reason = "history_conservation_failure"
+                elif not validate_history_sources(rows, histories, calls):
+                    reason = "per_step_source_conservation_failure"
+                else:
+                    loads = [
+                        [sum(history[t][e] for history in histories) for e in range(experts)] for t in range(calls)
+                    ]
+                    before = [[sum(step[e] for e in rank) for rank in previous.source_placement] for step in loads]
+                    after = [[sum(step[e] for e in rank) for rank in previous.candidate_placement] for step in loads]
+                    baseline = sum(max(step) for step in before)
+                    candidate = sum(max(step) for step in after)
+                    self.projection.update(
+                        step_peak_work=baseline,
+                        candidate_step_peak_work=candidate,
+                        step_peak_reduction=1 - candidate / baseline,
+                    )
+                    self.calibration_job = {
+                        "plan": previous,
+                        "loads": loads,
+                        "window": window,
+                        "metadata": [row.get("step_metadata", []) for row in rows],
+                        "comm_codes": [row["layers"][0].get("comm_codes") for row in rows],
+                    }
+            else:
+                reason = "missing_per_step_history"
+            logging.getLogger(_LOG_NAME).info(
+                "[EPLB projection] stage=%s layer=%s window=%s policy=default_eplb source_window=%s "
+                "candidate_rank_work=%s moved_experts=%s step_peak_work=%s candidate_step_peak_work=%s "
+                "work_reduction=%s planner_ms=%.3f timing=not_estimated reason=%s",
+                self.stage,
+                self.layer,
+                window,
+                previous.source_window,
+                self.projection["candidate_rank_work"],
+                previous.moved_experts,
+                self.projection.get("step_peak_work", "unknown"),
+                self.projection.get("candidate_step_peak_work", "unknown"),
+                self.projection.get("step_peak_reduction", "unknown"),
+                previous.planner_ms,
+                reason or "none",
+            )
+        self.pending_plan, plan_reason = build_plan(result["expert_work"], mappings, window, signature)
+        if self.projection is None or plan_reason:
+            logging.getLogger(_LOG_NAME).info(
+                "[EPLB projection] stage=%s layer=%s window=%s reason=%s timing=not_estimated",
+                self.stage,
+                self.layer,
+                window,
+                plan_reason or reason,
+            )
+
 
 class WorkloadLogger:
     """Print each rank/layer, then an overall assessment based on layer evidence."""
@@ -199,15 +296,11 @@ class WorkloadLogger:
     def summarize(self, window, final=False):
         names = list(self.layers)
         counts = Counter(layer.hint for layer in self.layers.values())
-        candidates = [name for name, layer in self.layers.items() if layer.hint == "consider_eplb"]
-        conclusion = "insufficient_evidence"
-        if candidates:
-            conclusion = "consider_eplb_for_observed_layers"
-        elif counts["no_persistent_rank_skew"] == len(names) and names:
-            conclusion = "no_persistent_rank_skew_observed"
+        candidates = [name for name, layer in self.layers.items() if layer.hint == "persistent_load_skew"]
         logging.getLogger(_LOG_NAME).info(
-            "[EPLB summary] stage=%s window=%s final=%s ranks=%s layers=%s layer_assessments=%s candidate_layers=%s "
-            "invalid_layer_windows=%s conclusion=%s scope=observed_valid_windows speedup=not_estimated",
+            "[EPLB summary] stage=%s window=%s final=%s ranks=%s layers=%s layer_assessments=%s skewed_layers=%s "
+            "invalid_layer_windows=%s conclusion=insufficient_benefit_evidence "
+            "missing=calibrated_compute_and_eplb_cost scope=observed_valid_windows speedup=not_estimated",
             self.stage,
             window,
             final,
@@ -216,7 +309,6 @@ class WorkloadLogger:
             dict(counts),
             candidates,
             sum(layer.invalid_windows for layer in self.layers.values()),
-            conclusion,
         )
 
 
@@ -227,6 +319,9 @@ class DiagnosticsRecorder:
         self.summary = WorkloadLogger(list(group.ranks), stage)
         self.step = self.tokens = 0
         self.phases = set()
+        self.step_metadata = []
+        self.token_steps = []
+        self.history_slot = layers[0][1].eplb_diagnostic_probe.history_slot if layers else None
         self.collecting = self.real = self.finished = False
         self.layout = [
             {
@@ -250,8 +345,19 @@ class DiagnosticsRecorder:
         if self.collecting and offset % self.config.window_size == 0:
             self.tokens = 0
             self.phases.clear()
+            self.step_metadata.clear()
+            self.token_steps.clear()
             for _, layer in self.layers:
-                layer.eplb_diagnostic_probe.totals.zero_()
+                probe = layer.eplb_diagnostic_probe
+                probe.totals.zero_()
+                if probe.history is not None:
+                    probe.history.zero_()
+                    probe.comm_history.zero_()
+        if self.history_slot is not None:
+            self.history_slot.fill_(max(0, offset) % self.config.window_size)
+        if self.collecting:
+            self.step_metadata.append(None)
+            self.token_steps.append(tokens if self.real else 0)
         self.source_tokens.fill_(tokens if self.collecting and self.real else 0)
         if self.collecting and self.real:
             self.tokens += tokens
@@ -268,13 +374,31 @@ class DiagnosticsRecorder:
         # is control bookkeeping. No world/PP collective is added here.
         counters = [layer.eplb_diagnostic_probe.totals for _, layer in self.layers]
         snapshots = torch.cat(counters).cpu().split([counter.numel() for counter in counters])
+        histories = [layer.eplb_diagnostic_probe.history for _, layer in self.layers]
+        if all(history is not None for history in histories):
+            flat = torch.cat([history[:calls].flatten() for history in histories]).cpu()
+            history_rows = [
+                part.reshape(calls, -1).tolist() for part in flat.split([calls * h.shape[1] for h in histories])
+            ]
+            comm_rows = (
+                torch.stack([layer.eplb_diagnostic_probe.comm_history[:calls] for _, layer in self.layers])
+                .cpu()
+                .tolist()
+            )
+        else:
+            history_rows, comm_rows = [None] * len(histories), [None] * len(histories)
         row = {
             "step": self.step,
             "rank": self.group.ranks[self.group.rank_in_group],
             "tp_ranks": self.tp_ranks,
             "tokens": self.tokens,
             "phases": sorted(self.phases),
-            "layers": [dict(layout, counts=counts.tolist()) for layout, counts in zip(self.layout, snapshots)],
+            "step_metadata": self.step_metadata,
+            "token_steps": self.token_steps,
+            "layers": [
+                dict(layout, counts=counts.tolist(), history=history, comm_codes=comm)
+                for layout, counts, history, comm in zip(self.layout, snapshots, history_rows, comm_rows)
+            ],
         }
         rows = [None] * len(self.group.ranks)
         # Gloo writes its temporary receive tensors from a background thread.
@@ -305,6 +429,8 @@ def annotate_batch(runner, **metadata):
     recorder = getattr(runner, "_eplb_diagnostics_recorder", None)
     if recorder is not None and recorder.collecting and recorder.real:
         recorder.phases.add((metadata["phase"], metadata["graph_mode"]))
+        if recorder.step_metadata:
+            recorder.step_metadata[-1] = metadata
 
 
 @torch.inference_mode()
@@ -320,10 +446,20 @@ def initialize_diagnostics(runner):
     )
     source_tokens = torch.zeros((), dtype=torch.int64, device=runner.device)
     positions = torch.arange(capacity, device=runner.device)
+    history_slot = torch.zeros(1, dtype=torch.int64, device=runner.device)
     for layer in runner.model.modules():
         probe = getattr(layer, "eplb_diagnostic_probe", None)
         if isinstance(probe, ExpertLoadProbe):
             probe.source_token_count, probe.source_positions = source_tokens, positions
+            probe.history = torch.zeros(
+                (runner.ascend_config.eplb_diagnostics.window_size, probe.num_experts + 2),
+                dtype=torch.int64,
+                device=runner.device,
+            )
+            probe.history_slot = history_slot
+            probe.comm_history = torch.zeros(
+                runner.ascend_config.eplb_diagnostics.window_size, dtype=torch.int64, device=runner.device
+            )
     runner._eplb_diagnostics_source_tokens = source_tokens
 
 
@@ -355,7 +491,7 @@ def start_diagnostics(runner):
     )
     logging.getLogger(_LOG_NAME).info(
         "EPLB diagnostics: per-layer valid MoE assignments across each EP group/stage; synchronous window summaries; "
-        "dummy/padding excluded. consider_eplb is a load signal, not a speedup prediction."
+        "dummy/padding excluded. Load skew alone never recommends EPLB; isolated calibration is required."
     )
 
 

@@ -9,6 +9,10 @@ class ExpertLoadProbe(torch.nn.Module):
     def __init__(self, num_experts: int, device: torch.device | str):
         super().__init__()
         self.num_experts = num_experts
+        self.calibration_templates = {}
+        self.register_buffer("history", None, persistent=False)
+        self.register_buffer("history_slot", None, persistent=False)
+        self.register_buffer("comm_history", None, persistent=False)
         self.register_buffer("source_token_count", None, persistent=False)
         self.register_buffer("source_positions", None, persistent=False)
         # Expert assignments, supported calls, invalid IDs. The call count is
@@ -26,19 +30,31 @@ class ExpertLoadProbe(torch.nn.Module):
             or physical_ids.shape[0] > self.source_positions.numel()
         ):
             return
+        counts = self.totals if self.history is None else torch.zeros_like(self.totals)
         # AllGather replicas without source ownership still count the call.
         if physical_ids.shape[0] == 0:
-            self.totals[-2].add_(1)
+            counts[-2].add_(1)
+            self._append_history(counts)
             return
         # The shared scalar is zero for dummy, warmup and stopped collection.
         active = self.source_positions[: physical_ids.shape[0], None] + source_offset < self.source_token_count
         if valid_mask is not None:
             active = active & valid_mask[:, None]
         valid = (physical_ids >= 0) & (physical_ids < self.num_experts)
-        self.totals[: self.num_experts].scatter_add_(
+        counts[: self.num_experts].scatter_add_(
             0,
             physical_ids.clamp(0, self.num_experts - 1).reshape(-1).to(torch.int64),
             (active & valid).reshape(-1).to(torch.int64),
         )
-        self.totals[-2].add_(1)
-        self.totals[-1].add_((active & ~valid).sum())
+        counts[-2].add_(1)
+        counts[-1].add_((active & ~valid).sum())
+        self._append_history(counts)
+
+    def _append_history(self, counts):
+        if self.history is not None:
+            self.totals.add_(counts)
+            self.history.index_add_(0, self.history_slot, counts.unsqueeze(0))
+
+    def record_comm(self, code):
+        if self.comm_history is not None:
+            self.comm_history.index_fill_(0, self.history_slot, code)

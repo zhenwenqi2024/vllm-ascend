@@ -700,6 +700,11 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             )
             if routes is not None:
                 self.eplb_diagnostic_probe.record_routes(*routes)
+                self.eplb_diagnostic_probe.record_comm(
+                    {"MC2CommImpl": 1, "AlltoAllCommImpl": 2, "AllGatherCommImpl": 3}[
+                        type(_EXTRA_CTX.moe_comm_method).__name__
+                    ]
+                )
         try:
             fused_experts_results: FusedExpertsResult = self.quant_method.apply(
                 layer=self,
