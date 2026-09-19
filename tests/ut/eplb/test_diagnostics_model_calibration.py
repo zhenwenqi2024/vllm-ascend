@@ -74,7 +74,7 @@ class AscendW8A8DynamicFusedMoEMethod:
 
 def sample(quant="NONE"):
     layer = torch.nn.Module()
-    layer.w1, layer.w2 = torch.ones(2, 4, 8), torch.ones(2, 8, 4)
+    layer.w1, layer.w2 = torch.ones(2, 4, 8), torch.ones(2, 4, 4)
     method = AscendUnquantizedFusedMoEMethod() if quant == "NONE" else AscendW8A8DynamicFusedMoEMethod()
     payload = Payload(
         torch.ones(8, 4, dtype=torch.float16 if quant == "NONE" else torch.int8),
@@ -84,7 +84,7 @@ def sample(quant="NONE"):
         SimpleNamespace(quant_type=SimpleNamespace(name=quant)),
         dynamic_scale=None if quant == "NONE" else torch.ones(8, 1),
     )
-    return SimpleNamespace(calibration_templates={}), payload, method
+    return SimpleNamespace(calibration_templates={}, eplb_enabled=True), payload, method
 
 
 @pytest.mark.parametrize("quant", ["NONE", "W8A8"])
@@ -154,8 +154,9 @@ def test_context_is_restored_and_method_state_is_not_mutated(api, monkeypatch):
     result, reason = api.calibrate_layer(probe, [[7, 1], [0, 0]], [[4, 4], [0, 0]], "MC2CommImpl", repeats=2)
     assert reason is None
     assert len(result["baseline"]) == len(result["candidate"]) == 2
-    assert result["scope"] == "isolated_eplb_off_mlp"
-    assert result["on_kernel_delta"] == result["communication_delta"] == result["graph_delta"] == "unknown"
+    assert result["scope"] == "isolated_eplb_on_mlp"
+    assert result["communication_delta"] == result["graph_delta"] == "unknown"
+    assert result["estimated_scratch_bytes"] > 0
     assert len(captured) == 12
     assert len({id(item.hidden_states) for item in captured}) == 12
     assert context.moe_comm_type == "previous"
@@ -187,29 +188,59 @@ def test_routing_dependent_path_fails_closed(api, field_name):
 def test_variant_templates_and_excessive_shapes_fail_closed(api):
     probe, payload, method = sample()
     api.capture_template(probe, payload, method, "MC2CommImpl")
-    result, reason = api.calibrate_layer(probe, [[7, 1]], [[9, 0]], "MC2CommImpl")
+    result, reason = api.calibrate_layer(probe, [[7, 1]], [[9, 0]], "MC2CommImpl", max_scratch_bytes=1)
     assert result is None
-    assert reason == "calibration_shape_exceeds_observed_capacity"
+    assert reason == "calibration_scratch_estimate_exceeds_limit"
+    previous = probe.calibration_templates["MC2CommImpl"]
     larger = replace(payload, hidden_states=torch.ones(16, 4, dtype=torch.float16))
     assert api.capture_template(probe, larger, method, "MC2CommImpl") is None
-    assert probe.calibration_templates["MC2CommImpl"].row_capacity == 16
+    assert probe.calibration_templates["MC2CommImpl"] == previous
     assert api.capture_template(probe, replace(payload, fusion=True), method, "MC2CommImpl") == "ambiguous_mlp_template"
 
 
-def test_payload_bytes_include_scales_and_deduplicate_aliases(api, monkeypatch):
-    probe, payload, method = sample("W8A8")
-    scale = torch.ones(2, 8, dtype=torch.float32)
+@pytest.mark.parametrize("dynamic_flag", [False, True])
+@pytest.mark.parametrize("quant", ["NONE", "W8A8"])
+def test_enabled_runner_preserves_actual_kernel_flag_and_split_weights(api, quant, dynamic_flag):
+    probe, payload, method = sample(quant)
+    payload.dynamic_eplb = dynamic_flag
+    payload.layer.w1 = list(payload.layer.w1.unbind(0))
+    payload.layer.w2 = list(payload.layer.w2.unbind(0))
     api.capture_template(probe, payload, method, "MC2CommImpl")
-    monkeypatch.setattr(
-        method,
-        "get_eplb_weight_views",
-        lambda layer: [layer.w1, layer.w2, scale, layer.w1.view_as(layer.w1), list(scale.unbind(0))],
-        raising=False,
-    )
-    size, reason = api.expert_payload_bytes(probe, "MC2CommImpl")
-    assert reason is None
-    assert size == (4 * 8 + 8 * 4 + 8) * 4
-    monkeypatch.setattr(method, "get_eplb_weight_views", lambda layer: [[torch.ones(2), torch.ones(3)]])
-    size, reason = api.expert_payload_bytes(probe, "MC2CommImpl")
-    assert size is None
-    assert reason == "nonuniform_expert_payload"
+    template = probe.calibration_templates["MC2CommImpl"]
+    fresh = api._new_input(template, [12, 0], payload.layer, method)
+    assert fresh.dynamic_eplb is dynamic_flag
+    assert fresh.hidden_states.shape[0] > payload.hidden_states.shape[0]
+    assert fresh.weights.w1 is payload.layer.w1
+    assert fresh.weights.w2 is payload.layer.w2
+    assert api._estimated_scratch_bytes(template, 12, payload.layer, method) > 0
+    payload.layer.w2.pop()
+    with pytest.raises(ValueError, match="unsupported split"):
+        api._estimated_scratch_bytes(template, 12, payload.layer, method)
+
+
+def test_missing_on_indicator_is_rejected_at_capture_and_calibration(api):
+    probe, payload, method = sample()
+    del probe.eplb_enabled
+    payload.dynamic_eplb = True  # Kernel flag alone is not validated runner state.
+    assert api.capture_template(probe, payload, method, "MC2CommImpl") == "requires_eplb_enabled"
+    result, reason = api.calibrate_layer(probe, [[4, 4]], [[4, 4]], "MC2CommImpl")
+    assert result is None
+    assert reason == "requires_eplb_enabled"
+
+
+@pytest.mark.parametrize("counts", [[-1, 9], [True, 7], [4.0, 4], [8], [4, 4, 0]])
+def test_invalid_counts_fail_before_runtime(api, counts):
+    probe, payload, method = sample()
+    api.capture_template(probe, payload, method, "MC2CommImpl")
+    result, reason = api.calibrate_layer(probe, [counts], [[4, 4]], "MC2CommImpl")
+    assert result is None
+    assert reason == "invalid_slot_counts"
+
+
+@pytest.mark.parametrize("kwargs", [{"repeats": True}, {"repeats": 1.5}, {"max_scratch_bytes": 0}])
+def test_invalid_bounds_fail_before_runtime(api, kwargs):
+    probe, payload, method = sample()
+    api.capture_template(probe, payload, method, "MC2CommImpl")
+    result, reason = api.calibrate_layer(probe, [[4, 4]], [[4, 4]], "MC2CommImpl", **kwargs)
+    assert result is None
+    assert reason == "invalid_calibration_samples"

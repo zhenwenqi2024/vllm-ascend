@@ -3,6 +3,7 @@
 
 """Narrow vLLM EPLB construction and commit adapters for Ascend."""
 
+from contextlib import nullcontext
 from functools import wraps
 from inspect import signature
 
@@ -106,16 +107,22 @@ def _wrap_move_to_workspace(original_move):
             consumed_event = pending_result.consumed_event
             deferred_event = _DeferredConsumedEvent(consumed_event)
             pending_result.consumed_event = deferred_event
+        monitor = getattr(model_state, "_eplb_diagnostic_monitor", None)
+        layer = model_state.model.moe_layers[layer_idx] if monitor is not None and layer_idx is not None else None
         try:
-            result = original_move(*bound.args, **bound.kwargs)
-            if layer_idx is not None:
-                refresh_model_routing_tables(model_state, layer_idx)
-                if bound.arguments["ep_rank"] == 0 and layer_idx == model_state.model.num_moe_layers - 1:
-                    logger.info(
-                        "%s: model=%s",
-                        ASYNC_EPLB_CYCLE_COMMITTED_LOG,
-                        model_state.model_name,
-                    )
+            with (
+                monitor.cpu_span("commit_apply", layer) if monitor is not None else nullcontext(),
+                monitor.device_span("commit_apply", layer) if monitor is not None else nullcontext(),
+            ):
+                result = original_move(*bound.args, **bound.kwargs)
+                if layer_idx is not None:
+                    refresh_model_routing_tables(model_state, layer_idx)
+                    if bound.arguments["ep_rank"] == 0 and layer_idx == model_state.model.num_moe_layers - 1:
+                        logger.info(
+                            "%s: model=%s",
+                            ASYNC_EPLB_CYCLE_COMMITTED_LOG,
+                            model_state.model_name,
+                        )
         finally:
             if pending_result is not None and consumed_event is not None:
                 pending_result.consumed_event = consumed_event

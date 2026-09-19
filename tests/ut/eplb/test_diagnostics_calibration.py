@@ -20,70 +20,112 @@ def api():
     return module
 
 
-def costs(**overrides):
+def measurements(**overrides):
     return (
         dict(
-            baseline_ms=(9, 11),
-            candidate_ms=(5, 6),
-            collection_ms=(0.1, 0.2),
-            planner_ms=(1, 2),
-            transfer_ms=(4, 8),
-            apply_ms=(1, 2),
-            update_interval=10,
-            communication_delta_ms=(0, 0.1),
+            previous_step_ms=[(9, 11), (5, 7)],
+            current_step_ms=[(5, 6), (4, 5)],
+            overhead_total_ms=(2, 4),
+            observed_steps=10,
+            missing=(),
         )
         | overrides
     )
 
 
-def test_conservative_net_interval_and_production_amortization(api):
-    result = api.estimate_net_benefit(**costs())
-    assert result["gross_saving_ms"] == (3, 6)
-    assert result["amortized_cost_ms"] == pytest.approx((0.7, 1.5))
-    assert result["net_saving_ms"] == pytest.approx((1.5, 5.3))
+def test_actual_adjustment_cost_and_net_are_separate(api):
+    result = api.estimate_adjustment_benefit(**measurements())
+    assert result["adjustment_saving_ms"] == (1.5, 4.5)
+    assert result["eplb_overhead_ms"] == (0.2, 0.4)
+    assert result["measured_budget_ms"] == result["estimated_net_saving_ms"] == (1.1, 4.3)
     assert result["conclusion"] == "positive_margin"
-    # Same measurements, more frequent updates: all saving can be lost.
-    result = api.estimate_net_benefit(**costs(update_interval=1))
-    assert result["net_saving_ms"][1] < 0
+    # Actual observed calls, not an assumed future update interval, amortize cost.
+    result = api.estimate_adjustment_benefit(**measurements(observed_steps=1, overhead_total_ms=(5, 6)))
+    assert result["adjustment_saving_ms"] == (1.5, 4.5)
+    assert result["eplb_overhead_ms"] == (5, 6)
     assert result["conclusion"] == "cost_exceeds_benefit"
 
 
-def test_uncertain_bounds_do_not_recommend_enabling(api):
-    result = api.estimate_net_benefit(**costs(candidate_ms=(8, 10)))
-    assert result["net_saving_ms"][0] < 0 < result["net_saving_ms"][1]
+def test_paired_step_maxima_keep_alternating_busiest_ranks(api):
+    # Rank latencies alternate [10, 0] and [0, 10]. Per-step maxima are 10, 10;
+    # max of rank averages would incorrectly use 5. Current layout takes 6, 6.
+    result = api.estimate_adjustment_benefit(
+        **measurements(previous_step_ms=[10, 10], current_step_ms=[6, 6], overhead_total_ms=0)
+    )
+    assert result["adjustment_saving_ms"] == (4, 4)
+
+
+@pytest.mark.parametrize("scope", ["fused_route_collection", "graph_delta", "communication_delta", "overlap"])
+def test_missing_scope_preserves_components_but_never_claims_net(api, scope):
+    result = api.estimate_adjustment_benefit(**measurements(missing=(scope,)))
+    assert result["adjustment_saving_ms"] == (1.5, 4.5)
+    assert result["eplb_overhead_ms"] == (0.2, 0.4)
+    assert result["measured_budget_ms"] == (1.1, 4.3)
+    assert result["estimated_net_saving_ms"] is None
+    assert result["conclusion"] == "insufficient_evidence"
+    assert result["missing"] == [scope]
+
+
+def test_unknown_exposed_total_is_not_zero_or_sum_of_components(api):
+    result = api.estimate_adjustment_benefit(**measurements(overhead_total_ms=None))
+    assert result["adjustment_saving_ms"] == (1.5, 4.5)
+    assert result["eplb_overhead_ms"] is None
+    assert result["measured_budget_ms"] is None
+    assert result["estimated_net_saving_ms"] is None
+    assert result["missing"] == ["total_exposed_overhead"]
+
+
+def test_adjustment_can_be_regression_and_bounds_can_be_uncertain(api):
+    result = api.estimate_adjustment_benefit(
+        **measurements(previous_step_ms=[5], current_step_ms=[8], overhead_total_ms=1)
+    )
+    assert result["adjustment_saving_ms"] == (-3, -3)
+    assert result["conclusion"] == "cost_exceeds_benefit"
+    result = api.estimate_adjustment_benefit(**measurements(previous_step_ms=[(4, 6)], current_step_ms=[(4, 6)]))
+    assert result["estimated_net_saving_ms"][0] < 0 < result["estimated_net_saving_ms"][1]
     assert result["conclusion"] == "uncertain"
 
 
-def test_candidate_can_be_slower_and_zero_margin_is_not_positive(api):
-    assert api.estimate_net_benefit(**costs(candidate_ms=12))["conclusion"] == "cost_exceeds_benefit"
-    result = api.estimate_net_benefit(
-        **costs(
-            baseline_ms=1,
-            candidate_ms=1,
-            collection_ms=0,
-            planner_ms=0,
-            transfer_ms=0,
-            apply_ms=0,
-            communication_delta_ms=0,
-        )
+def test_zero_adjustment_does_not_turn_into_positive_gain(api):
+    result = api.estimate_adjustment_benefit(
+        **measurements(previous_step_ms=[1], current_step_ms=[1], overhead_total_ms=0)
     )
-    assert result["net_saving_ms"] == (0, 0)
+    assert result["adjustment_saving_ms"] == result["estimated_net_saving_ms"] == (0, 0)
     assert result["conclusion"] == "cost_exceeds_benefit"
 
 
-@pytest.mark.parametrize("missing", list(costs()))
-def test_unknown_costs_and_timing_are_never_free(api, missing):
-    result = api.estimate_net_benefit(**costs(**{missing: None}))
-    assert result["conclusion"] == "insufficient_evidence"
-    assert result["missing"] == [missing]
-    assert result["net_saving_ms"] is None
+@pytest.mark.parametrize("values", [(None, [1]), ([1], None), ([], [])])
+def test_missing_comparison_keeps_measured_overhead(api, values):
+    result = api.estimate_adjustment_benefit(**measurements(previous_step_ms=values[0], current_step_ms=values[1]))
+    assert result["adjustment_saving_ms"] is None
+    assert result["eplb_overhead_ms"] == (0.2, 0.4)
+    assert result["estimated_net_saving_ms"] is None
+    assert result["missing"] == ["matched_layout_timing"]
 
 
-def test_signed_communication_change_is_accounted_for(api):
-    regular = api.estimate_net_benefit(**costs(communication_delta_ms=0))
-    improved = api.estimate_net_benefit(**costs(communication_delta_ms=(-0.5, -0.2)))
-    assert improved["net_saving_ms"][0] == pytest.approx(regular["net_saving_ms"][0] + 0.2)
-    assert improved["net_saving_ms"][1] == pytest.approx(regular["net_saving_ms"][1] + 0.5)
+def test_matched_sample_lengths_required(api):
+    with pytest.raises(ValueError, match="paired"):
+        api.estimate_adjustment_benefit(**measurements(previous_step_ms=[1], current_step_ms=[1, 2]))
+
+
+def test_missing_observed_steps_does_not_use_sample_count_as_cost_denominator(api):
+    result = api.estimate_adjustment_benefit(**measurements(observed_steps=None))
+    assert result["adjustment_saving_ms"] == (1.5, 4.5)
+    assert result["eplb_overhead_ms"] is None
+    assert result["missing"] == ["observed_steps"]
+
+
+@pytest.mark.parametrize("steps", [0, -1, 1.5, True])
+def test_invalid_observed_steps_rejected(api, steps):
+    with pytest.raises(ValueError):
+        api.estimate_adjustment_benefit(**measurements(observed_steps=steps))
+
+
+def test_missing_scope_must_be_explicit(api):
+    with pytest.raises(TypeError):
+        api.estimate_adjustment_benefit()
+    with pytest.raises(ValueError):
+        api.estimate_adjustment_benefit(**measurements(missing="graph_delta"))
 
 
 def test_latency_normalization(api):
@@ -96,12 +138,6 @@ def test_latency_normalization(api):
 def test_invalid_latency_rejected(api, value):
     with pytest.raises(ValueError):
         api.latency_interval(value)
-
-
-@pytest.mark.parametrize("interval", [0, -1, 1.5, True])
-def test_invalid_update_interval_rejected(api, interval):
-    with pytest.raises(ValueError):
-        api.estimate_net_benefit(**costs(update_interval=interval))
 
 
 def test_timing_prepares_fresh_inputs_outside_events_and_retains_outputs(api, monkeypatch):
@@ -163,3 +199,9 @@ def test_timing_cannot_run_inside_capture(api, monkeypatch):
 def test_bad_sample_counts_rejected(api, kwargs):
     with pytest.raises(ValueError):
         api.measure_callable(lambda: None, **kwargs)
+
+
+def test_missing_generator_is_not_consumed_before_net_gate(api):
+    result = api.estimate_adjustment_benefit(**measurements(missing=(x for x in ("graph_delta",))))
+    assert result["missing"] == ["graph_delta"]
+    assert result["estimated_net_saving_ms"] is None

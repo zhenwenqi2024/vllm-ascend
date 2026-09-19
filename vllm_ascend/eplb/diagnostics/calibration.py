@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Isolated device measurements and explicit EPLB benefit/cost bounds.
+"""Matched actual EPLB-layout timing and explicitly scoped live cost arithmetic.
 
-These helpers never change live expert placement or derive milliseconds from
-routing counts. Calibration must run collectively outside normal inference.
+The arithmetic separates layout adjustment saving from measured live overhead.
+It never infers milliseconds from route counts or treats missing costs as free.
 """
 
 import math
@@ -80,76 +80,79 @@ def latency_interval(value, *, signed: bool = False) -> tuple[float, float]:
     return lower, upper
 
 
-def estimate_net_benefit(
+def estimate_adjustment_benefit(
     *,
-    baseline_ms=None,
-    candidate_ms=None,
-    collection_ms=None,
-    planner_ms=None,
-    transfer_ms=None,
-    apply_ms=None,
-    update_interval=None,
-    communication_delta_ms=None,
+    previous_step_ms=None,
+    current_step_ms=None,
+    overhead_total_ms=None,
+    observed_steps=None,
+    missing,
 ) -> dict:
-    """Compare per-step savings with explicitly supplied cost bounds.
+    """Separate actual layout saving, covered live overhead and estimated net.
 
-    Baseline/candidate must have the same per-step measurement scope, model,
-    shapes, quantization, communication method, and graph mode. For GMM-only
-    measurements, communication_delta_ms bounds the omitted communication
-    change (candidate minus baseline); use explicit zero only when justified.
-    Collection is per step. Planner, transfer and apply are per update, divided
-    by the intended *production* update interval, not the diagnostic window.
+    previous_step_ms/current_step_ms are aligned lists of per-step EP maximum
+    MLP latency bounds, using the same logical workload and EPLB-on kernels for
+    the previous and current *observed* layouts. Maximum over ranks precedes
+    mean over steps; do not pass maximum of rank means or mix different layers.
 
-    Costs represent critical-path exposure, or explicitly conservative upper
-    bounds. Raw asynchronous stage durations must not be called exposed costs.
-    None means unknown; unknown components cannot silently become free.
+    overhead_total_ms is a non-overlapping, measured exposed span over the
+    matching observed_steps. It is not a sum of nested or overlapping raw host,
+    device, planner and transfer durations. No intended update interval is used.
+
+    missing is required: the caller names unmeasured collection, graph,
+    communication, overlap/interference, or other omitted scope. The reported
+    eplb_overhead_ms covers only the supplied observed spans. measured_budget_ms
+    subtracts that covered overhead, but estimated_net_saving_ms stays unknown
+    until missing is empty. Sample min/max bounds are not confidence intervals.
     """
-    components = {
-        "baseline_ms": baseline_ms,
-        "candidate_ms": candidate_ms,
-        "collection_ms": collection_ms,
-        "planner_ms": planner_ms,
-        "transfer_ms": transfer_ms,
-        "apply_ms": apply_ms,
-        "communication_delta_ms": communication_delta_ms,
-    }
-    missing = [name for name, value in components.items() if value is None]
-    if update_interval is None:
-        missing.append("update_interval")
-    elif isinstance(update_interval, bool) or not isinstance(update_interval, int) or update_interval < 1:
-        raise ValueError("update_interval must be a positive integer")
-    intervals = {
-        name: latency_interval(value, signed=name == "communication_delta_ms")
-        for name, value in components.items()
-        if value is not None
-    }
-    if missing:
-        return {
-            "conclusion": "insufficient_evidence",
-            "missing": missing,
-            "gross_saving_ms": None,
-            "amortized_cost_ms": None,
-            "net_saving_ms": None,
-        }
-    baseline, candidate = intervals["baseline_ms"], intervals["candidate_ms"]
-    gross = baseline[0] - candidate[1], baseline[1] - candidate[0]
-    cost = tuple(
-        intervals["collection_ms"][i]
-        + intervals["communication_delta_ms"][i]
-        + sum(intervals[key][i] for key in ("planner_ms", "transfer_ms", "apply_ms")) / update_interval
-        for i in (0, 1)
-    )
-    net = gross[0] - cost[1], gross[1] - cost[0]
-    if net[0] > 0:
+    if isinstance(missing, str):
+        raise ValueError("missing must explicitly list nonempty scope names")
+    omissions = list(dict.fromkeys(missing))
+    if any(not isinstance(name, str) or not name for name in omissions):
+        raise ValueError("missing must explicitly list nonempty scope names")
+    saving = overhead = budget = None
+    if previous_step_ms is None or current_step_ms is None:
+        omissions.append("matched_layout_timing")
+    else:
+        previous, current = list(previous_step_ms), list(current_step_ms)
+        if len(previous) != len(current):
+            raise ValueError("previous and current layout samples must be paired")
+        if not previous:
+            omissions.append("matched_layout_timing")
+        else:
+            previous = [latency_interval(value) for value in previous]
+            current = [latency_interval(value) for value in current]
+            saving = (
+                sum(old[0] - new[1] for old, new in zip(previous, current)) / len(previous),
+                sum(old[1] - new[0] for old, new in zip(previous, current)) / len(previous),
+            )
+    if observed_steps is None:
+        omissions.append("observed_steps")
+    elif isinstance(observed_steps, bool) or not isinstance(observed_steps, int) or observed_steps < 1:
+        raise ValueError("observed_steps must be a positive integer")
+    if overhead_total_ms is None:
+        omissions.append("total_exposed_overhead")
+    else:
+        total = latency_interval(overhead_total_ms)
+        if observed_steps is not None:
+            overhead = tuple(value / observed_steps for value in total)
+    if saving is not None and overhead is not None:
+        budget = saving[0] - overhead[1], saving[1] - overhead[0]
+    omissions = list(dict.fromkeys(omissions))
+    net = budget if not omissions else None
+    if net is None:
+        conclusion = "insufficient_evidence"
+    elif net[0] > 0:
         conclusion = "positive_margin"
     elif net[1] <= 0:
         conclusion = "cost_exceeds_benefit"
     else:
         conclusion = "uncertain"
     return {
+        "adjustment_saving_ms": saving,
+        "eplb_overhead_ms": overhead,
+        "measured_budget_ms": budget,
+        "estimated_net_saving_ms": net,
+        "missing": omissions,
         "conclusion": conclusion,
-        "missing": [],
-        "gross_saving_ms": gross,
-        "amortized_cost_ms": cost,
-        "net_saving_ms": net,
     }

@@ -4,6 +4,7 @@
 """Ascend-owned extensions for the upstream EPLB state."""
 
 import inspect
+from contextlib import nullcontext
 from dataclasses import fields
 from typing import Any
 
@@ -84,10 +85,17 @@ def refresh_model_routing_tables(
     """Refresh every routing table, or one table after an async commit."""
     layers = list(model_state.model.moe_layers)
     selected_layers = enumerate(layers) if layer_idx is None else ((layer_idx, layers[layer_idx]),)
+    monitor = getattr(model_state, "_eplb_diagnostic_monitor", None)
     for _, layer in selected_layers:
         layer_state = layer.eplb_state
         if isinstance(layer_state, AscendEplbLayerState):
-            layer_state.refresh_expert_replica_routing_table()
+            with (
+                monitor.cpu_span("routing_table_refresh", layer) if monitor is not None else nullcontext(),
+                monitor.device_span("routing_table_refresh", layer) if monitor is not None else nullcontext(),
+            ):
+                layer_state.refresh_expert_replica_routing_table()
+            if monitor is not None:
+                monitor.committed(layer)
 
 
 class AscendEplbState(_eplb_state.EplbState):
@@ -100,6 +108,20 @@ class AscendEplbState(_eplb_state.EplbState):
         self._has_fresh_recorded_load = False
         if self.cuda_device_index is None:
             self.cuda_device_index = torch.accelerator.current_device_index()
+
+    def step(self, is_dummy: bool = False, is_profile: bool = False, log_stats: bool = False) -> None:
+        monitor = getattr(self, "_eplb_diagnostic_monitor", None)
+        if monitor is None:
+            return super().step(is_dummy, is_profile, log_stats=log_stats)
+        # Sampling advances EPLB after the execute_model observation scope.
+        # Dummy/profile calls also consume and discard any stale qualification.
+        monitor.active = monitor.pending_real and not is_dummy and not is_profile
+        try:
+            with monitor.cpu_span("eplb_step"), monitor.device_span("eplb_step"):
+                return super().step(is_dummy, is_profile, log_stats=log_stats)
+        finally:
+            monitor.active = False
+            monitor.pending_real = False
 
     def _has_global_fresh_recorded_load(self) -> bool:
         """Synchronize whether any EP rank recorded load since rearranging."""

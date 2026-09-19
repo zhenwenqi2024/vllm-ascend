@@ -92,7 +92,12 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     plan_sparse_kv_offload_memory,
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
-from vllm_ascend.eplb.diagnostics.runtime import initialize_diagnostics, run_dummy_batch, start_diagnostics
+from vllm_ascend.eplb.diagnostics.runtime import (
+    diagnostics_quiescent,
+    initialize_diagnostics,
+    run_dummy_batch,
+    start_diagnostics,
+)
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -1218,21 +1223,22 @@ class NPUWorker(WorkerBase):
     def finish_eplb_diagnostics(self) -> None:
         """Collect the final partial window; invoke on all EP workers after generation."""
         recorder = getattr(self.model_runner, "_eplb_diagnostics_recorder", None)
-        if recorder is not None:
+        if recorder is not None and diagnostics_quiescent(self.model_runner):
             recorder.finish()
 
     def calibrate_eplb_diagnostics(
-        self, update_interval: int, samples: int = 4, repeats: int = 3, max_scratch_bytes: int = 134217728
+        self, samples: int = 4, repeats: int = 3, max_scratch_bytes: int = 134217728
     ) -> None:
         """Run isolated calibration collectively, after all requests have finished."""
         from vllm_ascend.eplb.diagnostics.assessment import calibrate
 
         recorder = getattr(self.model_runner, "_eplb_diagnostics_recorder", None)
         if recorder is None:
-            raise ValueError("EPLB diagnostics observe mode is required for calibration")
+            raise ValueError("EPLB diagnostics benefit mode is required for calibration")
+        if not diagnostics_quiescent(self.model_runner, calibration=True):
+            return
         calibrate(
             recorder,
-            update_interval=update_interval,
             samples=samples,
             repeats=repeats,
             max_scratch_bytes=max_scratch_bytes,

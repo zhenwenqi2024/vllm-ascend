@@ -1,264 +1,219 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Collective, post-generation calibration; never an inference routing change."""
+"""Post-run comparison of real EPLB-on placements, without changing live routing."""
 
 import logging
+import math
+from numbers import Real
 
-import torch
-
-from vllm_ascend.eplb.diagnostics.calibration import estimate_net_benefit, latency_interval
-from vllm_ascend.eplb.diagnostics.model_calibration import calibrate_layer, expert_payload_bytes
-from vllm_ascend.eplb.diagnostics.scratch import measure_overheads
+from vllm_ascend.eplb.diagnostics.calibration import estimate_adjustment_benefit, latency_interval
+from vllm_ascend.eplb.diagnostics.model_calibration import calibrate_layer
+from vllm_ascend.eplb.diagnostics.runtime import gather
 
 _COMM_NAMES = {1: "MC2CommImpl", 2: "AlltoAllCommImpl", 3: "AllGatherCommImpl"}
 _LOGGER = logging.getLogger("vllm.eplb.diagnostics")
 
 
-def gather(group, value):
-    rows = [None] * len(group.ranks)
-    with torch.inference_mode(False):
-        torch.distributed.all_gather_object(rows, value, group=group.cpu_group)
-    return rows
-
-
 def select_samples(job, samples):
-    """Use one real phase/communication/graph bucket, including idle owners."""
+    """Choose identical phase, graph shape and communication across EP ranks."""
+    ranks = len(job["initial_placement"])
+    if not ranks or any(len(job[key]) != ranks for key in ("current_placement", "metadata", "comm_codes")):
+        return None, []
+    steps = len(job["loads"])
+    if any(history is None or len(history) != steps for key in ("metadata", "comm_codes") for history in job[key]):
+        return None, []
     buckets = {}
     for step, loads in enumerate(job["loads"]):
         if not sum(loads):
             continue
-        metadata = [rank[step] for rank in job["metadata"] if len(rank) > step and rank[step] is not None]
+        metadata = [rank[step] for rank in job["metadata"] if rank[step] is not None]
         if not metadata:
             continue
         phases = {(value["phase"], value["graph_mode"]) for value in metadata}
-        codes = {rank[step] for rank in job["comm_codes"] if rank is not None and len(rank) > step}
-        if (
-            len(phases) != 1
-            or len(codes) != 1
-            or len(job["comm_codes"]) != sum(rank is not None and len(rank) > step for rank in job["comm_codes"])
-        ):
+        codes = {rank[step] for rank in job["comm_codes"]}
+        if len(phases) != 1 or len(codes) != 1:
             continue
         code = next(iter(codes))
         if code not in _COMM_NAMES:
             continue
-        phase, graph = next(iter(phases))
-        # Keep padded source shapes comparable as well as phase/graph mode.
-        shape = tuple(
-            None if len(rank) <= step or rank[step] is None else rank[step].get("padded_tokens")
-            for rank in job["metadata"]
-        )
-        buckets.setdefault((code, phase, graph, shape), []).append(step)
+        shape = tuple(None if rank[step] is None else rank[step].get("padded_tokens") for rank in job["metadata"])
+        buckets.setdefault((code, *next(iter(phases)), shape), []).append(step)
     if not buckets:
         return None, []
     key, indices = max(buckets.items(), key=lambda item: len(item[1]))
     count = min(samples, len(indices))
-    chosen = [indices[index * len(indices) // count] for index in range(count)]
-    return key, chosen
+    return key, [indices[index * len(indices) // count] for index in range(count)]
 
 
-def critical_path_interval(results, name):
-    """Average aligned per-step EP maxima; never max of per-rank totals."""
+def critical_path_samples(results, name):
+    """EP maximum per aligned step; do not average ranks before the maximum."""
     if not results or any(not rank.get(name) for rank in results):
         raise ValueError("Missing aligned timing samples")
     samples = len(results[0][name])
     if any(len(rank[name]) != samples for rank in results):
         raise ValueError("Unaligned timing samples")
-    return tuple(
-        sum(max(latency_interval(rank[name][step])[bound] for rank in results) for step in range(samples)) / samples
-        for bound in (0, 1)
-    )
+    return [
+        tuple(max(latency_interval(rank[name][step])[bound] for rank in results) for bound in (0, 1))
+        for step in range(samples)
+    ]
 
 
-def maximum_interval(values):
-    return tuple(max(latency_interval(value)[bound] for value in values) for bound in (0, 1))
+def observed_overhead(costs):
+    """Print raw components and only one set of outer spans as a covered total.
 
-
-def calibrated_budget(results, costs, planner_ms, update_interval):
-    if any(len(row.get("baseline", [])) != len(row.get("candidate", [])) for row in results):
-        raise ValueError("Baseline and candidate samples must be paired")
-    baseline = critical_path_interval(results, "baseline")
-    candidate = critical_path_interval(results, "candidate")
-    collection = maximum_interval([row["collection_ms"] for row in costs])
-    # This arithmetic budget covers ONLY isolated MLP minus scratch proxies.
-    # There is no dispatch/combine inside those MLP callbacks (explicit zero).
-    # The caller must keep actual EPLB net gain UNKNOWN for omitted live effects.
-    budget = estimate_net_benefit(
-        baseline_ms=baseline,
-        candidate_ms=candidate,
-        collection_ms=tuple(value / update_interval for value in collection),
-        planner_ms=planner_ms,
-        transfer_ms=maximum_interval([row["transfer_ms"] for row in costs]),
-        apply_ms=maximum_interval([row["apply_ms"] for row in costs]),
-        update_interval=update_interval,
-        communication_delta_ms=0,
-    )
-    return baseline, candidate, budget["gross_saving_ms"], budget["amortized_cost_ms"], budget["net_saving_ms"]
-
-
-def calibrate(recorder, *, update_interval, samples=4, repeats=3, max_scratch_bytes=134217728):
-    """Explicit collective RPC after requests finish; prints evidence, no files.
-
-    Model-backed MLP tests use fresh synthetic inputs and immutable OFF weights.
-    Scratch costs are packed serial proxies. Missing ON-kernel, graph, routing
-    collection, communication and overlap effects prevent an enable decision.
+    Device spans include idle gaps and async interference; they are not a
+    causal end-to-end slowdown. Host and nested spans must not be added.
     """
-    group = recorder.group
-    arguments = (update_interval, samples, repeats, max_scratch_bytes)
-    state = (
-        arguments,
-        recorder.finished,
-        getattr(recorder, "calibrated", False),
-        getattr(recorder, "calibration_arguments", None),
-        recorder.step,
-    )
-    peers = gather(group, state)
-    if any(peer != state for peer in peers):
-        raise ValueError("All EP workers must use identical calibration arguments and recorder state")
-    if (
-        isinstance(update_interval, bool)
-        or not isinstance(update_interval, int)
-        or update_interval < 1
-        or not isinstance(samples, int)
-        or isinstance(samples, bool)
-        or not 1 <= samples <= 32
-        or not isinstance(repeats, int)
-        or isinstance(repeats, bool)
-        or not 1 <= repeats <= 20
-        or not isinstance(max_scratch_bytes, int)
-        or isinstance(max_scratch_bytes, bool)
-        or max_scratch_bytes < 1
-    ):
-        raise ValueError("Calibration needs a positive production update_interval, samples 1..32 and repeats 1..20")
-    recorder.finish()
-    if getattr(recorder, "calibrated", False) and getattr(recorder, "calibration_arguments", None) == arguments:
-        if group.rank_in_group == 0:
-            _LOGGER.info(
-                "[EPLB calibration summary] stage=%s reason=already_calibrated "
-                "production_update_interval=%s samples=%s repeats=%s max_scratch_bytes=%s",
-                recorder.summary.stage,
-                *arguments,
-            )
-        return
-    jobs = None
-    if group.rank_in_group == 0:
-        jobs = {name: layer.calibration_job for name, layer in recorder.summary.layers.items() if layer.calibration_job}
-    jobs = gather(group, jobs)[0]
-    local_layers = dict(recorder.layers)
-    completed = 0
-    budget_counts = dict.fromkeys(("positive", "nonpositive", "uncertain"), 0)
-    for name, job in sorted(jobs.items()):
-        key, indices = select_samples(job, samples)
-        if not indices:
-            if group.rank_in_group == 0:
-                _LOGGER.info(
-                    "[EPLB calibration] layer=%s evaluation_window=%s reason=no_comparable_real_samples",
-                    name,
-                    job["window"],
-                )
-            continue
-        comm_name = _COMM_NAMES[key[0]]
-        plan = job["plan"]
-        rank = group.rank_in_group
-        source, target = plan.source_placement[rank], plan.candidate_placement[rank]
-        baseline_counts = [[job["loads"][step][expert] for expert in source] for step in indices]
-        candidate_counts = [[job["loads"][step][expert] for expert in target] for step in indices]
-        result = payload = None
-        reason = payload_reason = None
+    outer = {"eplb_step", "eplb_step_before", "eplb_step_after"}
+    if not costs or any(row["pending"] or row["dropped"] for row in costs):
+        return None
+    totals = []
+    families = set()
+    for row in costs:
+        spans = [record for record in row["totals"] if record["kind"] == "device" and record["component"] in outer]
+        if not spans:
+            return None
+        families.update("v2" if record["component"] == "eplb_step" else "v1" for record in spans)
         try:
-            probe = local_layers[name].eplb_diagnostic_probe
-            result, reason = calibrate_layer(probe, baseline_counts, candidate_counts, comm_name, repeats)
-            payload, payload_reason = expert_payload_bytes(probe, comm_name)
-        except Exception as error:
-            # A rank-local failure must reach peers before their next collective.
-            reason = f"calibration_failed:{type(error).__name__}"
-        evidence = gather(group, {"result": result, "reason": reason or payload_reason, "bytes": payload})
-        failures = [row["reason"] for row in evidence if row["reason"]]
-        if failures or len({row["bytes"] for row in evidence}) != 1:
-            if group.rank_in_group == 0:
-                _LOGGER.info(
-                    "[EPLB calibration] layer=%s evaluation_window=%s reason=%s "
-                    "conclusion=insufficient_benefit_evidence",
-                    name,
-                    job["window"],
-                    failures or "payload_mismatch",
-                )
-            continue
-        cost = measure_overheads(
-            group,
-            plan.source_placement,
-            plan.candidate_placement,
-            payload,
-            repeats=repeats,
+            if any(not isinstance(record["sum_ms"], Real) for record in spans):
+                return None
+            total = sum(latency_interval(record["sum_ms"])[0] for record in spans)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not math.isfinite(total) or len(families) != 1:
+            return None
+        totals.append(total)
+    # Per-rank total maximum is descriptive only, not a per-step EP critical path.
+    return (min(totals), max(totals))
+
+
+def _validate_arguments(recorder, samples, repeats, max_scratch_bytes):
+    arguments = (samples, repeats, max_scratch_bytes)
+    state = (arguments, recorder.finished, recorder.step)
+    if any(peer != state for peer in gather(recorder.group, state)):
+        raise ValueError("All EP workers must use identical calibration arguments and recorder state")
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in arguments):
+        raise ValueError("Calibration arguments must be integers")
+    if not 1 <= samples <= 32 or not 1 <= repeats <= 20 or max_scratch_bytes < 1:
+        raise ValueError("Calibration needs samples 1..32, repeats 1..20 and a positive scratch cap")
+    return arguments
+
+
+def _measure_job(recorder, name, job, samples, repeats, max_scratch_bytes):
+    key, indices = select_samples(job, samples)
+    if not indices:
+        return None, "no_comparable_real_samples"
+    missing = ("per_layer_exposed_overhead", "live_communication_delta", "graph_and_overlap")
+    if job["initial_placement"] == job["current_placement"]:
+        # Repeating an identical kernel workload measures noise, not a layout
+        # adjustment. The exact placement contribution is zero on every rank.
+        estimate = estimate_adjustment_benefit(previous_step_ms=[0], current_step_ms=[0], missing=missing)
+        return {"estimate": estimate, "key": key, "indices": indices, "unchanged": True}, None
+    rank = recorder.group.rank_in_group
+    result, reason = None, None
+    try:
+        previous, current = job["initial_placement"][rank], job["current_placement"][rank]
+        previous_counts = [[job["loads"][step][expert] for expert in previous] for step in indices]
+        current_counts = [[job["loads"][step][expert] for expert in current] for step in indices]
+        probe = dict(recorder.layers)[name].eplb_diagnostic_probe
+        result, reason = calibrate_layer(
+            probe,
+            previous_counts,
+            current_counts,
+            _COMM_NAMES[key[0]],
+            repeats,
             max_scratch_bytes=max_scratch_bytes,
         )
-        costs = gather(group, cost)
-        if any(row["reason"] for row in costs):
-            if group.rank_in_group == 0:
-                _LOGGER.info(
-                    "[EPLB calibration] layer=%s evaluation_window=%s reason=%s "
-                    "conclusion=insufficient_benefit_evidence",
-                    name,
-                    job["window"],
-                    [row["reason"] for row in costs],
-                )
-            continue
-        try:
-            baseline, candidate, saving, overhead, budget = calibrated_budget(
-                [row["result"] for row in evidence], costs, plan.planner_ms, update_interval
-            )
-        except (ValueError, TypeError, KeyError, IndexError):
-            if group.rank_in_group == 0:
-                _LOGGER.info("[EPLB calibration] layer=%s reason=invalid_measurement_evidence", name)
+    except Exception as error:
+        _LOGGER.warning("EPLB adjustment calibration failed on rank %s: %s", rank, error)
+        reason = f"calibration_failed:{type(error).__name__}"
+    evidence = gather(recorder.group, {"result": result, "reason": reason})
+    failures = [row["reason"] or "missing_result" for row in evidence if row["reason"] or row["result"] is None]
+    if failures:
+        return None, failures
+    results = [row["result"] for row in evidence]
+    try:
+        estimate = estimate_adjustment_benefit(
+            previous_step_ms=critical_path_samples(results, "baseline"),
+            current_step_ms=critical_path_samples(results, "candidate"),
+            # Actual update costs belong to the entire model/run. Never charge
+            # them once per sampled layer or add incomparable layer timings.
+            missing=missing,
+        )
+    except (ValueError, KeyError, TypeError):
+        return None, "invalid_timing_evidence"
+    return {"estimate": estimate, "key": key, "indices": indices}, None
+
+
+def calibrate(recorder, *, samples=4, repeats=3, max_scratch_bytes=134217728):
+    """Both placements use ON kernels. The live EPLB service must be quiescent."""
+    arguments = _validate_arguments(recorder, samples, repeats, max_scratch_bytes)
+    recorder.finish()
+    previous = getattr(recorder, "calibration_arguments", None)
+    success = getattr(recorder, "calibrated", False)
+    statuses = gather(recorder.group, (previous, success))
+    if all(status == (arguments, True) for status in statuses):
+        if recorder.group.rank_in_group == 0:
+            _LOGGER.info("[EPLB benefit summary] reason=already_calibrated")
+        return
+    jobs = gather(recorder.group, recorder.jobs if recorder.group.rank_in_group == 0 else None)[0]
+    inventories = gather(recorder.group, [name for name, _ in recorder.layers])
+    available = set(jobs).union(*(set(names) for names in inventories))
+    completed = 0
+    counts = dict.fromkeys(("positive", "nonpositive", "uncertain", "no_adjustment"), 0)
+    if recorder.group.rank_in_group == 0:
+        for name in sorted(available - jobs.keys()):
+            _LOGGER.info("[EPLB benefit] stage=%s layer=%s reason=no_comparable_window", recorder.stage, name)
+    for name, job in sorted(jobs.items()):
+        result, reason = _measure_job(recorder, name, job, samples, repeats, max_scratch_bytes)
+        if reason:
+            if recorder.group.rank_in_group == 0:
+                _LOGGER.info("[EPLB benefit] stage=%s layer=%s reason=%s", recorder.stage, name, reason)
             continue
         completed += 1
-        budget_status = "positive" if budget[0] > 0 else "nonpositive" if budget[1] <= 0 else "uncertain"
-        budget_counts[budget_status] += 1
-        if group.rank_in_group == 0:
+        saving = result["estimate"]["adjustment_saving_ms"]
+        unchanged = result.get("unchanged", False)
+        if unchanged:
+            status = "no_adjustment"
+        else:
+            status = "positive" if saving[0] > 0 else "nonpositive" if saving[1] <= 0 else "uncertain"
+        counts[status] += 1
+        if recorder.group.rank_in_group == 0:
+            key = result["key"]
             _LOGGER.info(
-                "[EPLB calibration] stage=%s layer=%s source_window=%s evaluation_window=%s sampled_steps=%s "
-                "phase=%s observed_graph=%s calibration_execution=eager comm=%s "
-                "baseline_mlp_ms=%s candidate_mlp_ms=%s compute_saving_ms=%s "
-                "collection_per_update_ms=%s transfer_per_update_ms=%s apply_per_update_ms=%s "
-                "serial_scratch_cost_per_step_ms=%s compute_budget_after_proxy_cost_ms=%s compute_budget_status=%s "
-                "production_update_interval=%s planner_ms=%.3f moved_experts=%s logical_bytes_per_expert=%s "
-                "conclusion=insufficient_benefit_evidence net_saving_ms=unknown "
-                "missing=communication_delta,on_kernel_delta,graph_delta,overlap,production_collection "
-                "scope=sampled_isolated_mlp_and_serial_scratch ranges=observed_min_max",
-                recorder.summary.stage,
+                "[EPLB benefit] stage=%s layer=%s generation=%s window_end_step=%s reference=initial_live_placement "
+                "sampled_steps=%s phase=%s observed_graph=%s comm=%s calibration_execution=%s "
+                "adjustment_saving_ms=%s adjustment_status=%s eplb_overhead_ms=shared_run_cost "
+                "estimated_net_saving_ms=unknown missing=%s "
+                "scope=same_workload_isolated_eplb_on_mlp ranges=%s",
+                recorder.stage,
                 name,
-                plan.source_window,
-                job["window"],
-                indices,
+                job["generation"],
+                job["window_end_step"],
+                result["indices"],
                 key[1],
                 key[2],
-                comm_name,
-                baseline,
-                candidate,
+                _COMM_NAMES[key[0]],
+                "not_required" if unchanged else "eager",
                 saving,
-                maximum_interval([row["collection_ms"] for row in costs]),
-                maximum_interval([row["transfer_ms"] for row in costs]),
-                maximum_interval([row["apply_ms"] for row in costs]),
-                overhead,
-                budget,
-                budget_status,
-                update_interval,
-                plan.planner_ms,
-                plan.moved_experts,
-                payload,
+                status,
+                result["estimate"]["missing"],
+                "exact_zero" if unchanged else "observed_min_max",
             )
-    # Incomplete attempts remain retryable. A successful result is idempotent
-    # only for the same settings; a larger scratch cap can recover failed runs.
-    recorder.calibrated = completed > 0 and completed == len(jobs)
     recorder.calibration_arguments = arguments
-    if group.rank_in_group == 0:
+    recorder.calibrated = completed > 0 and completed == len(available)
+    if recorder.group.rank_in_group == 0:
         _LOGGER.info(
-            "[EPLB calibration summary] stage=%s calibrated_layers=%s available_layers=%s "
-            "uncalibrated_layers=%s compute_budget_layer_counts=%s "
-            "conclusion=insufficient_benefit_evidence speedup=not_estimated "
-            "reason=isolated_measurements_do_not_cover_live_critical_path",
-            recorder.summary.stage,
+            "[EPLB benefit summary] stage=%s calibrated_layers=%s available_layers=%s comparable_layers=%s "
+            "adjustment_layer_counts=%s "
+            "covered_update_span_total_ms=%s observed_real_steps=%s eplb_overhead_ms=unknown "
+            "estimated_net_saving_ms=unknown missing=fused_route_collection,exposed_overhead,aligned_model_gain "
+            "scope=per_layer_estimate_and_actual_update_spans",
+            recorder.stage,
             completed,
+            len(available),
             len(jobs),
-            len(jobs) - completed,
-            budget_counts,
+            counts,
+            observed_overhead(recorder.costs),
+            recorder.observed_steps,
         )

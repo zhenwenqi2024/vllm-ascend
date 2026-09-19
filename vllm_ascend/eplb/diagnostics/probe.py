@@ -9,6 +9,10 @@ class ExpertLoadProbe(torch.nn.Module):
     def __init__(self, num_experts: int, device: torch.device | str):
         super().__init__()
         self.num_experts = num_experts
+        self.eplb_enabled = False
+        self.generation = 0
+        self.register_buffer("logical_to_physical", None, persistent=False)
+        self.register_buffer("owner_totals", None, persistent=False)
         self.calibration_templates = {}
         self.register_buffer("history", None, persistent=False)
         self.register_buffer("history_slot", None, persistent=False)
@@ -41,9 +45,23 @@ class ExpertLoadProbe(torch.nn.Module):
         if valid_mask is not None:
             active = active & valid_mask[:, None]
         valid = (physical_ids >= 0) & (physical_ids < self.num_experts)
+        logical_ids = physical_ids.clamp(0, self.num_experts - 1).to(torch.int64)
+        if self.logical_to_physical is not None:
+            # Zero redundancy: the live permutation changes in place, including
+            # between graph replays. Keep counters in logical expert space.
+            inverse = torch.argsort(self.logical_to_physical)
+            logical_ids = inverse[logical_ids]
+        if self.owner_totals is not None:
+            slots = self.num_experts // self.owner_totals.shape[0]
+            owners = physical_ids.clamp(0, self.num_experts - 1).to(torch.int64) // slots
+            self.owner_totals.view(-1).scatter_add_(
+                0,
+                (owners * self.num_experts + logical_ids).reshape(-1),
+                (active & valid).reshape(-1).to(torch.int64),
+            )
         counts[: self.num_experts].scatter_add_(
             0,
-            physical_ids.clamp(0, self.num_experts - 1).reshape(-1).to(torch.int64),
+            logical_ids.reshape(-1),
             (active & valid).reshape(-1).to(torch.int64),
         )
         counts[-2].add_(1)

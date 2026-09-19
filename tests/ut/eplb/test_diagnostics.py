@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Portable diagnostics checks: pytest --noconftest tests/ut/eplb/test_diagnostics.py."""
+"""Portable checks for live EPLB placement generations and valid source work."""
 
 import importlib
-import io
 import logging
 import sys
 from copy import deepcopy
@@ -34,485 +33,271 @@ def api():
                 del sys.modules[name]
 
 
-@pytest.fixture(autouse=True)
-def capture_worker_logs(api, monkeypatch):
-    # vLLM installs a non-propagating handler when available. Let pytest's
-    # root capture handler also receive these records for output assertions.
-    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
-
-
-def rows(two_layers=False):
-    # Two layers on noncontiguous ranks. EP owners deliberately differ from
-    # expert-ID modulo rank count. Each rank supplies four top-1 assignments.
+def rows():
     return [
         {
             "rank": rank,
             "tp_ranks": [rank],
-            "tokens": 4,
-            "step": 8,
-            "phases": [("decode", "FULL")],
-            "layers": [
-                {
-                    "name": name,
+            "step": 2,
+            "token_steps": [4, 2],
+            "metadata": [{"phase": "decode", "graph_mode": "FULL"}] * 2,
+            "layers": {
+                "layer": {
+                    "initial": [0, 1, 2, 3],
+                    "current": [0, 2, 1, 3],
+                    "generation_start": 1,
+                    "generation_end": 1,
                     "top_k": 1,
-                    "local_experts": 2,
-                    "mapping": [0, 1, -1, -1] if i == 0 else [-1, -1, 0, 1],
-                    "counts": [3, 1, 0, 0, 8, 0],
+                    "history": [[3, 1, 0, 0, 1, 0], [0, 2, 0, 0, 1, 0]],
+                    "comm_codes": [1, 1],
                 }
-                for name in (("layer.0", "layer.1") if two_layers else ("layer.0",))
-            ],
+            },
         }
-        for i, rank in enumerate((2, 5))
+        for rank in (2, 5)
     ]
 
 
-def test_layer_work_and_real_owners(api):
-    result, reason = api.runtime.layer_work(rows(), 8)
+def test_actual_layouts_use_same_logical_work(api):
+    job, reason = api.runtime.validate_window(rows(), "layer", 2)
     assert reason is None
-    assert result["total"] == 8
-    assert result["rank_work"] == [8, 0]
-    assert result["skew"] == 2
-    assert result["hot"] == {("layer.0", 0): 6}
-
-
-def test_window_reports_prefill_and_decode_coverage(api, caplog):
-    caplog.set_level(logging.INFO)
-    data = rows()
-    data[0]["phases"].append(("prefill", "NONE"))
-    api.runtime.WorkloadLogger([2, 5], 0).log(data, 1, 8)
-    assert "phases=['decode', 'prefill']" in caplog.text
-
-
-def test_diagnostics_use_worker_logging_namespace(api, monkeypatch, caplog):
-    # Spawned workers may configure only vLLM; the root remains at WARNING.
-    output = io.StringIO()
-    parent = logging.getLogger("vllm")
-    monkeypatch.setattr(parent, "handlers", [logging.StreamHandler(output)])
-    monkeypatch.setattr(parent, "propagate", False)
-    with (
-        caplog.at_level(logging.WARNING),
-        caplog.at_level(logging.INFO, logger="vllm"),
-        caplog.at_level(logging.WARNING, logger="vllm_ascend"),
-    ):
-        api.runtime.WorkloadLogger([2, 5], 0).log(rows(), 1, 8)
-    text = output.getvalue()
-    assert "[EPLB experts]" in text
-    assert "[EPLB diagnostic]" in text
-    assert "[EPLB summary]" in text
-
-
-def test_routes_without_comm_mask_and_empty_replica(api):
-    probe = api.probe.ExpertLoadProbe(2, "cpu")
-    probe.source_positions = torch.arange(4)
-    probe.source_token_count = torch.tensor(3)
-    ids = torch.tensor([[0], [1], [0], [1]])
-    probe.record_routes(ids, source_offset=2)
-    probe.record_routes(ids[:0])
-    probe.source_token_count.zero_()
-    probe.record_routes(ids)
-    assert probe.totals.tolist() == [1, 0, 3, 0]
+    assert job["initial_placement"] == ((0, 1), (2, 3))
+    assert job["current_placement"] == ((0, 2), (1, 3))
+    assert job["loads"] == [[6, 2, 0, 0], [0, 4, 0, 0]]
 
 
 @pytest.mark.parametrize(
-    "problem,reason",
+    "case,reason",
     [
-        ("step", "unaligned_windows"),
-        ("layer", "incomplete_layer_set"),
-        ("rank", "duplicate_rank"),
-        ("tp", "source_tp_mismatch"),
-        ("counts", "unsupported_routing_or_call_count"),
-        ("invalid_id", "unsupported_routing_or_call_count"),
+        ("commit", "placement_changed_during_window"),
+        ("generation", "unaligned_placement_generations"),
+        ("mapping", "placement_mismatch"),
+        ("replica", "unsupported_placement"),
+        ("calls", "invalid_route_history"),
+        ("invalid_id", "invalid_route_history"),
+        ("negative", "invalid_route_history"),
         ("tokens", "source_conservation_failure"),
-        ("mapping", "invalid_expert_mapping"),
-        ("owner", "duplicate_expert_owner"),
-        ("top_k", "expert_space_mismatch"),
+        ("missing_source", "source_tp_mismatch"),
+        ("step", "unaligned_ranks"),
+        ("missing_layer", "missing_layer"),
     ],
 )
-def test_incomplete_data_never_becomes_balance(api, problem, reason):
+def test_incomparable_or_invalid_work_never_becomes_benefit(api, case, reason):
     data = rows()
-    row, layer = data[1], data[1]["layers"][0]
-    if problem == "step":
-        row["step"] += 1
-    elif problem == "layer":
-        row["layers"].pop()
-    elif problem == "rank":
-        row["rank"] = 2
-    elif problem == "tp":
-        row["tp_ranks"] = [2, 5]
-    elif problem == "counts":
-        layer["counts"][-2] -= 1
-    elif problem == "invalid_id":
-        layer["counts"][-1] = 1
-    elif problem == "tokens":
-        row["tokens"] += 1
-    elif problem == "mapping":
-        layer["mapping"] = [-1, -1, 0, 0]
-    elif problem == "owner":
-        layer["mapping"] = [0, 1, -1, -1]
-    else:
-        layer["top_k"] = 2
-    assert api.runtime.layer_work(data, 8) == (None, reason)
+    layer = data[0]["layers"]["layer"]
+    if case == "commit":
+        layer["generation_end"] = 2
+    elif case == "generation":
+        layer["generation_start"] = layer["generation_end"] = 2
+    elif case == "mapping":
+        layer["current"] = [0, 1, 2, 3]
+    elif case == "replica":
+        for row in data:
+            row["layers"]["layer"]["current"] = [0, 0, 2, 3]
+    elif case == "calls":
+        layer["history"][0][-2] = 2
+    elif case == "invalid_id":
+        layer["history"][0][-1] = 1
+    elif case == "negative":
+        layer["history"][0][0] = -1
+    elif case == "tokens":
+        data[0]["token_steps"][0] = 3
+    elif case == "missing_source":
+        data[0]["tp_ranks"] = [2, 7]
+    elif case == "step":
+        data[0]["step"] = 3
+    elif case == "missing_layer":
+        data[0]["layers"] = {}
+    assert api.runtime.validate_window(data, "layer", 2) == (None, reason)
 
 
-def test_tp_shards_and_idle_dp_sources(api):
+def test_idle_source_participates_without_fake_routes(api):
     data = rows()
-    for row in data:
-        row["tp_ranks"] = [2, 5]
-        row["tokens"] = 8
-    assert api.runtime.layer_work(data, 8)[0]["total"] == 8
-    data = rows()
-    data[1]["tokens"] = 0
-    for layer in data[1]["layers"]:
-        layer["counts"][:4] = [0] * 4
-    assert api.runtime.layer_work(data, 8)[0]["rank_work"] == [4, 0]
-    for row in data:
-        row["tokens"] = 0
-        for layer in row["layers"]:
-            layer["counts"][:4] = [0] * 4
-    assert api.runtime.layer_work(data, 8) == (None, "no_real_work")
+    data[1]["token_steps"] = [0, 0]
+    data[1]["layers"]["layer"]["history"] = [[0, 0, 0, 0, 1, 0]] * 2
+    assert api.runtime.validate_window(data, "layer", 2)[0]["loads"][0] == [3, 1, 0, 0]
 
 
-def diagnostics(caplog):
-    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("[EPLB diagnostic]")]
-
-
-def test_rank_expert_totals_and_layer_persistence(api, caplog):
-    caplog.set_level(logging.INFO)
-    summary = api.runtime.WorkloadLogger([2, 5], 1)
-    summary.log(rows(), 1, 8)
-    summary.log(rows(), 2, 8)
-    assert len(diagnostics(caplog)) == 2
-    assert "valid_assignments=8 rank_work=[8, 0]" in caplog.text
-    assert "persistent_hot_experts=['0(2/2)']" in caplog.text
-    assert "cumulative_work=16 expert_work=['0:12', '1:4']" in caplog.text
-    assert "expert_work=['2:0', '3:0']" in caplog.text
-    assert "conclusion=insufficient_benefit_evidence" in caplog.text
-    data = rows()
-    data[1]["step"] = 9
-    summary.log(data, 3, 8)
-    layer = summary.layers["layer.0"]
-    assert layer.invalid_windows == 1 and not layer.streaks
-    assert layer.valid_windows == 2
-    assert layer.hint == "insufficient_evidence"
-    summary.log(rows(), 4, 8)
-    assert layer.valid_windows == 3
-    data = rows()
-    data[0]["phases"] = [("prefill", "NONE")]
-    summary.log(data, 5, 8)
-    assert layer.streaks[("layer.0", 0)] == 1
-
-
-def test_cumulative_rank_skew_uses_work_and_includes_partial_windows(api, caplog):
-    caplog.set_level(logging.INFO)
-    summary = api.runtime.WorkloadLogger([2, 5], 0)
-    summary.log(rows(), 1, 8)
-    assert "cumulative_rank_max_mean=2.000 busiest_rank=2" in diagnostics(caplog)[-1]
-    data = rows()
-    for row in data:
-        row["tokens"] = 12
-        row["layers"][0]["counts"][:4] = [0, 0, 9, 3]
-    summary.log(data, 2, 8)
-    assert "window_rank_max_mean=2.000 cumulative_rank_max_mean=1.500 busiest_rank=5" in diagnostics(caplog)[-1]
-    # Invalid work must not enter the cumulative denominator or change the peak.
-    data[0]["tokens"] += 1
-    summary.log(data, 3, 8)
-    assert "cumulative_rank_max_mean" not in diagnostics(caplog)[-1]
-    assert [sum(c.values()) for c in summary.layers["layer.0"].expert_totals] == [8, 24]
-    # The tail balances cumulative work. Ties use the first global rank in ranks.
-    for row in data:
-        row["tokens"] = 8
-        row["layers"][0]["counts"] = [6, 2, 0, 0, 1, 0]
-    summary.log(data, 4, 1, complete=False)
-    assert "window_rank_max_mean=2.000 cumulative_rank_max_mean=1.000 busiest_rank=2" in diagnostics(caplog)[-1]
-    assert summary.layers["layer.0"].valid_windows == 2
-
-
-def test_opposite_layer_skew_does_not_cancel(api, caplog):
-    caplog.set_level(logging.INFO)
-    data = rows(two_layers=True)
-    for row in data:
-        row["layers"][1]["counts"][:4] = [0, 0, 3, 1]
-    summary = api.runtime.WorkloadLogger([2, 5], 0)
-    summary.log(data, 1, 8)
-    caplog.clear()
-    summary.log(data, 2, 8)
-    first, second = diagnostics(caplog)
-    assert "layer=layer.0" in first and "rank_work=[8, 0]" in first
-    assert "layer=layer.1" in second and "rank_work=[0, 8]" in second
-    assert "cumulative_rank_max_mean=2.000 busiest_rank=2" in first
-    assert "cumulative_rank_max_mean=2.000 busiest_rank=5" in second
-    assert all("hint=persistent_load_skew" in line for line in (first, second))
-    assert "skewed_layers=['layer.0', 'layer.1']" in caplog.text
-    data[1]["layers"][1]["counts"][-1] = 1
-    caplog.clear()
-    summary.log(data, 3, 8)
-    assert "insufficient_evidence=" in diagnostics(caplog)[1]
-    assert summary.layers["layer.0"].valid_windows == 3
-    assert summary.layers["layer.1"].valid_windows == 2
-    assert summary.layers["layer.1"].invalid_windows == 1
-
-
-def test_layer_hotspot_histories_are_independent(api, caplog):
-    caplog.set_level(logging.INFO)
-    summary = api.runtime.WorkloadLogger([2, 5], 0)
-    data = rows(two_layers=True)
-    summary.log(data, 1, 8)
-    for row in data:
-        row["layers"][1]["counts"][:4] = [1, 3, 0, 0]
-    caplog.clear()
-    summary.log(data, 2, 8)
-    assert "hint=persistent_load_skew" in diagnostics(caplog)[0]
-    assert "hint=insufficient_hotspot_evidence" in diagnostics(caplog)[1]
-
-
-def test_run_history_is_cumulative_not_last_four_windows(api, caplog):
-    caplog.set_level(logging.INFO)
-    summary = api.runtime.WorkloadLogger([2, 5], 0)
-    summary.log(rows(), 1, 8)
-    data = rows()
-    for row in data:
-        data_layer = row["layers"][0]
-        data_layer["counts"][:4] = [1, 3, 0, 0]
-    summary.log(data, 2, 8)
-    assert "hint=insufficient_hotspot_evidence" in caplog.text
-    for window in range(3, 9):
-        summary.log(data, window, 8)
-    layer = summary.layers["layer.0"]
-    assert layer.valid_windows == 8
-    assert layer.hot_windows[("layer.0", 1)] == 7
-    assert sum(sum(counts.values()) for counts in layer.expert_totals) == 64
-
-
-def test_partial_window_counts_work_but_not_persistence(api, caplog):
-    caplog.set_level(logging.INFO)
-    summary = api.runtime.WorkloadLogger([2, 5], 0)
-    summary.log(rows(), 1, 8)
-    data = rows()
-    for row in data:
-        row["layers"][0]["counts"][-2] = 1
-    summary.log(data, 2, 1, complete=False)
-    layer = summary.layers["layer.0"]
-    assert layer.valid_windows == 1 and layer.observed_calls == 9
-    assert not layer.persistent
-    assert sum(sum(counts.values()) for counts in layer.expert_totals) == 16
-    summary.summarize(2, final=True)
-    assert "final=True" in caplog.text
-    assert "conclusion=insufficient_benefit_evidence" in caplog.text
-
-
-def test_probe_padding_source_offset_dummy_and_stable_storage(api):
-    probe = api.probe.ExpertLoadProbe(2, "cpu")
-    probe.source_token_count = torch.tensor(3)
-    probe.source_positions = torch.arange(4)
-    ptr = probe.totals.data_ptr()
-    ids = torch.tensor([[0], [1], [99], [1]])
-    probe.record_routes(ids, torch.tensor([True, False, True, True]), source_offset=2)
-    assert probe.totals.tolist() == [1, 0, 1, 0]
-    probe.source_token_count.fill_(0)
-    probe.record_routes(ids, torch.ones(4, dtype=torch.bool))
-    assert probe.totals.tolist() == [1, 0, 2, 0]
-    probe.source_token_count.fill_(4)
-    probe.record_routes(ids, torch.ones(4, dtype=torch.bool))
-    assert probe.totals.tolist() == [2, 2, 3, 1]
-    assert probe.totals.data_ptr() == ptr
-
-
-def test_window_collection_limits_and_dummy(api, monkeypatch, caplog):
-    caplog.set_level(logging.INFO)
-    config = api.config.EplbDiagnosticsConfig(mode="observe", warmup_steps=1, window_size=2, max_windows=1)
-    probe = api.probe.ExpertLoadProbe(2, "cpu")
-    source = torch.tensor(0)
-    probe.source_token_count, probe.source_positions = source, torch.arange(1)
-    layer = SimpleNamespace(
-        eplb_diagnostic_probe=probe,
-        ascend_expert_map=torch.tensor([0, 1]),
-        moe_config=SimpleNamespace(experts_per_token=1),
-        local_num_experts=2,
-    )
-    group = SimpleNamespace(ranks=[0], rank_in_group=0, cpu_group=None)
-    calls = []
-
-    def gather(output, row, group):
-        calls.append(deepcopy(row))
-        output[0] = row
-
-    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
-    recorder = api.runtime.DiagnosticsRecorder(config, [("layer", layer)], group, [0], 0, source)
-    for tokens, dummy in ((1, False), (1, False), (99, True), (1, False)):
-        recorder.begin(tokens, dummy)
-        probe.record_routes(torch.tensor([[0]]), torch.tensor([True]))
-        recorder.end()
-    assert len(calls) == 1
-    assert calls[0]["tokens"] == 1
-    assert calls[0]["layers"][0]["counts"] == [1, 0, 2, 0]
-    assert "valid_assignments=1" in caplog.text
-    assert source.item() == 0
-
-
-@pytest.mark.parametrize("steps", [1, 3, 6])
-def test_finish_collects_tail_once_and_stops(api, monkeypatch, caplog, steps):
-    caplog.set_level(logging.INFO)
-    config = api.config.EplbDiagnosticsConfig(mode="observe", warmup_steps=0, window_size=2, max_windows=0)
-    probe = api.probe.ExpertLoadProbe(2, "cpu")
-    source = torch.tensor(0)
-    probe.source_token_count, probe.source_positions = source, torch.arange(1)
-    layer = SimpleNamespace(
-        eplb_diagnostic_probe=probe,
-        ascend_expert_map=torch.tensor([0, 1]),
-        moe_config=SimpleNamespace(experts_per_token=1),
-        local_num_experts=2,
-    )
-    group = SimpleNamespace(ranks=[0], rank_in_group=0, cpu_group=None)
-    monkeypatch.setattr(torch.distributed, "all_gather_object", lambda out, row, group: out.__setitem__(0, row))
-    recorder = api.runtime.DiagnosticsRecorder(config, [("layer", layer)], group, [0], 0, source)
-    for _ in range(steps):
-        recorder.begin(1)
-        probe.record_routes(torch.tensor([[0]]), torch.tensor([True]))
-        recorder.end()
-    recorder.finish()
-    recorder.finish()
-    summary = recorder.summary.layers["layer"]
-    assert summary.observed_calls == steps
-    assert summary.valid_windows == steps // 2
-    assert summary.expert_totals[0][0] == steps
-    assert caplog.text.count("final=True") == 1
-    recorder.begin(1)
-    assert not recorder.collecting and source.item() == 0
-
-
-def test_wrapper_nested_dummy_and_failure(api, monkeypatch):
-    monkeypatch.setattr(torch, "npu", SimpleNamespace(is_current_stream_capturing=lambda: False), raising=False)
-    calls = []
-    recorder = SimpleNamespace(begin=lambda *x: calls.append(x), end=lambda: calls.append("end"))
-    runner = SimpleNamespace(_eplb_diagnostics_recorder=recorder)
-    scheduler = SimpleNamespace(total_num_scheduled_tokens=0)
-
-    @api.runtime.record_diagnostics
-    def execute(runner, scheduler, dummy_run=False, nested=False):
-        if not nested:
-            return execute(runner, scheduler, dummy_run=True, nested=True)
-        return 42
-
-    assert execute(runner, scheduler, dummy_run=True) == 42
-    assert calls == [(0, True), "end"]
-    calls.clear()
-    assert execute(runner, scheduler) == 42
-    assert calls == [(0, True), "end"]  # Only the actual nested dummy executes.
-
-    @api.runtime.record_diagnostics
-    def fail(*args, **kwargs):
-        raise RuntimeError("inference failed")
-
-    with pytest.raises(RuntimeError, match="inference failed"):
-        fail(runner, scheduler, dummy_run=True)
-    assert runner._eplb_diagnostics_in_execution is False
-
-
-@pytest.mark.parametrize("field", ["window_size", "warmup_steps", "max_windows"])
-def test_config_bounds(api, field):
+def test_off_observation_mode_removed(api):
     with pytest.raises(ValueError):
-        api.config.EplbDiagnosticsConfig(**{field: -1})
+        api.config.EplbDiagnosticsConfig(mode="observe")
+    assert api.config.EplbDiagnosticsConfig(mode="benefit").mode == "benefit"
 
 
-def history_rows(per_source_steps):
-    data = rows()
-    for row, steps in zip(data, per_source_steps):
-        row["token_steps"] = [sum(step) for step in steps]
-        row["tokens"] = sum(row["token_steps"])
-        row["step_metadata"] = [dict(phase="decode", graph_mode="FULL", padded_tokens=8) for _ in steps]
-        layer = row["layers"][0]
-        layer["history"] = [step + [1, 0] for step in steps]
-        layer["counts"] = list(map(sum, zip(*layer["history"])))
-        layer["comm_codes"] = [1] * len(steps)
-    return data
-
-
-def test_projection_uses_step_peaks_and_retains_complete_calibration_job(api, caplog):
-    caplog.set_level(logging.INFO)
-    summary = api.runtime.WorkloadLogger([2, 5], 0)
-    training = history_rows([[[4, 4, 0, 0]] * 2] * 2)
-    summary.log(training, 1, 2)
-    assert summary.layers["layer.0"].calibration_job is None
-    evaluation = history_rows([[[4, 0, 0, 0], [0, 4, 0, 0]]] * 2)
-    summary.log(evaluation, 2, 2)
-    layer = summary.layers["layer.0"]
-    assert layer.projection["candidate_rank_work"] == [8, 8]
-    assert layer.projection["step_peak_work"] == 16
-    assert layer.projection["candidate_step_peak_work"] == 16
-    assert layer.projection["step_peak_reduction"] == 0
-    assert layer.calibration_job["plan"].source_window == 1
-    assert layer.calibration_job["window"] == 2
-    tail = history_rows([[[1, 0, 0, 0]]] * 2)
-    summary.log(tail, 3, 1, complete=False)
-    assert layer.pending_plan is None
-    assert layer.calibration_job["window"] == 2
-    assert "conclusion=insufficient_benefit_evidence" in caplog.text
-    assert "consider_eplb" not in caplog.text
-
-
-def test_projection_rejects_shifted_source_steps_even_when_window_sums_match(api, caplog):
-    caplog.set_level(logging.INFO)
-    summary = api.runtime.WorkloadLogger([2, 5], 0)
-    data = history_rows([[[3, 1, 0, 0], [6, 2, 0, 0]]] * 2)
-    summary.log(data, 1, 2)
-    data[0]["layers"][0]["history"].reverse()
-    summary.log(data, 2, 2)
-    assert summary.layers["layer.0"].calibration_job is None
-    assert "per_step_source_conservation_failure" in caplog.text
-
-
-def test_history_device_slot_tracks_padding_dummy_and_communication(api):
-    probe = api.probe.ExpertLoadProbe(2, "cpu")
+def test_live_mapping_changes_keep_logical_expert_counters(api):
+    probe = api.probe.ExpertLoadProbe(4, "cpu")
+    probe.source_token_count = torch.tensor(2)
     probe.source_positions = torch.arange(3)
-    probe.source_token_count = torch.tensor(0)
-    probe.history = torch.zeros((3, 4), dtype=torch.int64)
-    probe.history_slot = torch.zeros(1, dtype=torch.int64)
-    probe.comm_history = torch.zeros(3, dtype=torch.int64)
-    pointers = probe.totals.data_ptr(), probe.history.data_ptr(), probe.history_slot.data_ptr()
+    probe.logical_to_physical = torch.arange(4)
+    probe.owner_totals = torch.zeros((2, 4), dtype=torch.int64)
     ids = torch.tensor([[0], [1], [99]])
-    for step, tokens in enumerate((1, 0, 2)):
-        probe.history_slot.fill_(step)
-        probe.source_token_count.fill_(tokens)
-        probe.record_routes(ids)
-        probe.record_comm(step + 1)
-    assert probe.history.tolist() == [[1, 0, 1, 0], [0, 0, 1, 0], [1, 1, 1, 0]]
-    assert probe.totals.tolist() == [2, 1, 3, 0]
-    assert probe.comm_history.tolist() == [1, 2, 3]
-    assert pointers == (probe.totals.data_ptr(), probe.history.data_ptr(), probe.history_slot.data_ptr())
+    probe.record_routes(ids)
+    probe.logical_to_physical.copy_(torch.tensor([2, 0, 1, 3]))
+    ids[:2] = torch.tensor([[2], [0]])
+    probe.record_routes(ids)
+    probe.source_token_count.zero_()
+    probe.record_routes(ids)
+    assert probe.totals.tolist() == [2, 2, 0, 0, 3, 0]
+    assert probe.owner_totals.tolist() == [[1, 2, 0, 0], [1, 0, 0, 0]]
 
 
-def test_history_recorder_resets_windows_and_finishes_partial(api, monkeypatch):
-    config = api.config.EplbDiagnosticsConfig(mode="observe", warmup_steps=0, window_size=2)
+def make_recorder(api, monkeypatch, *, warmup=0, limit=0):
     probe = api.probe.ExpertLoadProbe(2, "cpu")
-    probe.source_token_count, probe.source_positions = torch.tensor(0), torch.arange(2)
-    probe.history, probe.history_slot = torch.zeros((2, 4), dtype=torch.int64), torch.zeros(1, dtype=torch.int64)
+    source = torch.tensor(0)
+    probe.source_token_count, probe.source_positions = source, torch.arange(3)
+    probe.logical_to_physical = torch.arange(2)
+    probe.owner_totals = torch.zeros((1, 2), dtype=torch.int64)
+    probe.history = torch.zeros((2, 4), dtype=torch.int64)
+    probe.history_slot = torch.zeros(1, dtype=torch.int64)
     probe.comm_history = torch.zeros(2, dtype=torch.int64)
     layer = SimpleNamespace(
+        log2phy=probe.logical_to_physical,
         eplb_diagnostic_probe=probe,
-        ascend_expert_map=torch.tensor([0, 1]),
         moe_config=SimpleNamespace(experts_per_token=1),
-        local_num_experts=2,
     )
     group = SimpleNamespace(ranks=[0], rank_in_group=0, cpu_group=None)
-    snapshots = []
+    monkeypatch.setattr(api.runtime, "gather", lambda group, row: [deepcopy(row)])
+    config = api.config.EplbDiagnosticsConfig(mode="benefit", window_size=2, warmup_steps=warmup, max_windows=limit)
+    recorder = api.runtime.DiagnosticsRecorder(config, [("layer", layer)], group, [0], 0, source)
+    return recorder, probe, layer
 
-    def gather(out, row, group):
-        snapshots.append(deepcopy(row))
-        out[0] = row
 
-    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
-    recorder = api.runtime.DiagnosticsRecorder(config, [("layer", layer)], group, [0], 0, probe.source_token_count)
-    for tokens, dummy in ((2, False), (99, True), (1, False)):
-        recorder.begin(tokens, dummy)
-        probe.record_routes(torch.tensor([[0], [1]]))
-        probe.record_comm(1)
-        recorder.end()
+def run_step(recorder, probe, tokens=2, dummy=False):
+    recorder.begin(tokens, dummy)
+    probe.record_routes(torch.tensor([[0], [1], [99]]))
+    probe.record_comm(1)
+    if recorder.collecting and recorder.real:
+        recorder.metadata[-1] = {"phase": "decode", "graph_mode": "FULL"}
+    recorder.end()
+
+
+def test_warmup_dummy_cap_and_finalization(api, monkeypatch):
+    recorder, probe, _ = make_recorder(api, monkeypatch, warmup=1, limit=1)
+    run_step(recorder, probe)
+    run_step(recorder, probe)
+    run_step(recorder, probe, dummy=True)
+    run_step(recorder, probe)
     recorder.finish()
+    assert recorder.observed_steps == 1
+    assert recorder.jobs["layer"]["loads"] == [[1, 1], [0, 0]]
+    assert not recorder.monitor.active and probe.source_token_count == 0
+    saved = deepcopy(recorder.jobs)
     recorder.finish()
-    assert len(snapshots) == 2
-    assert snapshots[0]["token_steps"] == [2, 0]
-    assert snapshots[0]["layers"][0]["history"] == [[1, 1, 1, 0], [0, 0, 1, 0]]
-    assert snapshots[1]["token_steps"] == [1]
-    assert snapshots[1]["layers"][0]["history"] == [[1, 0, 1, 0]]
+    assert recorder.jobs == saved
+
+
+def test_cross_commit_invalidates_job_then_new_stable_window_recovers(api, monkeypatch):
+    recorder, probe, layer = make_recorder(api, monkeypatch)
+    run_step(recorder, probe)
+    recorder.committed(layer)
+    probe.logical_to_physical.copy_(torch.tensor([1, 0]))
+    run_step(recorder, probe)
+    assert not recorder.jobs
+    assert recorder.invalid_windows["layer"] == 1
+    assert recorder.logical_totals["layer"] == {0: 2, 1: 2}
+    assert recorder.expert_totals["layer"][0] == {0: 2, 1: 2}
+    run_step(recorder, probe)
+    run_step(recorder, probe)
+    assert recorder.jobs["layer"]["generation"] == 1
+    assert recorder.jobs["layer"]["initial_placement"] == ((0, 1),)
+    assert recorder.jobs["layer"]["current_placement"] == ((1, 0),)
+
+
+def test_partial_window_and_worker_logging(api, monkeypatch, caplog):
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
+    caplog.set_level(logging.INFO, logger="vllm.eplb.diagnostics")
+    recorder, probe, _ = make_recorder(api, monkeypatch)
+    run_step(recorder, probe)
+    recorder.finish()
+    assert recorder.jobs["layer"]["loads"] == [[1, 1]]
+    assert "[EPLB experts]" in caplog.text
+    assert "estimated_net_saving_ms=unknown" in caplog.text
+    assert "[EPLB overhead]" in caplog.text
+
+
+@pytest.mark.parametrize("v2", [False, True])
+def test_enabled_validation_rejects_off_configuration(api, v2):
+    runner = SimpleNamespace(
+        ascend_config=SimpleNamespace(
+            eplb_diagnostics=api.config.EplbDiagnosticsConfig(mode="benefit"),
+            eplb_config=SimpleNamespace(dynamic_eplb=False),
+        ),
+        vllm_config=SimpleNamespace(
+            use_v2_model_runner=v2,
+            parallel_config=SimpleNamespace(enable_eplb=False, enable_expert_parallel=True),
+        ),
+    )
+    with pytest.raises(ValueError, match="EP and EPLB enabled"):
+        api.runtime.initialize_diagnostics(runner)
+
+
+def test_mrv2_router_mapping_and_wrapper_commit_keep_graph_view(api, monkeypatch):
+    recorder, probe, layer = make_recorder(api, monkeypatch)
+    mapping = torch.tensor([[1], [0]])
+    layer._use_v2_model_runner = True
+    layer.router = SimpleNamespace(eplb_state=SimpleNamespace(logical_to_physical_map=mapping))
+    view = api.runtime.logical_to_physical(layer)
+    assert view.tolist() == [1, 0]
+    mapping.copy_(torch.tensor([[0], [1]]))
+    assert view.tolist() == [0, 1]
+    recorder.committed(SimpleNamespace(routed_experts=layer))
+    assert probe.generation == 1
+
+
+def test_owner_count_corruption_rejected_before_accumulation(api, monkeypatch):
+    recorder, probe, _ = make_recorder(api, monkeypatch)
     recorder.begin(2)
-    assert not recorder.collecting and probe.source_token_count.item() == 0
+    probe.record_routes(torch.tensor([[0], [1], [99]]))
+    probe.owner_totals[0, 0] += 1
+    recorder.finish()
+    assert recorder.invalid_windows["layer"] == 1
+    assert not recorder.jobs and not recorder.logical_totals
+
+
+def test_post_forward_step_keeps_one_pending_real_qualification(api, monkeypatch):
+    recorder, probe, _ = make_recorder(api, monkeypatch)
+    run_step(recorder, probe)
+    assert not recorder.monitor.active and recorder.monitor.pending_real
+    recorder.begin(0, dummy=True)
+    assert not recorder.monitor.pending_real
+
+
+@pytest.mark.parametrize("busy_kind", ["forward", "sample", "planner", "transfer", "v1_cycle", "v1_copy"])
+def test_calibration_defers_for_any_rank_with_pending_work(api, monkeypatch, busy_kind):
+    recorder, _, _ = make_recorder(api, monkeypatch)
+    model = SimpleNamespace(rebalanced=False, pending_result=None)
+    runner = SimpleNamespace(
+        _eplb_diagnostics_recorder=recorder,
+        eplb=SimpleNamespace(state=SimpleNamespace(model_states={"model": model})),
+    )
+    if busy_kind == "forward":
+        runner._eplb_diagnostics_in_execution = True
+    elif busy_kind == "sample":
+        recorder.monitor.pending_real = True
+    elif busy_kind == "planner":
+        model.rebalanced = True
+    elif busy_kind == "transfer":
+        model.pending_result = object()
+    else:
+        runner.eplb_updator = SimpleNamespace(
+            cur_iterations=10 if busy_kind == "v1_cycle" else 0,
+            expert_heat_collection_interval=10,
+            eplb_loader=SimpleNamespace(
+                state=SimpleNamespace(name="TRANSFERRING" if busy_kind == "v1_copy" else "WAITING")
+            ),
+        )
+    assert not api.runtime.diagnostics_quiescent(runner, calibration=True)
+    assert not recorder.finished
+
+
+def test_quiescent_check_does_not_treat_old_waited_requests_as_busy(api, monkeypatch):
+    recorder, _, _ = make_recorder(api, monkeypatch)
+    runner = SimpleNamespace(
+        _eplb_diagnostics_recorder=recorder,
+        eplb_updator=SimpleNamespace(
+            reqs=[object()],
+            cur_iterations=0,
+            expert_heat_collection_interval=10,
+            eplb_loader=SimpleNamespace(state=SimpleNamespace(name="WAITING")),
+        ),
+    )
+    assert api.runtime.diagnostics_quiescent(runner, calibration=True)

@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Scratch calibration on two independent EP-like pairs, using four NPUs."""
+"""Tiny real MRv2 state, expert migration, graph counters and ON MLP calibration."""
 
 import io
 import logging
-import math
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -15,149 +14,229 @@ import torch.multiprocessing as mp
 
 pytest.importorskip("torch_npu")
 
-from vllm_ascend.eplb.diagnostics.scratch import measure_overheads
+from vllm.distributed.eplb import eplb_state as upstream_state
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import FusedTopKRouter
 
-_SOURCE = ((0, 1), (2, 3))
-_SCRATCH_LIMIT = 1024 * 1024
-
-
-def _worker(rank, rendezvous):
-    torch.npu.set_device(rank)
-    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=90))
-    try:
-        # Noncontiguous ranks ensure P2P peers are global, not local group IDs.
-        members = ([0, 2], [1, 3])
-        cpu_groups = [dist.new_group(pair, backend="gloo") for pair in members]
-        device_groups = [dist.new_group(pair, backend="hccl") for pair in members]
-        stage, local = rank % 2, rank // 2
-        group = SimpleNamespace(
-            ranks=members[stage],
-            rank_in_group=local,
-            cpu_group=cpu_groups[stage],
-            device_group=device_groups[stage],
-            device=torch.device(f"npu:{rank}"),
-        )
-        candidate = ((0, 2), (1, 3)) if stage == 0 else ((2, 3), (0, 1))
-        result = measure_overheads(group, _SOURCE, candidate, 4096, repeats=2, max_scratch_bytes=_SCRATCH_LIMIT)
-        assert result["reason"] is None, result
-        assert result["moved_experts"] == (2 if stage == 0 else 4)
-        assert result["scratch_bytes"] <= _SCRATCH_LIMIT
-        for field in ("collection_ms", "transfer_ms", "apply_ms"):
-            timing = result[field]
-            assert timing["samples"] == 2
-            assert 0 <= timing["min_ms"] <= timing["median_ms"] <= timing["max_ms"]
-            assert math.isfinite(timing["max_ms"])
-
-        # A refusal on one participant must be observed by its peer before HCCL.
-        result = measure_overheads(
-            group,
-            _SOURCE,
-            candidate,
-            4096,
-            repeats=1,
-            max_scratch_bytes=1 if local == 0 else _SCRATCH_LIMIT,
-        )
-        assert result["reason"] == "scratch_memory_cap_exceeded"
-        result = measure_overheads(
-            group,
-            _SOURCE,
-            candidate if local == 0 else _SOURCE,
-            4096,
-            repeats=1,
-            max_scratch_bytes=_SCRATCH_LIMIT,
-        )
-        assert result["reason"] == "inconsistent_calibration_parameters"
-        # Both groups can still enter a valid device collective after refusals.
-        result = measure_overheads(group, _SOURCE, _SOURCE, 4096, repeats=1, max_scratch_bytes=_SCRATCH_LIMIT)
-        assert result["reason"] is None and result["moved_experts"] == 0
-        assert result["transfer_ms"]["max_ms"] == 0
-        _check_real_assessment(group, stage)
-    finally:
-        dist.destroy_process_group()
+from vllm_ascend.distributed.eplb import state as ascend_state
+from vllm_ascend.distributed.eplb.communicator import AscendGlooEplbCommunicator
+from vllm_ascend.eplb.diagnostics.assessment import calibrate
+from vllm_ascend.eplb.diagnostics.config import EplbDiagnosticsConfig
+from vllm_ascend.eplb.diagnostics.model_calibration import capture_template
+from vllm_ascend.eplb.diagnostics.probe import ExpertLoadProbe
+from vllm_ascend.eplb.diagnostics.runtime import initialize_diagnostics, start_diagnostics
+from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights
+from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
+from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEQuantParams
+from vllm_ascend.ops.fused_moe.eplb import map_to_physical_and_record
+from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
+from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts, AscendUnquantizedFusedMoEMethod
+from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
 
-def _check_real_assessment(group, stage):
-    # Real model hooks + real collectives, using tiny weights and synthetic
-    # route traces. This is functional coverage, not full-model performance.
-    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+def _tiny_model(local, device):
+    # Retain the actual wrapper/router/weight-owner classes while bypassing
+    # serving setup and model loading. All tensors and compute below are real.
+    layer = AscendRoutedExperts.__new__(AscendRoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.layer_name = "tiny.layer"
+    layer.moe_config = SimpleNamespace(num_experts=4, num_logical_experts=4, experts_per_token=1, ep_size=2)
+    layer._use_v2_model_runner = True
+    layer._diagnostic_route_ownership_supported = True
+    layer.mix_placement = False
+    layer.eplb_diagnostic_probe = ExpertLoadProbe(4, device)
+    layer.w13_weight = torch.stack(
+        [torch.full((128, 256), local * 2 + slot + 1, dtype=torch.bfloat16, device=device) for slot in range(2)]
+    )
+    layer.w2_weight = torch.stack(
+        [torch.full((128, 128), local * 2 + slot + 1, dtype=torch.bfloat16, device=device) for slot in range(2)]
+    )
+    layer_state = ascend_state.AscendEplbLayerState()
+    router = FusedTopKRouter(top_k=1, global_num_experts=4, eplb_state=layer_state)
+    layer.router = router
+    wrapper = AscendMoERunner.__new__(AscendMoERunner)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.layer_name = "tiny.layer"
+    wrapper.router, wrapper.routed_experts = router, layer
+    model = torch.nn.Module()
+    model.add_module("layer", wrapper)
+    model.moe_layers = [wrapper]
+    model.num_moe_layers = 1
+    return model, layer, layer_state
 
-    from vllm_ascend.eplb.diagnostics.assessment import calibrate
-    from vllm_ascend.eplb.diagnostics.model_calibration import capture_template
-    from vllm_ascend.eplb.diagnostics.placement import build_plan
-    from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights
-    from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
-    from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEQuantParams
-    from vllm_ascend.ops.fused_moe.routed_experts import AscendUnquantizedFusedMoEMethod
 
-    layer = torch.nn.Module()
-    layer.w13_weight = torch.full((2, 128, 256), 0.01, dtype=torch.bfloat16, device=group.device)
-    layer.w2_weight = torch.full((2, 128, 128), 0.01, dtype=torch.bfloat16, device=group.device)
+def _template(layer):
     method = AscendUnquantizedFusedMoEMethod.__new__(AscendUnquantizedFusedMoEMethod)
     torch.nn.Module.__init__(method)
     method.moe = SimpleNamespace(has_bias=False)
+    method.dynamic_eplb = False  # Actual MRv2 NONE path keeps dense MLP weights.
     method._lora_routing = method.lora_context = None
-    method.dynamic_eplb = False
-    probe = SimpleNamespace(calibration_templates={})
     payload = MoEMlpComputeInput(
-        hidden_states=torch.ones((64, 128), dtype=torch.bfloat16, device=group.device),
-        group_list=torch.tensor([32, 32], dtype=torch.int64, device=group.device),
+        hidden_states=torch.ones((16, 128), dtype=torch.bfloat16, device=layer.w13_weight.device),
+        group_list=torch.tensor([8, 8], dtype=torch.int64, device=layer.w13_weight.device),
         group_list_type=1,
         dynamic_scale=None,
         topk_scales=None,
         weights=MoEWeights(w1=layer.w13_weight, w2=layer.w2_weight),
-        quant=MoEQuantParams(),
+        quant=MoEQuantParams(quant_type=QuantType.NONE),
         fusion=False,
-        layer=layer,
         activation=MoEActivation.SILU,
+        layer=layer,
+        dynamic_eplb=False,
     )
+    return method, payload
+
+
+@torch.inference_mode()
+def _worker(rank, rendezvous):
+    torch.npu.set_device(rank)
+    device = torch.device("npu", rank)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=90))
+    try:
+        members = ([0, 2], [1, 3])
+        groups = [dist.new_group(ranks, backend="gloo") for ranks in members]
+        stage, local = rank % 2, members[rank % 2].index(rank)
+        group = SimpleNamespace(
+            ranks=members[stage], rank_in_group=local, cpu_group=groups[stage], device_group=groups[stage]
+        )
+        with pytest.MonkeyPatch.context() as patch, torch_cuda_wrapper():
+            # Substitute only group lookup/configuration, not communication,
+            # routing, state updates, device timing, or MLP implementations.
+            patch.setattr(ascend_state, "get_ep_group", lambda: group)
+            patch.setattr(upstream_state, "get_ep_group", lambda: group)
+            patch.setattr("vllm.distributed.parallel_state.get_tp_group", lambda: SimpleNamespace(ranks=[rank]))
+            patch.setattr("vllm.distributed.parallel_state.get_pp_group", lambda: SimpleNamespace(rank_in_group=stage))
+            patch.setattr("vllm_ascend.distributed.parallel_state.get_mc2_group", lambda: group)
+            _run_case(rank, local, device, group)
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_case(rank, local, device, group):
+    model, layer, layer_state = _tiny_model(local, device)
+    parallel = SimpleNamespace(enable_expert_parallel=True, enable_eplb=True, enable_elastic_ep=False)
+    state = ascend_state.AscendEplbState(parallel, device)
+    state.expert_load_window_size = state.expert_rearrangement_step_interval = 8
+    state.should_record_tensor = torch.tensor(True, device=device)
+    mapping = torch.arange(4, dtype=torch.int32, device=device).reshape(1, 4, 1)
+    replica_count = torch.ones((1, 4), dtype=torch.int32, device=device)
+    load_pass = torch.zeros((1, 4), dtype=torch.int32, device=device)
+    layer_state.set_layer_state(0, load_pass, mapping, replica_count)
+    communicator = AscendGlooEplbCommunicator(group.cpu_group, torch.npu.current_stream())
+    model_state = upstream_state.EplbModelState(
+        physical_to_logical_map=torch.arange(4, dtype=torch.int32, device=device).reshape(1, 4),
+        logical_to_physical_map=mapping,
+        logical_replica_count=replica_count,
+        expert_load_pass=load_pass,
+        expert_load_window=torch.zeros((8, 1, 4), dtype=torch.int32, device=device),
+        model_name="tiny",
+        model=model,
+        expert_buffer=[],
+        rebalanced=False,
+        eplb_stats=None,
+        cuda_device_index=rank,
+        communicator=communicator,
+    )
+    state.model_states["tiny"] = model_state
+    runner = SimpleNamespace(
+        model=model,
+        device=device,
+        eplb=SimpleNamespace(state=state),
+        ascend_config=SimpleNamespace(
+            eplb_diagnostics=EplbDiagnosticsConfig(mode="benefit", window_size=2, warmup_steps=0)
+        ),
+        vllm_config=SimpleNamespace(
+            use_v2_model_runner=True,
+            parallel_config=parallel,
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+            compilation_config=SimpleNamespace(cudagraph_capture_sizes=[16]),
+        ),
+    )
+    initialize_diagnostics(runner)
+    start_diagnostics(runner)
+    recorder = runner._eplb_diagnostics_recorder
+    probe = layer.eplb_diagnostic_probe
+    assert recorder.layers == [("tiny.layer", layer)]
+    assert state._eplb_diagnostic_monitor is model_state._eplb_diagnostic_monitor is recorder.monitor
+    assert communicator._eplb_diagnostic_monitor is recorder.monitor
+    assert probe.logical_to_physical.data_ptr() == layer_state.logical_to_physical_map.data_ptr()
+    method, payload = _template(layer)
     assert capture_template(probe, payload, method, "MC2CommImpl") is None
-    plan, reason = build_plan(
-        [{0: 100, 1: 100}, {2: 1, 3: 1}],
-        [[0, 1, -1, -1], [-1, -1, 0, 1]],
-        1,
-        "decode",
-    )
-    assert reason is None
-    job = {
-        "plan": plan,
-        "window": 2,
-        "loads": [[48, 8, 4, 4], [24, 4, 2, 2]],
-        "metadata": [[{"phase": "decode", "graph_mode": "FULL", "padded_tokens": 64}] * 2 for _ in group.ranks],
-        "comm_codes": [[1, 1] for _ in group.ranks],
-    }
-    recorder = SimpleNamespace(
-        group=group,
-        summary=SimpleNamespace(stage=stage, layers={"layer.0": SimpleNamespace(calibration_job=job)}),
-        layers=[("layer.0", SimpleNamespace(eplb_diagnostic_probe=probe))],
-        finished=False,
-        step=4,
-    )
-    recorder.finish = lambda: setattr(recorder, "finished", True)
+    logical_ids = torch.tensor([[0], [0], [0], [1], [1], [2], [3]], dtype=torch.int32, device=device)
+
+    def record():
+        physical_ids = map_to_physical_and_record(
+            logical_ids,
+            layer_state.expert_replica_routing_table,
+            layer_state.expert_load_view,
+            state.should_record_tensor,
+            probe.source_token_count,
+        )
+        probe.record_routes(physical_ids)
+        probe.record_comm(1)
+
+    record()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        record()
+    load_pass.zero_()
+    table_pointer = layer_state.expert_replica_routing_table.data_ptr()
     output = io.StringIO()
-    logger = logging.getLogger("vllm.eplb.diagnostics")
     handler = logging.StreamHandler(output)
-    old_level = logger.level
+    logger = logging.getLogger("vllm.eplb.diagnostics")
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     try:
-        calibrate(recorder, update_interval=8, samples=2, repeats=2, max_scratch_bytes=_SCRATCH_LIMIT)
-        assert recorder.calibrated, output.getvalue()
-        assert recorder.finished
-        if group.rank_in_group == 0:
-            text = output.getvalue()
-            assert "calibrated_layers=1 available_layers=1" in text
-            assert "baseline_mlp_ms=" in text and "transfer_per_update_ms=" in text
-            assert "conclusion=insufficient_benefit_evidence net_saving_ms=unknown" in text
-            print(text, flush=True)
-        calibrate(recorder, update_interval=8, samples=2, repeats=2, max_scratch_bytes=_SCRATCH_LIMIT)
-        if group.rank_in_group == 0:
-            assert "reason=already_calibrated" in output.getvalue()
+        for step in range(4):
+            if step == 2:
+                # Move actual tiny experts using the production staged Gloo
+                # communicator and refresh the real MRv2 routing state.
+                slot = 1 if local == 0 else 0
+                tensors = [layer.w13_weight[slot], layer.w2_weight[slot]]
+                communicator.add_send(tensors, dst_rank=1 - local, expert_id=slot)
+                communicator.add_recv(tensors, src_rank=1 - local, expert_id=slot)
+                recorder.monitor.active = True
+                communicator.execute()
+                mapping.copy_(torch.tensor([[[0], [2], [1], [3]]], dtype=torch.int32, device=device))
+                model_state.physical_to_logical_map.copy_(mapping[..., 0])
+                ascend_state.refresh_model_routing_tables(model_state)
+                recorder.monitor.active = False
+                assert probe.generation == 1
+                assert layer_state.expert_replica_routing_table.data_ptr() == table_pointer
+                assert tensors[0][0, 0].item() == (3 if local == 0 else 2)
+            recorder.begin(6)
+            recorder.metadata[-1] = {"phase": "decode", "graph_mode": "FULL", "padded_tokens": 7}
+            graph.replay()
+            recorder.end()
+            # MRv2 advances EPLB after execute_model, when end() already ran.
+            state.step()
+        original_weights = [value.cpu().clone() for value in (layer.w13_weight, layer.w2_weight)]
+        original_mapping = mapping.cpu().clone()
+        calibrate(recorder, samples=2, repeats=2)
+        assert recorder.calibrated
+        costs = recorder.costs[local]
+        assert costs["pending"] == costs["dropped"] == 0
+        components = {(item["kind"], item["component"]): item for item in costs["totals"]}
+        assert components[("device", "eplb_step")]["count"] == 4
+        assert components[("device", "migration_pipeline")]["sum_ms"] > 0
+        assert components[("device", "routing_table_refresh")]["sum_ms"] > 0
+        torch.testing.assert_close(mapping.cpu(), original_mapping, rtol=0, atol=0)
+        for actual, expected in zip((layer.w13_weight, layer.w2_weight), original_weights):
+            torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        if local == 0:
+            job = recorder.jobs["tiny.layer"]
+            assert job["loads"] == [[6, 4, 2, 0], [6, 4, 2, 0]]
+            assert job["initial_placement"] == ((0, 1), (2, 3))
+            assert job["current_placement"] == ((0, 2), (1, 3))
+            assert "calibrated_layers=1" in output.getvalue()
+            assert "estimated_net_saving_ms=unknown" in output.getvalue()
+        else:
+            assert not output.getvalue()
     finally:
         logger.removeHandler(handler)
-        logger.setLevel(old_level)
 
 
-@pytest.mark.skipif(not torch.npu.is_available() or torch.npu.device_count() < 4, reason="requires four NPUs")
-def test_scratch_calibration_in_independent_ep_groups(tmp_path):
-    rendezvous = (tmp_path / "calibration-gloo-init").as_uri()
-    mp.spawn(_worker, args=(rendezvous,), nprocs=4, join=True)
+def test_real_mrv2_commit_graph_history_and_enabled_mlp_assessment(tmp_path):
+    mp.spawn(_worker, args=((tmp_path / "mrv2-init").as_uri(),), nprocs=4, join=True)

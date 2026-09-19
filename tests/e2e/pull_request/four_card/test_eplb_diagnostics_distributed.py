@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Four NPU processes: independent PP-like groups and idle DP participation."""
+"""Actual graph replay with independent EP groups, idle sources and live maps."""
 
 import io
 import logging
@@ -24,36 +24,49 @@ def _worker(rank, rendezvous):
     torch.npu.set_device(rank)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=90))
     try:
-        groups = [dist.new_group(members, backend="gloo") for members in ([0, 1], [2, 3])]
-        stage, local = divmod(rank, 2)
-        group = SimpleNamespace(ranks=[stage * 2, stage * 2 + 1], rank_in_group=local, cpu_group=groups[stage])
-        probe = ExpertLoadProbe(4, "npu")
-        opposite = ExpertLoadProbe(4, "npu")
-        source = torch.tensor(3, device="npu")
-        probe.source_token_count, probe.source_positions = source, torch.arange(4, device="npu")
-        opposite.source_token_count, opposite.source_positions = source, probe.source_positions
-        ids = torch.zeros((4, 1), dtype=torch.int64, device="npu")
-        other_ids = torch.full_like(ids, 2)
-        mask = torch.ones(4, dtype=torch.bool, device="npu")
-        probe.record_routes(ids, mask)
-        opposite.record_routes(other_ids, mask)
-        torch.npu.synchronize()
+        members = ([0, 2], [1, 3])
+        groups = [dist.new_group(ranks, backend="gloo") for ranks in members]
+        stage = rank % 2
+        local = members[stage].index(rank)
+        group = SimpleNamespace(ranks=members[stage], rank_in_group=local, cpu_group=groups[stage])
+        source = torch.tensor(0, device="npu")
+        slot = torch.zeros(1, dtype=torch.int64, device="npu")
+        layers = []
+        for name in ("layer.0", "layer.1"):
+            probe = ExpertLoadProbe(4, "npu")
+            probe.eplb_enabled = True
+            probe.source_token_count, probe.source_positions = source, torch.arange(4, device="npu")
+            probe.logical_to_physical = torch.arange(4, device="npu")
+            probe.owner_totals = torch.zeros((2, 4), dtype=torch.int64, device="npu")
+            probe.history = torch.zeros((2, 6), dtype=torch.int64, device="npu")
+            probe.history_slot = slot
+            probe.comm_history = torch.zeros(2, dtype=torch.int64, device="npu")
+            layers.append(
+                (
+                    name,
+                    SimpleNamespace(
+                        eplb_diagnostic_probe=probe,
+                        log2phy=probe.logical_to_physical,
+                        moe_config=SimpleNamespace(experts_per_token=1),
+                    ),
+                )
+            )
+        ids = torch.tensor([[0], [0], [1], [99]], device="npu")
         graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph):
-            probe.record_routes(ids, mask)
-            opposite.record_routes(other_ids, mask)
-        graph.replay()
+        for _, layer in layers:
+            layer.eplb_diagnostic_probe.record_routes(ids)
         torch.npu.synchronize()
-        layer = SimpleNamespace(
-            eplb_diagnostic_probe=probe,
-            local_num_experts=2,
-            ascend_expert_map=torch.tensor([0, 1, -1, -1] if local == 0 else [-1, -1, 0, 1]),
-            moe_config=SimpleNamespace(experts_per_token=1),
-        )
-        config = EplbDiagnosticsConfig(mode="observe", window_size=2, warmup_steps=0, max_windows=0)
-        other_layer = SimpleNamespace(**dict(vars(layer), eplb_diagnostic_probe=opposite))
+        with torch.npu.graph(graph):
+            for _, layer in layers:
+                layer.eplb_diagnostic_probe.record_routes(ids)
+                layer.eplb_diagnostic_probe.record_comm(1)
         recorder = DiagnosticsRecorder(
-            config, [("layer.0", layer), ("layer.1", other_layer)], group, [rank], stage, source
+            EplbDiagnosticsConfig(mode="benefit", window_size=2, warmup_steps=0),
+            layers,
+            group,
+            [rank],
+            stage,
+            source,
         )
         output = io.StringIO()
         handler = logging.StreamHandler(output)
@@ -61,27 +74,30 @@ def _worker(rank, rendezvous):
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
         try:
-            for _ in range(2):
-                for tokens, dummy in ((3, False), (2, local == 1)):
-                    recorder.begin(tokens, dummy)
-                    if not dummy:
-                        recorder.phases.add(("decode", "FULL"))
-                    graph.replay()
-                    recorder.end()
-            recorder.begin(1, dummy=local == 1)
-            graph.replay()
-            recorder.end()
+            for step in range(5):
+                recorder.begin(3, dummy=local == 1)
+                if step == 1:
+                    for _, layer in layers:
+                        layer.log2phy.copy_(torch.tensor([2, 0, 1, 3], device="npu"))
+                        recorder.committed(layer)
+                    ids[:3].copy_(torch.tensor([[2], [2], [0]], device="npu"))
+                if local == 0:
+                    recorder.metadata[-1] = {"phase": "decode", "graph_mode": "FULL"}
+                graph.replay()
+                recorder.end()
             recorder.finish()
             recorder.finish()
             if local == 0:
-                assert output.getvalue().count("[EPLB diagnostic]") == 6
+                assert output.getvalue().count("placement_changed_during_window") == 2
                 assert output.getvalue().count("[EPLB experts]") == 12
-                assert "skewed_layers=['layer.0', 'layer.1']" in output.getvalue()
-                assert "cumulative_work=17" in output.getvalue()
-                assert output.getvalue().count("final=True") == 1
-                assert "valid_assignments=8 rank_work=[8, 0]" in output.getvalue()
-                assert "hint=persistent_load_skew" in output.getvalue()
-                assert f"stage={stage}" in output.getvalue()
+                assert output.getvalue().count("[EPLB summary]") == 1
+                assert recorder.jobs["layer.0"]["loads"] == [[2, 1, 0, 0]]
+                assert recorder.jobs["layer.0"]["current_placement"] == ((1, 2), (0, 3))
+                assert recorder.jobs["layer.0"]["initial_placement"] == ((0, 1), (2, 3))
+                assert recorder.jobs["layer.0"]["generation"] == 1
+                assert recorder.logical_totals["layer.0"] == {0: 10, 1: 5, 2: 0, 3: 0}
+                assert recorder.expert_totals["layer.0"][0] == {0: 2, 1: 5, 2: 0, 3: 0}
+                assert recorder.expert_totals["layer.0"][1] == {0: 8, 1: 0, 2: 0, 3: 0}
             else:
                 assert not output.getvalue()
         finally:
@@ -90,6 +106,5 @@ def _worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
-def test_graph_window_gather_with_idle_dp_and_separate_stages(tmp_path):
-    rendezvous = (tmp_path / "gloo-init").as_uri()
-    mp.spawn(_worker, args=(rendezvous,), nprocs=4, join=True)
+def test_graph_live_placement_with_idle_sources_and_independent_groups(tmp_path):
+    mp.spawn(_worker, args=((tmp_path / "gloo-init").as_uri(),), nprocs=4, join=True)
