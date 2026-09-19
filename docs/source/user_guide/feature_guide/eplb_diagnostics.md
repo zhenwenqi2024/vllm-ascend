@@ -57,10 +57,10 @@ update interval, migration delay, or expert replication.
 | --- | --- |
 | `recommend_trial` | Persistent imbalance and hotspots; the previous-window candidate repeatedly reduces future peak work. Proceed to a measured EPLB performance trial. |
 | `not_recommended_now` | This workload shows no persistent rank imbalance, or the candidate does not consistently improve subsequent work. |
-| `insufficient_evidence` | Too few comparable windows, changing hotspots, mixed phases, unsupported policy, or invalid/incomplete collection. |
+| `insufficient_evidence` | Too few complete windows, changing hotspots, unsupported policy, or invalid/incomplete collection. |
 
 The current screening heuristics require at least three consecutive complete
-comparable windows (two held-out evaluations):
+windows (two held-out evaluations):
 
 - Step-aware rank peak/mean is at least 1.2 in at least 80% of windows.
 - Hotspot Jaccard overlap is at least 0.5 in at least 80% of evaluated pairs.
@@ -95,10 +95,15 @@ padding do not contribute workload. Idle ranks still participate in aligned
 collectives; bookkeeping call counts are not real work.
 
 Each window verifies source-token conservation per TP group and per step,
-expert ownership and route call counts. Invalid data, phase changes and window
-gaps clear predictive evidence. Mixed prefill/decode windows cannot produce a
-positive decision. Partial tails contribute cumulative workload but are not
-training or evaluation windows.
+expert ownership and route call counts. Invalid data, placement changes and
+window gaps clear predictive evidence. Prefill, decode and mixed prefill/decode
+work all participate in screening, including when EP ranks report different
+phases. Phase labels remain in the logs as descriptive metadata; phase changes
+or missing labels do not discard otherwise valid workload evidence. If the
+workload changes, hotspot overlap and next-window candidate evaluation test
+whether the earlier placement remains useful. This is assignment-count
+screening, not a comparison of prefill and decode execution times. Partial tails
+contribute cumulative workload but are not training or evaluation windows.
 
 Initial support requires fixed EP groups, no redundant experts, equal expert
 capacity per rank, explicit ownership and supported source-shard layouts.

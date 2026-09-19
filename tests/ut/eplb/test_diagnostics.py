@@ -453,32 +453,60 @@ def test_recommendation_requires_future_windows_and_real_policy(api, caplog):
         ((8, 0, 0, 0), "candidate_did_not_generalize"),
     ],
 )
-def test_balanced_and_indivisible_hot_expert_are_not_recommended(api, loads, reason):
+@pytest.mark.parametrize("phase", ["decode", "mixed"])
+def test_balanced_and_indivisible_hot_expert_are_not_recommended(api, loads, reason, phase):
     summary = api.runtime.WorkloadLogger([2, 5], 0, actual_default_plan, "mrv1:1")
     for window in range(1, 4):
-        summary.log(complete_rows(loads), window, 2)
+        summary.log(complete_rows(loads, phase=phase), window, 2)
     decision = summary.layers["layer.0"].decision
     assert decision.verdict == "not_recommended_now" and decision.reason == reason
 
 
-def test_moving_hotspots_do_not_reuse_same_window_success(api):
+@pytest.mark.parametrize("phase", ["decode", "mixed"])
+def test_moving_hotspots_do_not_reuse_same_window_success(api, phase):
     summary = api.runtime.WorkloadLogger([2, 5], 0, actual_default_plan, "mrv1:1")
     for window, loads in enumerate(((6, 2, 0, 0), (0, 0, 2, 6), (6, 2, 0, 0)), 1):
-        summary.log(complete_rows(loads), window, 2)
+        summary.log(complete_rows(loads, phase=phase), window, 2)
     decision = summary.layers["layer.0"].decision
     assert decision.verdict == "insufficient_evidence" and decision.reason == "hotspots_not_predictable"
 
 
-@pytest.mark.parametrize("boundary", ["phase", "gap", "invalid", "mixed", "prefill_or_mixed"])
+@pytest.mark.parametrize(
+    "phase_windows",
+    [
+        [["mixed"]] * 3,
+        [["prefill", "decode"]] * 3,
+        [["decode"], ["mixed", "decode"], ["prefill"]],
+        [["prefill_or_mixed"]] * 3,
+        [[]] * 3,
+    ],
+)
+def test_phase_metadata_does_not_discard_real_work(api, phase_windows):
+    summary = api.runtime.WorkloadLogger([2, 5], 0, actual_default_plan, "mrv1:1")
+    for window, phases in enumerate(phase_windows, 1):
+        data = complete_rows()
+        # One rank can be decoding while another handles mixed/prefill work.
+        data[0]["phases"] = [(phase, "FULL") for phase in phases]
+        summary.log(data, window, 2)
+        assert summary.layers["layer.0"].hint == ("recommend_trial" if window == 3 else "insufficient_evidence")
+    report = summary.layers["layer.0"].decision.report()
+    assert report["complete_windows"] == 3
+    assert report["evaluated_pairs"] == 2
+    assert report["heldout_baseline_peak_work"] == 64
+    assert report["heldout_candidate_peak_work"] == 48
+
+
+@pytest.mark.parametrize("boundary", ["gap", "invalid", "mapping"])
 def test_window_boundaries_invalidate_old_positive_evidence(api, boundary):
     summary = api.runtime.WorkloadLogger([2, 5], 0, actual_default_plan, "mrv1:1")
     for window in range(1, 4):
-        summary.log(complete_rows(), window, 2)
-    data = complete_rows(phase="prefill" if boundary == "phase" else "decode")
-    if boundary in {"mixed", "prefill_or_mixed"}:
-        data[0]["phases"] = [(boundary, "FULL")]
+        summary.log(complete_rows(phase="mixed"), window, 2)
+    assert summary.layers["layer.0"].hint == "recommend_trial"
+    data = complete_rows(phase="mixed")
     if boundary == "invalid":
         data[0]["layers"][0]["history"][0][-1] = 1
+    if boundary == "mapping":
+        data[0]["layers"][0]["mapping"] = [1, 0, -1, -1]
     summary.log(data, 5 if boundary == "gap" else 4, 2)
     assert summary.layers["layer.0"].hint == "insufficient_evidence"
 

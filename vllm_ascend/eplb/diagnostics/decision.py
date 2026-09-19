@@ -89,11 +89,8 @@ class EnablementDecision:
             self.previous = None
             return
         signature = tuple((r["rank"], tuple(r["layers"][0]["mapping"])) for r in rows)
-        phases = {phase for row in rows for phase, _ in row["phases"]}
-        if len(phases) != 1 or not phases.issubset({"prefill", "decode"}):
-            self.reset("mixed_or_missing_phase")
-            return
-        signature = signature, tuple(sorted(phases))
+        # Phase labels describe the workload; mixed batches and phase changes
+        # remain valid evidence. Held-out work tests whether a plan generalizes.
         if signature != self.signature or (self.last_window is not None and window != self.last_window + 1):
             self.reset("need_complete_windows")
         self.signature, self.last_window = signature, window

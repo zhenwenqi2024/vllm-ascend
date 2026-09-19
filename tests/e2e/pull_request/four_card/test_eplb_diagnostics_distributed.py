@@ -21,7 +21,7 @@ from vllm_ascend.eplb.diagnostics.runtime import DiagnosticsRecorder
 
 
 @torch.inference_mode()
-def _worker(rank, rendezvous):
+def _worker(rank, rendezvous, mixed_workload):
     torch.npu.set_device(rank)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=90))
     try:
@@ -78,11 +78,11 @@ def _worker(rank, rendezvous):
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
         try:
-            for _ in range(3):
+            for phase in ("decode", "mixed", "prefill") if mixed_workload else ("decode",) * 3:
                 for tokens, dummy in ((3, False), (2, local == 1)):
                     recorder.begin(tokens, dummy)
                     if not dummy:
-                        recorder.phases.add(("decode", "FULL"))
+                        recorder.phases.add((phase if local == 0 else "decode", "FULL"))
                     graph.replay()
                     recorder.end()
             recorder.begin(1, dummy=local == 1)
@@ -99,6 +99,9 @@ def _worker(rank, rendezvous):
                 assert "valid_assignments=8 rank_work=[8, 0]" in output.getvalue()
                 assert "hint=recommend_trial" in output.getvalue()
                 assert "timing_evidence=not_collected net_benefit=unknown" in output.getvalue()
+                if mixed_workload:
+                    assert "mixed" in output.getvalue() and "prefill" in output.getvalue()
+                assert recorder.summary.layers["layer.0"].decision.windows == 3
                 assert recorder.summary.layers["layer.0"].decision.pairs == 2
                 assert recorder.summary.layers["layer.0"].decision.report()["heldout_peak_work_reduction"] > 0
                 assert f"stage={stage}" in output.getvalue()
@@ -110,6 +113,7 @@ def _worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
-def test_graph_window_gather_with_idle_dp_and_separate_stages(tmp_path):
+@pytest.mark.parametrize("mixed_workload", [False, True], ids=["decode", "mixed"])
+def test_graph_window_gather_with_idle_dp_and_separate_stages(tmp_path, mixed_workload):
     rendezvous = (tmp_path / "gloo-init").as_uri()
-    mp.spawn(_worker, args=(rendezvous,), nprocs=4, join=True)
+    mp.spawn(_worker, args=(rendezvous, mixed_workload), nprocs=4, join=True)
