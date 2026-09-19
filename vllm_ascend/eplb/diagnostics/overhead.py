@@ -33,6 +33,9 @@ class LiveEplbOverhead:
         if isinstance(max_samples, bool) or not isinstance(max_samples, int) or max_samples < 1:
             raise ValueError("max_samples must be a positive integer")
         self.active = False
+        # Observation spans the gaps between forwards, where async transfers run.
+        self.observing = False
+        self.peer_locality = {}
         # MRv2 advances EPLB after sampling, after execute_model has returned.
         # Consume this qualification exactly once in AscendEplbState.step.
         self.pending_real = False
@@ -42,6 +45,7 @@ class LiveEplbOverhead:
         self._pending = []
         self._inflight = 0
         self._totals = {}
+        self._transfers = {}
         self._dropped = 0
         self._lock = Lock()
 
@@ -63,8 +67,8 @@ class LiveEplbOverhead:
             self._samples.append(sample)
 
     @contextmanager
-    def cpu_span(self, component, layer=None):
-        if not self.active:
+    def cpu_span(self, component, layer=None, *, enabled=None):
+        if not (self.active if enabled is None else enabled):
             yield
             return
         start = perf_counter()
@@ -74,8 +78,8 @@ class LiveEplbOverhead:
             self._record(component, "host", layer, (perf_counter() - start) * 1000)
 
     @contextmanager
-    def device_span(self, component, layer=None, stream=None):
-        if not self.active or torch.npu.is_current_stream_capturing():
+    def device_span(self, component, layer=None, stream=None, *, enabled=None):
+        if not (self.active if enabled is None else enabled) or torch.npu.is_current_stream_capturing():
             yield
             return
         with self._lock:
@@ -115,6 +119,31 @@ class LiveEplbOverhead:
         # Commits during an idle/dummy participant still change the placement
         # used by its next real forward. Notification must remain CPU-only.
         self.on_commit(layer)
+
+    def record_transfers(self, layer, transfers):
+        """Account successful submissions from tensor metadata, without device reads.
+
+        Callers qualify observation at submission time. A send and its peer's
+        receive describe the same payload; they must not be summed together.
+        """
+        batches = {}
+        for direction, tensor, peer in transfers:
+            locality = self.peer_locality.get(peer, "unknown")
+            key = (_layer_name(layer), direction, locality)
+            record = batches.setdefault(key, dict(payload_bytes=0, tensor_ops=0))
+            record["payload_bytes"] += tensor.numel() * tensor.element_size()
+            record["tensor_ops"] += 1
+        with self._lock:
+            for (name, direction, locality), batch in batches.items():
+                record = self._transfers.setdefault(
+                    (name, direction, locality),
+                    dict(
+                        layer=name, direction=direction, locality=locality, payload_bytes=0, tensor_ops=0, submissions=0
+                    ),
+                )
+                record["payload_bytes"] += batch["payload_bytes"]
+                record["tensor_ops"] += batch["tensor_ops"]
+                record["submissions"] += 1
 
     def wrap_policy(self, policy):
         """Attach host planner timing to an in-process policy instance (MRv2)."""
@@ -160,6 +189,7 @@ class LiveEplbOverhead:
             return dict(
                 samples=samples,
                 totals=[dict(value) for value in self._totals.values()],
+                transfers=[dict(value) for value in self._transfers.values()],
                 pending=len(self._pending) + self._inflight,
                 dropped=self._dropped,
             )

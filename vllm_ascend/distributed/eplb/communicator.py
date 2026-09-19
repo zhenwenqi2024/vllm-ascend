@@ -51,17 +51,28 @@ class AscendGlooEplbCommunicator(TorchDistGlooStagedEplbCommunicator):
         # parent's positional P2POp.peer argument.
         super().add_recv(tensors, self._to_global_peer_rank(src_rank), expert_id)
 
+    def set_transfer_context(self, old_indices, layer_idx: int) -> None:
+        super().set_transfer_context(old_indices, layer_idx)
+        monitor = getattr(self, "_eplb_diagnostic_monitor", None)
+        if monitor is not None:
+            self._eplb_diagnostic_layer = self._eplb_diagnostic_layers[layer_idx]
+
     def execute(self) -> None:
         monitor = getattr(self, "_eplb_diagnostic_monitor", None)
-        if monitor is None or not monitor.active:
+        if monitor is None or not monitor.observing or not self._ops:
             return super().execute()
+        layer = getattr(self, "_eplb_diagnostic_layer", None)
+        # The parent clears its queue, so retain metadata for successful calls.
+        transfers = list(self._ops)
         # Record on the actual staging stream. Host submission time excludes
         # trailing asynchronous H2D; the deferred device end event includes it.
         with (
-            monitor.cpu_span("migration_pipeline"),
-            monitor.device_span("migration_pipeline", stream=self._cuda_stream),
+            monitor.cpu_span("migration_pipeline", layer, enabled=True),
+            monitor.device_span("migration_pipeline", layer, stream=self._cuda_stream, enabled=True),
         ):
-            return super().execute()
+            result = super().execute()
+        monitor.record_transfers(layer, transfers)
+        return result
 
     @property
     def needs_profile_buffer_reservation(self) -> bool:

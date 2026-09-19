@@ -195,10 +195,12 @@ def _run_case(rank, local, device, group):
                 # communicator and refresh the real MRv2 routing state.
                 slot = 1 if local == 0 else 0
                 tensors = [layer.w13_weight[slot], layer.w2_weight[slot]]
+                communicator.set_transfer_context(None, 0)
                 communicator.add_send(tensors, dst_rank=1 - local, expert_id=slot)
                 communicator.add_recv(tensors, src_rank=1 - local, expert_id=slot)
-                recorder.monitor.active = True
+                assert recorder.monitor.observing and not recorder.monitor.active
                 communicator.execute()
+                recorder.monitor.active = True
                 mapping.copy_(torch.tensor([[[0], [2], [1], [3]]], dtype=torch.int32, device=device))
                 model_state.physical_to_logical_map.copy_(mapping[..., 0])
                 ascend_state.refresh_model_routing_tables(model_state)
@@ -218,6 +220,17 @@ def _run_case(rank, local, device, group):
         assert recorder.calibrated
         costs = recorder.costs[local]
         assert costs["pending"] == costs["dropped"] == 0
+        assert costs["transfers"] == [
+            dict(
+                layer="tiny.layer",
+                direction=direction,
+                locality="same_node",
+                payload_bytes=98304,
+                tensor_ops=2,
+                submissions=1,
+            )
+            for direction in ("send", "recv")
+        ]
         components = {(item["kind"], item["component"]): item for item in costs["totals"]}
         assert components[("device", "eplb_step")]["count"] == 4
         assert components[("device", "migration_pipeline")]["sum_ms"] > 0
@@ -231,6 +244,7 @@ def _run_case(rank, local, device, group):
             assert job["initial_placement"] == ((0, 1), (2, 3))
             assert job["current_placement"] == ((0, 2), (1, 3))
             assert "calibrated_layers=1" in output.getvalue()
+            assert "[EPLB migration]" in output.getvalue() and "98304" in output.getvalue()
             assert "estimated_net_saving_ms=unknown" in output.getvalue()
         else:
             assert not output.getvalue()

@@ -1,7 +1,7 @@
 # Expert Parallelism Load Balancer (EPLB)
 
-For runtime logs of per-rank, per-layer MoE work and persistent hot experts with EPLB
-disabled, see [EPLB diagnostics](eplb_diagnostics.md).
+For per-rank, per-layer workload, actual adjustment gains and update costs with EPLB
+enabled, see [EPLB diagnostics](eplb_diagnostics.md).
 
 ## Overview
 

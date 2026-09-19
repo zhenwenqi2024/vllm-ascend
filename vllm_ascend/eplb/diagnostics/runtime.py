@@ -5,6 +5,7 @@
 import functools
 import logging
 from collections import Counter
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -20,6 +21,14 @@ def gather(group, value):
     with torch.inference_mode(False):
         torch.distributed.all_gather_object(rows, value, group=group.cpu_group)
     return rows
+
+
+def local_node_id():
+    """Linux boot identity is shared by containers on one host; never log it."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
+    except OSError:
+        return None
 
 
 def logical_to_physical(layer):
@@ -147,6 +156,7 @@ class DiagnosticsRecorder:
             and (not self.config.max_windows or offset < self.config.max_windows * self.config.window_size)
         )
         self.real = not dummy and tokens > 0
+        self.monitor.observing = self.collecting
         self.monitor.active = self.collecting and self.real
         self.monitor.pending_real = self.monitor.active
         self.source_tokens.fill_(tokens if self.monitor.active else 0)
@@ -156,7 +166,6 @@ class DiagnosticsRecorder:
             self.metadata, self.token_steps = [], []
             for name, layer in self.layers:
                 probe = layer.eplb_diagnostic_probe
-                probe.totals.zero_()
                 probe.history.zero_()
                 probe.comm_history.zero_()
                 probe.owner_totals.zero_()
@@ -284,12 +293,21 @@ class DiagnosticsRecorder:
             return
         self.monitor.active = False
         self.monitor.pending_real = False
+        self.monitor.observing = False
         self.source_tokens.zero_()
         if self.window_calls:
             self._collect()
         self.costs = gather(self.group, self.monitor.drain(synchronize=True))
         self.finished = True
         if self.group.rank_in_group == 0:
+            for rank, costs in zip(self.group.ranks, self.costs):
+                _LOGGER.info(
+                    "[EPLB migration] stage=%s rank=%s records=%s "
+                    "scope=observed_submissions accounting=send_recv_describe_same_payload",
+                    self.stage,
+                    rank,
+                    costs["transfers"],
+                )
             _LOGGER.info(
                 "[EPLB overhead] stage=%s observed_real_steps=%s rank_records=%s "
                 "accounting=overlapping_components_do_not_sum",
@@ -319,6 +337,7 @@ def attach_monitor(runner, monitor):
         for model_state in state.model_states.values():
             model_state._eplb_diagnostic_monitor = monitor
             model_state.communicator._eplb_diagnostic_monitor = monitor
+            model_state.communicator._eplb_diagnostic_layers = model_state.model.moe_layers
 
 
 def diagnostics_quiescent(runner, *, calibration=False):
@@ -419,6 +438,12 @@ def start_diagnostics(runner):
         runner._eplb_diagnostics_source_tokens,
     )
     runner._eplb_diagnostics_recorder = recorder
+    node = local_node_id()
+    nodes = gather(recorder.group, node)
+    recorder.monitor.peer_locality = {
+        rank: "unknown" if node is None or peer is None else "same_node" if node == peer else "cross_node"
+        for rank, peer in zip(recorder.group.ranks, nodes)
+    }
     attach_monitor(runner, recorder.monitor)
     _LOGGER.info("EPLB benefit diagnostics enabled; compare actual initial/current layouts; exclude dummy and padding")
 

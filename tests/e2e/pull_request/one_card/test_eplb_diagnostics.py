@@ -61,7 +61,8 @@ def test_graph_replay_writes_each_device_selected_history_slot():
         probe.history_slot.fill_(step)
         probe.source_token_count.fill_(tokens)
         graph.replay()
-    assert probe.totals.cpu().tolist() == [2, 1, 3, 0]
+    assert probe.totals.cpu().tolist() == [0, 0, 0, 0]
+    assert probe.history.sum(dim=0).cpu().tolist() == [2, 1, 3, 0]
     assert probe.history.cpu().tolist() == [[1, 1, 1, 0], [0, 0, 1, 0], [1, 0, 1, 0]]
     assert probe.comm_history.cpu().tolist() == [1, 1, 1]
     assert pointers == (probe.totals.data_ptr(), probe.history.data_ptr(), probe.history_slot.data_ptr())

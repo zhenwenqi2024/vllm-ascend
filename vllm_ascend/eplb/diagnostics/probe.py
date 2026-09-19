@@ -19,7 +19,9 @@ class ExpertLoadProbe(torch.nn.Module):
         self.register_buffer("comm_history", None, persistent=False)
         self.register_buffer("source_token_count", None, persistent=False)
         self.register_buffer("source_positions", None, persistent=False)
-        # Expert assignments, supported calls, invalid IDs. The call count is
+        # Standalone counters / history-row template; history mode does not
+        # maintain a duplicate running total. The fields are expert assignments,
+        # supported calls and invalid IDs. The call count is
         # alignment bookkeeping, including dummy collective participation.
         self.register_buffer("totals", torch.zeros(num_experts + 2, dtype=torch.int64, device=device), persistent=False)
 
@@ -45,7 +47,9 @@ class ExpertLoadProbe(torch.nn.Module):
         if valid_mask is not None:
             active = active & valid_mask[:, None]
         valid = (physical_ids >= 0) & (physical_ids < self.num_experts)
-        logical_ids = physical_ids.clamp(0, self.num_experts - 1).to(torch.int64)
+        physical_slots = physical_ids.clamp(0, self.num_experts - 1).to(torch.int64)
+        logical_ids = physical_slots
+        valid_counts = (active & valid).reshape(-1).to(torch.int64)
         if self.logical_to_physical is not None:
             # Zero redundancy: the live permutation changes in place, including
             # between graph replays. Keep counters in logical expert space.
@@ -53,16 +57,16 @@ class ExpertLoadProbe(torch.nn.Module):
             logical_ids = inverse[logical_ids]
         if self.owner_totals is not None:
             slots = self.num_experts // self.owner_totals.shape[0]
-            owners = physical_ids.clamp(0, self.num_experts - 1).to(torch.int64) // slots
+            owners = physical_slots // slots
             self.owner_totals.view(-1).scatter_add_(
                 0,
                 (owners * self.num_experts + logical_ids).reshape(-1),
-                (active & valid).reshape(-1).to(torch.int64),
+                valid_counts,
             )
         counts[: self.num_experts].scatter_add_(
             0,
             logical_ids.reshape(-1),
-            (active & valid).reshape(-1).to(torch.int64),
+            valid_counts,
         )
         counts[-2].add_(1)
         counts[-1].add_((active & ~valid).sum())
@@ -70,7 +74,6 @@ class ExpertLoadProbe(torch.nn.Module):
 
     def _append_history(self, counts):
         if self.history is not None:
-            self.totals.add_(counts)
             self.history.index_add_(0, self.history_slot, counts.unsqueeze(0))
 
     def record_comm(self, code):

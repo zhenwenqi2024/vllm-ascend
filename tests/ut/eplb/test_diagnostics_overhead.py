@@ -63,7 +63,7 @@ def test_inactive_monitor_never_reads_clock_or_creates_events(api, monkeypatch, 
     with monitor.cpu_span("planner_compute"), monitor.device_span("eplb_step"):
         pass
     assert events == ([], [])
-    assert monitor.drain() == {"samples": [], "totals": [], "pending": 0, "dropped": 0}
+    assert monitor.drain() == {"samples": [], "totals": [], "transfers": [], "pending": 0, "dropped": 0}
 
 
 def test_live_drain_queries_without_synchronizing_and_keeps_run_totals(api, events):
@@ -368,3 +368,119 @@ def test_mrv2_unattached_step_is_transparent(state_api, monkeypatch):
     monkeypatch.delattr(torch, "npu", raising=False)
     assert state_api.step(is_dummy=True, log_stats=True) == "upstream result"
     assert state_api.calls == [(True, False, True, False)]
+
+
+def test_transfer_metadata_separates_direction_topology_and_preserves_snapshots(api):
+    monitor = api.LiveEplbOverhead(lambda layer: None)
+    monitor.peer_locality = {2: "same_node", 9: "cross_node"}
+    weights = torch.empty((3, 5), dtype=torch.bfloat16, device="meta")
+    scales = torch.empty(3, dtype=torch.float32, device="meta")
+    transfers = [("send", weights, 2), ("send", scales, 2), ("recv", weights, 9), ("recv", scales, 11)]
+    monitor.record_transfers("layer.0", transfers)
+    first = monitor.drain()["transfers"]
+    assert [(r["direction"], r["locality"], r["payload_bytes"], r["tensor_ops"]) for r in first] == [
+        ("send", "same_node", 42, 2),
+        ("recv", "cross_node", 30, 1),
+        ("recv", "unknown", 12, 1),
+    ]
+    monitor.record_transfers("layer.0", transfers)
+    second = monitor.drain()["transfers"]
+    assert [r["payload_bytes"] for r in first] == [42, 30, 12]
+    assert [r["payload_bytes"] for r in second] == [84, 60, 24]
+    assert all(r["layer"] == "layer.0" and r["submissions"] == 2 for r in second)
+
+
+@pytest.fixture
+def communicator_api(monkeypatch):
+    class StagedCommunicator:
+        def __init__(self):
+            self._ops, self._cuda_stream = [], object()
+            self._cpu_group = SimpleNamespace(size=lambda: 2)
+            self.fail = False
+
+        def set_transfer_context(self, old_indices, layer_idx):
+            self.context = old_indices, layer_idx
+
+        def add_send(self, tensors, dst_rank, expert_id):
+            self._ops.extend(("send", tensor, dst_rank) for tensor in tensors)
+
+        def add_recv(self, tensors, src_rank, expert_id):
+            self._ops.extend(("recv", tensor, src_rank) for tensor in tensors)
+
+        def execute(self):
+            self._ops.clear()
+            if self.fail:
+                raise RuntimeError("transfer failed")
+            return 42
+
+    name = "vllm.distributed.eplb.eplb_communicator"
+    module = ModuleType(name)
+    module.TorchDistGlooStagedEplbCommunicator = StagedCommunicator
+    monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(torch.distributed, "get_global_rank", lambda group, rank: [2, 9][rank])
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/distributed/eplb/communicator.py"
+    spec = importlib.util.spec_from_file_location("migration_communicator_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.AscendGlooEplbCommunicator()
+
+
+@pytest.mark.parametrize("observing", [False, True])
+def test_communicator_accounts_between_forwards_and_skips_empty_work(api, communicator_api, events, observing):
+    monitor = api.LiveEplbOverhead(lambda layer: None)
+    monitor.observing = observing
+    monitor.peer_locality = {2: "same_node", 9: "cross_node"}
+    communicator_api._eplb_diagnostic_monitor = monitor
+    communicator_api._eplb_diagnostic_layers = [SimpleNamespace(layer_name="layer.0")]
+    communicator_api.set_transfer_context(None, 0)
+    tensor = torch.empty(8, dtype=torch.int8, device="meta")
+    communicator_api.add_send([tensor], 1, 0)
+    communicator_api.add_recv([tensor], 0, 0)
+    assert communicator_api.execute() == 42
+    assert not monitor.active
+    records = monitor.drain(synchronize=True)
+    if observing:
+        assert [(r["direction"], r["locality"], r["payload_bytes"]) for r in records["transfers"]] == [
+            ("send", "cross_node", 8),
+            ("recv", "same_node", 8),
+        ]
+        assert all(r["layer"] == "layer.0" for r in records["totals"])
+    else:
+        assert not records["transfers"] and not records["totals"] and not events[1]
+    event_count = len(events[1])
+    assert communicator_api.execute() == 42
+    assert len(events[1]) == event_count
+
+
+def test_failed_communicator_submission_does_not_count_payload(api, communicator_api, events):
+    monitor = api.LiveEplbOverhead(lambda layer: None)
+    monitor.observing = True
+    communicator_api._eplb_diagnostic_monitor = monitor
+    communicator_api.add_send([torch.empty(8, device="meta")], 1, 0)
+    communicator_api.fail = True
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        communicator_api.execute()
+    assert monitor.drain(synchronize=True)["transfers"] == []
+
+
+def test_mrv1_loader_accounts_successful_submission_metadata(api, loader_api, monkeypatch):
+    monitor = api.LiveEplbOverhead(lambda layer: None)
+    monitor.observing = True
+    monitor.peer_locality = {9: "cross_node"}
+    loader = loader_api.D2DExpertWeightLoader()
+    loader._eplb_diagnostic_monitor = monitor
+    loader.eplb_adaptor = SimpleNamespace(moe_layers=[SimpleNamespace(layer_name="layer.0")])
+    loader.layer_id = 0
+    loader.state = loader_api.ExpertWeightUpdateState.READY
+    loader.comm_op_list = [
+        SimpleNamespace(op=torch.distributed.isend, tensor=t, peer=9)
+        for t in (torch.empty(4, dtype=torch.int8, device="meta"), torch.empty(2, device="meta"))
+    ]
+    request = object()
+    monkeypatch.setattr(torch.distributed, "batch_isend_irecv", lambda ops: [request])
+    requests = []
+    loader.asyn_expert_weight_transfer(requests)
+    assert requests == [request]
+    assert monitor.drain()["transfers"] == [
+        dict(layer="layer.0", direction="send", locality="cross_node", payload_bytes=12, tensor_ops=2, submissions=1)
+    ]

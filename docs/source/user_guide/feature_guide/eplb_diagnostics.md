@@ -87,6 +87,25 @@ a positive adjustment result. Any EPLB overhead remains a separate quantity.
 
 ## Measure live EPLB activity
 
+`[EPLB migration]` logs cumulative submitted payload by rank, layer, direction
+(`send` or `recv`), and locality (`same_node`, `cross_node`, or `unknown`). Each
+record includes `payload_bytes`, `tensor_ops`, and `submissions`. Sizes come from
+actual submitted tensor metadata, including weights and scales, without reading
+device data. These are payload bytes, excluding local copies and transport
+framing. A successful submission is not a committed placement. A send and its
+peer's receive describe the same payload: do not add both to count traffic.
+
+Locality uses a host boot identity exchanged once at diagnostic startup. The
+identity is never logged; unavailable identity produces `unknown`. Background
+transfers remain observable between forwards, with timing events on the actual
+staging stream. Warmup and completed observation are excluded. A snapshot taken
+before an update finishes can have incomplete cost coverage; use the calibration
+RPC after the update cycle completes for a final snapshot.
+
+Graph replay writes the selected history slot directly. History mode avoids a
+second, unused cumulative device update; window and run summaries are derived
+from that history.
+
 Runtime instrumentation reports durations of actual EPLB work where supported,
 such as load aggregation, waiting for the planner, transfer submission or wait,
 and map/weight application. Component labels distinguish host and device spans.

@@ -94,6 +94,12 @@ class D2DExpertWeightLoader:
         if self.comm_op_list:
             ret_list = dist.batch_isend_irecv(self.comm_op_list)
             reqs.extend(ret_list)
+            monitor = getattr(self, "_eplb_diagnostic_monitor", None)
+            if monitor is not None and monitor.observing:
+                monitor.record_transfers(
+                    self.eplb_adaptor.moe_layers[self.layer_id],
+                    [("send" if op.op is dist.isend else "recv", op.tensor, op.peer) for op in self.comm_op_list],
+                )
 
         self.state = ExpertWeightUpdateState.TRANSFERRING
 

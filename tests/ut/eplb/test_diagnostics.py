@@ -212,6 +212,17 @@ def test_partial_window_and_worker_logging(api, monkeypatch, caplog):
     assert "[EPLB experts]" in caplog.text
     assert "estimated_net_saving_ms=unknown" in caplog.text
     assert "[EPLB overhead]" in caplog.text
+    assert "[EPLB migration]" in caplog.text
+    assert not recorder.monitor.observing
+    assert not probe.totals.any()
+
+
+def test_unavailable_host_identity_is_unknown(api, monkeypatch):
+    def unavailable(path):
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(api.runtime.Path, "read_text", unavailable)
+    assert api.runtime.local_node_id() is None
 
 
 @pytest.mark.parametrize("v2", [False, True])
