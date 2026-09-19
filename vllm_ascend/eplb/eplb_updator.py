@@ -15,8 +15,6 @@
 # This file is a part of the vllm-ascend project.
 #
 # Todo: Once https://github.com/vllm-project/vllm/issues/22246 is merged in vllm. Remove this updator.
-from contextlib import nullcontext
-
 import numpy
 import torch
 import torch.distributed as dist
@@ -29,7 +27,6 @@ from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
-from vllm_ascend.eplb.diagnostics.overhead import monitor_call
 
 
 class EplbUpdator:
@@ -106,13 +103,10 @@ class EplbUpdator:
     def wakeup_eplb_worker(self):
         self.eplb_process.planner_q.put(1)
 
-    @monitor_call("eplb_step_before", device=True)
     def forward_before(self):
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
-            monitor = getattr(self, "_eplb_diagnostic_monitor", None)
-            with monitor.cpu_span("planner_wait") if monitor is not None else nullcontext():
-                self.update_info_all = self.eplb_process.block_update_q.get()
+            self.update_info_all = self.eplb_process.block_update_q.get()
         if self.update_expert_weight_flag():
             with record_function_or_nullcontext("EPLB generate p2p task"):
                 (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = (
@@ -132,7 +126,6 @@ class EplbUpdator:
                 self.reqs = []
                 self.eplb_loader.asyn_expert_weight_transfer(self.reqs)
 
-    @monitor_call("eplb_step_after", device=True)
     def forward_end(self, eplb_heat_collection_status: bool = True):
         if self.wakeup_eplb_worker_flag():
             with record_function_or_nullcontext("EPLB gather moe load"):
@@ -149,7 +142,6 @@ class EplbUpdator:
         if self.cur_iterations >= self.expert_heat_collection_interval - 1 or eplb_heat_collection_status:
             self.update_iteration()
 
-    @monitor_call("load_aggregation", device=True)
     def compute_and_set_moe_load(self):
         local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)
         moe_load = self.comm_group.all_gather(local_load, dim=1).cpu()

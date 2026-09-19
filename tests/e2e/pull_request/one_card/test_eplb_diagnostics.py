@@ -38,31 +38,25 @@ def test_graph_replay_excludes_padding_and_dummy(source_offset):
     assert probe.totals.data_ptr() == pointer
 
 
-def test_graph_replay_writes_each_device_selected_history_slot():
+def test_graph_history_uses_device_slot_and_excludes_dummy_padding():
     torch.npu.set_device(0)
     probe = ExpertLoadProbe(2, "npu")
     probe.source_token_count = torch.tensor(2, device="npu")
     probe.source_positions = torch.arange(3, device="npu")
     probe.history = torch.zeros((3, 4), dtype=torch.int64, device="npu")
     probe.history_slot = torch.zeros(1, dtype=torch.int64, device="npu")
-    probe.comm_history = torch.zeros(3, dtype=torch.int64, device="npu")
     ids = torch.tensor([[0], [1], [99]], device="npu")
     probe.record_routes(ids)
-    probe.record_comm(1)
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         probe.record_routes(ids)
-        probe.record_comm(1)
-    pointers = probe.totals.data_ptr(), probe.history.data_ptr(), probe.history_slot.data_ptr()
-    probe.totals.zero_()
+    pointer = probe.history.data_ptr()
     probe.history.zero_()
     for step, tokens in enumerate((2, 0, 1)):
         probe.history_slot.fill_(step)
         probe.source_token_count.fill_(tokens)
         graph.replay()
-    assert probe.totals.cpu().tolist() == [0, 0, 0, 0]
-    assert probe.history.sum(dim=0).cpu().tolist() == [2, 1, 3, 0]
     assert probe.history.cpu().tolist() == [[1, 1, 1, 0], [0, 0, 1, 0], [1, 0, 1, 0]]
-    assert probe.comm_history.cpu().tolist() == [1, 1, 1]
-    assert pointers == (probe.totals.data_ptr(), probe.history.data_ptr(), probe.history_slot.data_ptr())
+    assert not probe.totals.cpu().any()
+    assert probe.history.data_ptr() == pointer

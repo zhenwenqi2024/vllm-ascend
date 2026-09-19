@@ -690,6 +690,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             and self.eplb_diagnostic_probe.source_token_count is not None
             and type(_EXTRA_CTX.moe_comm_method).__name__ in {"MC2CommImpl", "AlltoAllCommImpl", "AllGatherCommImpl"}
             and not self.mix_placement
+            and (self._use_v2_model_runner or not self.dynamic_eplb)
             and not enable_force_load_balance
             and not get_ascend_config().enable_force_eplb
             and self._diagnostic_route_ownership_supported
@@ -699,11 +700,6 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             )
             if routes is not None:
                 self.eplb_diagnostic_probe.record_routes(*routes)
-                self.eplb_diagnostic_probe.record_comm(
-                    {"MC2CommImpl": 1, "AlltoAllCommImpl": 2, "AllGatherCommImpl": 3}[
-                        type(_EXTRA_CTX.moe_comm_method).__name__
-                    ]
-                )
         try:
             fused_experts_results: FusedExpertsResult = self.quant_method.apply(
                 layer=self,

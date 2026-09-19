@@ -14,7 +14,6 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-from contextlib import nullcontext
 from enum import Enum
 
 import torch.distributed as dist
@@ -22,7 +21,6 @@ from vllm.logger import logger
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
-from vllm_ascend.eplb.diagnostics.overhead import monitor_call
 
 
 class ExpertWeightUpdateState(Enum):
@@ -84,7 +82,6 @@ class D2DExpertWeightLoader:
     def set_log2phy_map(self, log2phy_map):
         self.updated_log2phy_map = log2phy_map
 
-    @monitor_call("transfer_launch")
     def asyn_expert_weight_transfer(self, reqs):
         # Only when send/recv tasks are parsed into self.comm_op_list, d2d send/recv tasks can be launched
         if self.state != ExpertWeightUpdateState.READY:
@@ -94,12 +91,6 @@ class D2DExpertWeightLoader:
         if self.comm_op_list:
             ret_list = dist.batch_isend_irecv(self.comm_op_list)
             reqs.extend(ret_list)
-            monitor = getattr(self, "_eplb_diagnostic_monitor", None)
-            if monitor is not None and monitor.observing:
-                monitor.record_transfers(
-                    self.eplb_adaptor.moe_layers[self.layer_id],
-                    [("send" if op.op is dist.isend else "recv", op.tensor, op.peer) for op in self.comm_op_list],
-                )
 
         self.state = ExpertWeightUpdateState.TRANSFERRING
 
@@ -108,34 +99,26 @@ class D2DExpertWeightLoader:
         if self.state != ExpertWeightUpdateState.TRANSFERRING:
             return
 
-        monitor = getattr(self, "_eplb_diagnostic_monitor", None)
-        layer = self.eplb_adaptor.moe_layers[self.layer_id] if monitor is not None else None
-        # Host req.wait may enqueue a device dependency instead of blocking.
-        # Keep its CPU duration separate from the main-stream device interval.
+        # Waiting for send/recv tasks finish
         if reqs:
-            with (
-                record_function_or_nullcontext("EPLB weight D2D wait"),
-                monitor.cpu_span("transfer_wait", layer) if monitor is not None else nullcontext(),
-                monitor.device_span("transfer_wait", layer) if monitor is not None else nullcontext(),
-            ):
+            with record_function_or_nullcontext("EPLB weight D2D wait"):
                 for req in reqs:
                     req.wait()
 
         if self.comm_op_list is not None:
             self.comm_op_list = None
 
-        with (
-            monitor.cpu_span("commit_apply", layer) if monitor is not None else nullcontext(),
-            monitor.device_span("commit_apply", layer) if monitor is not None else nullcontext(),
-        ):
-            self.eplb_adaptor.do_update_expert_map(self.layer_id, self.updated_expert_map)
-            self.eplb_adaptor.do_update_log2phy_map(self.layer_id, self.updated_log2phy_map)
-            buffer_tensor_id = 0
-            for recv_expert_info in self.recv_expert_list:
-                local_expert_to_replace, buffer_tensor_id = recv_expert_info
-                self.eplb_adaptor.do_update_expert_weight(self.layer_id, local_expert_to_replace, buffer_tensor_id)
-        if monitor is not None:
-            monitor.committed(layer)
+        # update expert_map
+        self.eplb_adaptor.do_update_expert_map(self.layer_id, self.updated_expert_map)
+
+        # update log2phy_map
+        self.eplb_adaptor.do_update_log2phy_map(self.layer_id, self.updated_log2phy_map)
+
+        # update expert weight
+        buffer_tensor_id = 0
+        for recv_expert_info in self.recv_expert_list:
+            local_expert_to_replace, buffer_tensor_id = recv_expert_info
+            self.eplb_adaptor.do_update_expert_weight(self.layer_id, local_expert_to_replace, buffer_tensor_id)
 
         logger.debug(
             "[eplb/d2d_loader] Layer %s D2D transfer completed, updated_experts=%s",

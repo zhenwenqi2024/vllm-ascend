@@ -486,9 +486,10 @@ class NPUModelRunner(GPUModelRunner):
         query_start_loc = query_start_loc[: num_reqs_padded + 1]
         self.eplb.set_batch_phase(batch_req_state.has_prefill)
         if self.ascend_config.eplb_diagnostics.mode != "off":
+            prefill_mask = batch_req_state.is_prefilling_np
             annotate_batch(
                 self,
-                phase="prefill_or_mixed" if batch_req_state.has_prefill else "decode",
+                phase="prefill" if prefill_mask.all() else ("mixed" if prefill_mask.any() else "decode"),
                 padded_tokens=num_tokens_after_padding,
                 graph_mode=str(batch_desc.cg_mode),
             )

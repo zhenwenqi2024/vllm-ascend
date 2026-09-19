@@ -1,151 +1,243 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Live EPLB diagnostics. Initial and current placements are both real layouts."""
+"""Bounded, per-layer workload logging across one EP group."""
 
 import functools
 import logging
 from collections import Counter
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
-from vllm_ascend.eplb.diagnostics.overhead import LiveEplbOverhead
+from vllm_ascend.eplb.diagnostics.decision import EnablementDecision, make_planner
 from vllm_ascend.eplb.diagnostics.probe import ExpertLoadProbe
 
-_LOGGER = logging.getLogger("vllm.eplb.diagnostics")
+_LOG_NAME = "vllm.eplb.diagnostics"
 
 
-def gather(group, value):
-    rows = [None] * len(group.ranks)
-    with torch.inference_mode(False):
-        torch.distributed.all_gather_object(rows, value, group=group.cpu_group)
-    return rows
-
-
-def local_node_id():
-    """Linux boot identity is shared by containers on one host; never log it."""
-    try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
-    except OSError:
-        return None
-
-
-def logical_to_physical(layer):
-    if getattr(layer, "_use_v2_model_runner", False):
-        state = getattr(getattr(layer, "router", None), "eplb_state", None)
-        mapping = getattr(state, "logical_to_physical_map", None)
-        return None if mapping is None else mapping[:, 0]
-    return getattr(layer, "log2phy", None)
-
-
-def placement(mapping, ranks):
-    """Zero-redundancy permutation, ordered by physical rank and local slot."""
-    if not mapping or len(mapping) % ranks or sorted(mapping) != list(range(len(mapping))):
-        raise ValueError("EPLB benefit diagnostics requires a complete nonredundant expert permutation")
-    inverse = sorted(range(len(mapping)), key=mapping.__getitem__)
-    slots = len(mapping) // ranks
-    return tuple(tuple(inverse[start : start + slots]) for start in range(0, len(mapping), slots))
-
-
-def logical_work(rows, name, calls):
-    """Validate logical and owner counters even when placement changes."""
-    if not rows or calls < 1:
-        return None, "empty_window"
-    if len({row["step"] for row in rows}) != 1 or len({row["rank"] for row in rows}) != len(rows):
-        return None, "unaligned_ranks"
-    layers = [row["layers"].get(name) for row in rows]
-    if any(layer is None for layer in layers):
-        return None, "missing_layer"
-    try:
-        for layer in layers:
-            placement(layer["initial"], len(rows))
-            placement(layer["current"], len(rows))
-    except ValueError:
-        return None, "unsupported_placement"
-    experts = len(layers[0]["initial"])
-    histories = [layer["history"] for layer in layers]
-    if any(
-        len(history) != calls
-        or any(len(step) != experts + 2 or step[-2] != 1 or step[-1] or min(step) < 0 for step in history)
-        for history in histories
-    ):
-        return None, "invalid_route_history"
+def layer_work(rows, window_size):
+    """Validate source conservation and map valid routes to actual expert owners."""
+    if len({r["step"] for r in rows}) != 1:
+        return None, "unaligned_windows"
+    names = [x["name"] for x in rows[0]["layers"]]
+    if len(names) != 1 or any([x["name"] for x in r["layers"]] != names for r in rows):
+        return None, "incomplete_layer_set"
+    ranks = [r["rank"] for r in rows]
+    if len(set(ranks)) != len(ranks):
+        return None, "duplicate_rank"
     sources = {}
-    for index, row in enumerate(rows):
-        sources.setdefault(tuple(row["tp_ranks"]), []).append(index)
-    top_k = layers[0]["top_k"]
-    if top_k < 1 or any(layer["top_k"] != top_k for layer in layers):
-        return None, "top_k_mismatch"
-    for ranks, members in sources.items():
-        expected = rows[members[0]]["token_steps"]
-        if set(ranks) != {rows[i]["rank"] for i in members} or len(expected) != calls:
+    for row in rows:
+        sources.setdefault(tuple(row["tp_ranks"]), []).append(row)
+    for tp, members in sources.items():
+        if set(tp) != {r["rank"] for r in members} or len({r["tokens"] for r in members}) != 1:
             return None, "source_tp_mismatch"
-        if any(rows[i]["token_steps"] != expected for i in members):
-            return None, "source_token_mismatch"
-        if any(
-            count < 0 or sum(sum(histories[i][step][:-2]) for i in members) != count * top_k
-            for step, count in enumerate(expected)
-        ):
-            return None, "source_conservation_failure"
-    loads = [
-        [sum(history[step][expert] for history in histories) for expert in range(experts)] for step in range(calls)
-    ]
-    if not any(sum(step) for step in loads):
+    rank_work, hot = [0] * len(rows), {}
+    for index, name in enumerate(names):
+        layers = [r["layers"][index] for r in rows]
+        n = len(layers[0]["counts"]) - 2
+        top_k = layers[0]["top_k"]
+        if n <= 0 or top_k <= 0 or any(len(x["counts"]) != n + 2 or x["top_k"] != top_k for x in layers):
+            return None, "expert_space_mismatch"
+        if any(x["counts"][-2] != window_size or x["counts"][-1] or min(x["counts"]) < 0 for x in layers):
+            return None, "unsupported_routing_or_call_count"
+        for members in sources.values():
+            actual = sum(sum(r["layers"][index]["counts"][:-2]) for r in members)
+            if actual != members[0]["tokens"] * top_k:
+                return None, "source_conservation_failure"
+        owners = {}
+        for owner, layer in enumerate(layers):
+            mapping = layer["mapping"]
+            local_slots = [slot for slot in mapping if slot >= 0]
+            if (
+                len(mapping) != n
+                or len(local_slots) != layer["local_experts"]
+                or set(local_slots) != set(range(layer["local_experts"]))
+            ):
+                return None, "invalid_expert_mapping"
+            for expert, slot in enumerate(mapping):
+                if slot >= 0:
+                    if expert in owners:
+                        return None, "duplicate_expert_owner"
+                    owners[expert] = owner
+        if len(owners) != n:
+            return None, "missing_expert_owner"
+        loads = [sum(x["counts"][e] for x in layers) for e in range(n)]
+        for expert, count in enumerate(loads):
+            rank_work[owners[expert]] += count
+        mean = sum(loads) / n
+        cutoff = sorted(loads, reverse=True)[min(4, n) - 1]
+        hot.update(
+            {(name, e): count for e, count in enumerate(loads) if count > 0 and count >= max(cutoff, 1.2 * mean)}
+        )
+    total = sum(rank_work)
+    if not total:
         return None, "no_real_work"
-    return loads, None
-
-
-def validate_window(rows, name, calls, loads=None):
-    """Only stable, aligned placement generations may become timing evidence."""
-    if loads is None:
-        loads, reason = logical_work(rows, name, calls)
-        if reason:
-            return None, reason
-    layers = [row["layers"][name] for row in rows]
-    if any(layer["generation_start"] != layer["generation_end"] for layer in layers):
-        return None, "placement_changed_during_window"
-    if len({layer["generation_end"] for layer in layers}) != 1:
-        return None, "unaligned_placement_generations"
-    if any(layer["initial"] != layers[0]["initial"] or layer["current"] != layers[0]["current"] for layer in layers):
-        return None, "placement_mismatch"
-    try:
-        old = placement(layers[0]["initial"], len(rows))
-        current = placement(layers[0]["current"], len(rows))
-    except ValueError:
-        return None, "unsupported_placement"
+    history = None
+    if any("history" in layer for layer in layers):
+        histories = [layer.get("history", []) for layer in layers]
+        if any(
+            len(h) != window_size
+            or any(len(step) != n + 2 or step[-2] != 1 or step[-1] or min(step) < 0 for step in h)
+            or [sum(step[e] for step in h) for e in range(n + 2)] != layer["counts"]
+            for h, layer in zip(histories, layers)
+        ):
+            return None, "invalid_step_history"
+        for members in sources.values():
+            expected = members[0].get("token_steps", [])
+            if len(expected) != window_size or any(row.get("token_steps") != expected for row in members):
+                return None, "unaligned_step_tokens"
+            if any(
+                tokens < 0 or sum(sum(row["layers"][0]["history"][step][:-2]) for row in members) != tokens * top_k
+                for step, tokens in enumerate(expected)
+            ):
+                return None, "step_source_conservation_failure"
+        history = [[sum(h[step][e] for h in histories) for e in range(n)] for step in range(window_size)]
     return {
-        "initial_placement": old,
-        "current_placement": current,
-        "loads": loads,
-        "metadata": [row["metadata"] for row in rows],
-        "comm_codes": [layer["comm_codes"] for layer in layers],
-        "generation": layers[0]["generation_end"],
-        "window_end_step": rows[0]["step"],
+        "history": history,
+        "rank_work": rank_work,
+        "total": total,
+        "skew": max(rank_work) * len(rows) / total,
+        "hot": hot,
+        "expert_work": [{e: loads[e] for e in range(n) if owners[e] == rank} for rank in range(len(rows))],
     }, None
 
 
-class DiagnosticsRecorder:
-    def __init__(self, config, layers, group, tp_ranks, stage, source_tokens):
-        self.config, self.layers, self.group = config, layers, group
-        self.tp_ranks, self.stage, self.source_tokens = list(tp_ranks), stage, source_tokens
-        self.step = self.observed_steps = self.window_calls = 0
-        self.collecting = self.real = self.finished = False
-        self.metadata, self.token_steps, self.generations = [], [], {}
-        self.initial = {name: logical_to_physical(layer).cpu().tolist() for name, layer in layers}
-        for mapping in self.initial.values():
-            placement(mapping, len(group.ranks))
-        self.jobs, self.expert_totals, self.invalid_windows = {}, {}, Counter()
-        self.logical_totals = {}
-        self.history_slot = layers[0][1].eplb_diagnostic_probe.history_slot
-        self.monitor = LiveEplbOverhead(on_commit=self.committed)
-        self.costs = None
+class LayerLogger:
+    """Log cumulative work and a bounded consecutive-window enablement decision."""
 
-    def committed(self, layer):
-        layer = getattr(layer, "routed_experts", layer)
-        probe = getattr(layer, "eplb_diagnostic_probe", None)
-        if probe is not None:
-            probe.generation += 1
+    def __init__(self, ranks, stage, layer, planner=None, policy="unavailable"):
+        self.ranks, self.stage, self.layer = ranks, stage, layer
+        self.valid_windows = self.invalid_windows = self.observed_calls = 0
+        self.expert_totals = [Counter() for _ in ranks]
+        self.decision = EnablementDecision(planner, policy)
+        self.hint = "insufficient_evidence"
+
+    def log(self, rows, window, window_size, complete=True):
+        result, reason = layer_work(rows, window_size)
+        logger = logging.getLogger(_LOG_NAME)
+        if reason:
+            self.invalid_windows += 1
+            self.decision.reset(reason)
+            self.hint = "insufficient_evidence"
+            logger.info(
+                "[EPLB diagnostic] stage=%s layer=%s window=%s insufficient_evidence=%s",
+                self.stage,
+                self.layer,
+                window,
+                reason,
+            )
+            return
+        self.observed_calls += window_size
+        self.valid_windows += int(complete)
+        self.decision.observe(result, rows, window, complete)
+        self.hint = self.decision.verdict
+        for rank, counts, total, work in zip(
+            self.ranks, result["expert_work"], self.expert_totals, result["rank_work"]
+        ):
+            total.update(counts)
+            logger.info(
+                "[EPLB experts] stage=%s layer=%s rank=%s window=%s window_work=%s "
+                "cumulative_work=%s window_expert_work=%s expert_work=%s",
+                self.stage,
+                self.layer,
+                rank,
+                window,
+                work,
+                sum(total.values()),
+                counts,
+                [f"{e}:{count}" for e, count in sorted(total.items())],
+            )
+        cumulative = [sum(counts.values()) for counts in self.expert_totals]
+        peak = max(cumulative)
+        logger.info(
+            "[EPLB diagnostic] stage=%s layer=%s window=%s calls=%s ranks=%s "
+            "valid_assignments=%s rank_work=%s window_rank_max_mean=%.3f "
+            "cumulative_rank_max_mean=%.3f busiest_rank=%s hot_experts=%s "
+            "evidence=%s hint=%s phases=%s timing_evidence=not_collected net_benefit=unknown",
+            self.stage,
+            self.layer,
+            window,
+            window_size,
+            self.ranks,
+            result["total"],
+            result["rank_work"],
+            result["skew"],
+            peak * len(self.ranks) / sum(cumulative),
+            self.ranks[cumulative.index(peak)],
+            sorted(result["hot"]),
+            self.decision.report(),
+            self.hint,
+            sorted({phase for row in rows for phase, _ in row["phases"]}),
+        )
+
+
+class WorkloadLogger:
+    """Print each rank/layer, then an overall assessment based on layer evidence."""
+
+    def __init__(self, ranks, stage, planner=None, policy="unavailable"):
+        self.ranks, self.stage = ranks, stage
+        self.layers = {}
+        self.planner, self.policy = planner, policy
+
+    def log(self, rows, window, window_size, complete=True):
+        names = sorted({layer["name"] for row in rows for layer in row["layers"]} | self.layers.keys())
+        for name in names:
+            if name not in self.layers:
+                self.layers[name] = LayerLogger(self.ranks, self.stage, name, self.planner, self.policy)
+            scoped = [dict(row, layers=[layer for layer in row["layers"] if layer["name"] == name]) for row in rows]
+            self.layers[name].log(scoped, window, window_size, complete)
+        self.summarize(window)
+
+    def summarize(self, window, final=False):
+        names = list(self.layers)
+        counts = Counter(layer.hint for layer in self.layers.values())
+        candidates = [name for name, layer in self.layers.items() if layer.hint == "recommend_trial"]
+        conclusion = "insufficient_evidence"
+        if candidates:
+            conclusion = "recommend_trial"
+        elif counts["not_recommended_now"] == len(names) and names:
+            conclusion = "not_recommended_now"
+        logging.getLogger(_LOG_NAME).info(
+            "[EPLB summary] stage=%s window=%s final=%s ranks=%s layers=%s layer_assessments=%s candidate_layers=%s "
+            "invalid_layer_windows=%s conclusion=%s scope=workload_screening "
+            "timing_evidence=not_collected net_benefit=unknown speedup=not_estimated",
+            self.stage,
+            window,
+            final,
+            self.ranks,
+            len(names),
+            dict(counts),
+            candidates,
+            sum(layer.invalid_windows for layer in self.layers.values()),
+            conclusion,
+        )
+
+
+class DiagnosticsRecorder:
+    def __init__(self, config, layers, group, tp_ranks, stage, source_tokens, planner=None, policy="unavailable"):
+        self.config, self.layers, self.group = config, layers, group
+        self.tp_ranks, self.source_tokens = list(tp_ranks), source_tokens
+        self.summary = WorkloadLogger(list(group.ranks), stage, planner, policy)
+        self.step = self.tokens = 0
+        self.phases = set()
+        self.token_steps = []
+        self.history_slots = list(
+            {
+                id(layer.eplb_diagnostic_probe.history_slot): layer.eplb_diagnostic_probe.history_slot
+                for _, layer in layers
+                if layer.eplb_diagnostic_probe.history_slot is not None
+            }.values()
+        )
+        self.collecting = self.real = self.finished = False
+        self.layout = [
+            {
+                "name": name,
+                "mapping": layer.ascend_expert_map.cpu().tolist(),
+                "top_k": layer.moe_config.experts_per_token,
+                "local_experts": layer.local_num_experts,
+            }
+            for name, layer in layers
+        ]
 
     def begin(self, tokens, dummy=False):
         self.step += 1
@@ -153,271 +245,118 @@ class DiagnosticsRecorder:
         self.collecting = (
             not self.finished
             and offset >= 0
-            and (not self.config.max_windows or offset < self.config.max_windows * self.config.window_size)
+            and (self.config.max_windows == 0 or offset < self.config.window_size * self.config.max_windows)
         )
-        self.real = not dummy and tokens > 0
-        self.monitor.observing = self.collecting
-        self.monitor.active = self.collecting and self.real
-        self.monitor.pending_real = self.monitor.active
-        self.source_tokens.fill_(tokens if self.monitor.active else 0)
-        if not self.collecting:
-            return
-        if not self.window_calls:
-            self.metadata, self.token_steps = [], []
-            for name, layer in self.layers:
-                probe = layer.eplb_diagnostic_probe
-                probe.history.zero_()
-                probe.comm_history.zero_()
-                probe.owner_totals.zero_()
-                self.generations[name] = probe.generation
-        self.history_slot.fill_(self.window_calls)
-        self.window_calls += 1
-        self.observed_steps += int(self.real)
-        self.metadata.append(None)
-        self.token_steps.append(tokens if self.real else 0)
+        self.real = not dummy
+        if self.collecting and offset % self.config.window_size == 0:
+            self.tokens = 0
+            self.phases.clear()
+            self.token_steps = []
+            for _, layer in self.layers:
+                layer.eplb_diagnostic_probe.totals.zero_()
+                if layer.eplb_diagnostic_probe.history is not None:
+                    layer.eplb_diagnostic_probe.history.zero_()
+        self.source_tokens.fill_(tokens if self.collecting and self.real else 0)
+        if self.collecting and self.real:
+            self.tokens += tokens
+        if self.collecting:
+            self.token_steps.append(tokens if self.real else 0)
+            for slot in self.history_slots:
+                slot.fill_(offset % self.config.window_size)
 
     def end(self):
-        self.monitor.active = False
-        if self.collecting and self.window_calls == self.config.window_size:
-            self._collect()
-        self.monitor.drain()
+        if not self.collecting or (self.step - self.config.warmup_steps) % self.config.window_size:
+            return
+        self._collect(self.config.window_size)
 
-    def _collect(self):
-        calls = self.window_calls
+    def _collect(self, calls, complete=True):
+        # Deliberately synchronous only once per window. All group members,
+        # including idle DP participants, must join in model-collective order.
+        # Dummy requests contribute no routes/tokens or timing; their participation
+        # is control bookkeeping. No world/PP collective is added here.
         probes = [layer.eplb_diagnostic_probe for _, layer in self.layers]
-        flat = torch.cat([probe.history[:calls].flatten() for probe in probes]).cpu()
-        histories = [
-            part.reshape(calls, -1).tolist() for part in flat.split([calls * p.history.shape[1] for p in probes])
-        ]
-        comms = torch.stack([probe.comm_history[:calls] for probe in probes]).cpu().tolist()
-        owner_flat = torch.cat([probe.owner_totals.flatten() for probe in probes]).cpu()
-        ownership = [
-            part.reshape(len(self.group.ranks), -1).tolist()
-            for part in owner_flat.split([probe.owner_totals.numel() for probe in probes])
-        ]
-        mappings = torch.cat([logical_to_physical(layer) for _, layer in self.layers]).cpu()
-        current = [part.tolist() for part in mappings.split([probe.num_experts for probe in probes])]
+        counters = [probe.history[:calls] if probe.history is not None else probe.totals for probe in probes]
+        snapshots = torch.cat([c.flatten() for c in counters]).cpu().split([counter.numel() for counter in counters])
+        layer_rows = []
+        for layout, snapshot, probe in zip(self.layout, snapshots, probes):
+            if probe.history is None:
+                layer_rows.append(dict(layout, counts=snapshot.tolist()))
+            else:
+                history = snapshot.reshape(calls, -1)
+                layer_rows.append(dict(layout, counts=history.sum(dim=0).tolist(), history=history.tolist()))
         row = {
             "step": self.step,
             "rank": self.group.ranks[self.group.rank_in_group],
             "tp_ranks": self.tp_ranks,
+            "tokens": self.tokens,
             "token_steps": self.token_steps,
-            "metadata": self.metadata,
-            "layers": {
-                name: {
-                    "history": history,
-                    "comm_codes": comm,
-                    "owner_counts": owned,
-                    "initial": self.initial[name],
-                    "current": mapping,
-                    "generation_start": self.generations[name],
-                    "generation_end": layer.eplb_diagnostic_probe.generation,
-                    "top_k": layer.moe_config.experts_per_token,
-                }
-                for (name, layer), history, comm, owned, mapping in zip(
-                    self.layers, histories, comms, ownership, current
-                )
-            },
+            "phases": sorted(self.phases),
+            "layers": layer_rows,
         }
-        rows = gather(self.group, row)
+        rows = [None] * len(self.group.ranks)
+        # Gloo writes its temporary receive tensors from a background thread.
+        with torch.inference_mode(False):
+            torch.distributed.all_gather_object(rows, row, group=self.group.cpu_group)
         if self.group.rank_in_group == 0:
-            for name, _ in self.layers:
-                self._log_layer(rows, name, calls)
-        self.window_calls = 0
-
-    def _log_layer(self, rows, name, calls):
-        loads, reason = logical_work(rows, name, calls)
-        if loads is not None:
-            reason = self._log_work(rows, name, loads)
-        job = None
-        if reason is None:
-            job, reason = validate_window(rows, name, calls, loads)
-        if reason:
-            self.jobs.pop(name, None)
-            self.invalid_windows[name] += 1
-            _LOGGER.info("[EPLB diagnostic] stage=%s layer=%s reason=%s", self.stage, name, reason)
-            return
-        self.jobs[name] = job
-        initial = job["initial_placement"]
-        current = job["current_placement"]
-        rank_work = [sum(sum(step[e] for e in rank) for step in loads) for rank in current]
-        old_peak = sum(max(sum(step[e] for e in rank) for rank in initial) for step in job["loads"])
-        new_peak = sum(max(sum(step[e] for e in rank) for rank in current) for step in job["loads"])
-        _LOGGER.info(
-            "[EPLB adjustment] stage=%s layer=%s generation=%s calls=%s reference=initial_live_placement "
-            "rank_max_mean=%.3f initial_step_peak_work=%s current_step_peak_work=%s "
-            "moved_experts=%s timing=requires_calibration",
-            self.stage,
-            name,
-            job["generation"],
-            calls,
-            max(rank_work) * len(rows) / sum(rank_work),
-            old_peak,
-            new_peak,
-            sum(len(set(new) - set(old)) for old, new in zip(initial, current)),
-        )
-
-    def _log_work(self, rows, name, loads):
-        experts = len(loads[0])
-        counts = [row["layers"][name]["owner_counts"] for row in rows]
-        if any(
-            len(rank) != len(rows) or any(len(owner) != experts or min(owner) < 0 for owner in rank) for rank in counts
-        ):
-            return "invalid_owner_counts"
-        owned = [[sum(rank[owner][e] for rank in counts) for e in range(experts)] for owner in range(len(rows))]
-        totals = [sum(step[e] for step in loads) for e in range(experts)]
-        if any(sum(owner[e] for owner in owned) != totals[e] for e in range(experts)):
-            return "owner_conservation_failure"
-        self.logical_totals.setdefault(name, Counter()).update(dict(enumerate(totals)))
-        cumulative = self.expert_totals.setdefault(name, [Counter() for _ in rows])
-        current = placement(rows[0]["layers"][name]["current"], len(rows))
-        for rank, work, history, hosted in zip(self.group.ranks, owned, cumulative, current):
-            history.update(dict(enumerate(work)))
-            visible = set(hosted) | {expert for expert, count in history.items() if count}
-            _LOGGER.info(
-                "[EPLB experts] stage=%s layer=%s rank=%s window_work=%s "
-                "expert_work=%s cumulative_valid_work=%s cumulative_expert_work=%s",
-                self.stage,
-                name,
-                rank,
-                sum(work),
-                {expert: work[expert] for expert in sorted(visible)},
-                sum(history.values()),
-                {expert: history[expert] for expert in sorted(visible)},
+            self.summary.log(
+                rows, (self.step - self.config.warmup_steps - 1) // self.config.window_size + 1, calls, complete
             )
-        return None
 
     @torch.inference_mode()
     def finish(self):
+        """Called collectively after generation, never from asynchronous teardown."""
         if self.finished:
             return
-        self.monitor.active = False
-        self.monitor.pending_real = False
-        self.monitor.observing = False
-        self.source_tokens.zero_()
-        if self.window_calls:
-            self._collect()
-        self.costs = gather(self.group, self.monitor.drain(synchronize=True))
+        pending = (self.step - self.config.warmup_steps) % self.config.window_size
+        if self.collecting and pending:
+            self._collect(pending, complete=False)
         self.finished = True
+        self.source_tokens.zero_()
         if self.group.rank_in_group == 0:
-            for rank, costs in zip(self.group.ranks, self.costs):
-                _LOGGER.info(
-                    "[EPLB migration] stage=%s rank=%s records=%s "
-                    "scope=observed_submissions accounting=send_recv_describe_same_payload",
-                    self.stage,
-                    rank,
-                    costs["transfers"],
-                )
-            _LOGGER.info(
-                "[EPLB overhead] stage=%s observed_real_steps=%s rank_records=%s "
-                "accounting=overlapping_components_do_not_sum",
-                self.stage,
-                self.observed_steps,
-                self.costs,
-            )
-            _LOGGER.info(
-                "[EPLB summary] stage=%s layers=%s comparable_layers=%s invalid_windows=%s "
-                "estimated_net_saving_ms=unknown reason=calibration_required",
-                self.stage,
-                len(self.layers),
-                len(self.jobs),
-                dict(self.invalid_windows),
+            self.summary.summarize(
+                max(0, (self.step - self.config.warmup_steps - 1) // self.config.window_size + 1), final=True
             )
 
 
-def attach_monitor(runner, monitor):
-    updater = getattr(runner, "eplb_updator", None)
-    if updater is not None:
-        updater._eplb_diagnostic_monitor = monitor
-        updater.eplb_loader._eplb_diagnostic_monitor = monitor
-    state = getattr(getattr(runner, "eplb", None), "state", None)
-    if state is not None:
-        state._eplb_diagnostic_monitor = monitor
-        monitor.wrap_policy(state.policy)
-        for model_state in state.model_states.values():
-            model_state._eplb_diagnostic_monitor = monitor
-            model_state.communicator._eplb_diagnostic_monitor = monitor
-            model_state.communicator._eplb_diagnostic_layers = model_state.model.moe_layers
-
-
-def diagnostics_quiescent(runner, *, calibration=False):
-    """Collectively defer RPCs while model execution or weight updates are pending."""
+def annotate_batch(runner, **metadata):
     recorder = getattr(runner, "_eplb_diagnostics_recorder", None)
-    if recorder is None:
-        return False
-    state = getattr(getattr(runner, "eplb", None), "state", None)
-    busy = bool(
-        getattr(runner, "_eplb_diagnostics_in_execution", False)
-        or getattr(runner, "execute_model_state", None) is not None
-        or (state is not None and recorder.monitor.pending_real)
-    )
-    if calibration:
-        if state is not None:
-            busy |= any(model.rebalanced or model.pending_result is not None for model in state.model_states.values())
-        updater = getattr(runner, "eplb_updator", None)
-        if updater is not None:
-            busy |= (
-                updater.eplb_loader.state.name != "WAITING"
-                or updater.cur_iterations >= updater.expert_heat_collection_interval
-            )
-    peers = gather(recorder.group, busy)
-    if any(peers):
-        if recorder.group.rank_in_group == 0:
-            _LOGGER.info(
-                "[EPLB diagnostic] reason=execution_or_update_pending busy_ranks=%s retry_after_completed_cycle=True",
-                [rank for rank, pending in zip(recorder.group.ranks, peers) if pending],
-            )
-        return False
-    return True
+    if recorder is not None and recorder.collecting and recorder.real:
+        recorder.phases.add((metadata["phase"], metadata["graph_mode"]))
 
 
 @torch.inference_mode()
 def initialize_diagnostics(runner):
-    config = runner.ascend_config.eplb_diagnostics
-    if config.mode == "off":
+    if runner.ascend_config.eplb_diagnostics.mode == "off":
         return
     parallel = runner.vllm_config.parallel_config
-    enabled = (
-        parallel.enable_eplb
-        if runner.vllm_config.use_v2_model_runner
-        else runner.ascend_config.eplb_config.dynamic_eplb
-    )
-    if not parallel.enable_expert_parallel or not enabled:
-        raise ValueError("EPLB benefit diagnostics requires EP and EPLB enabled")
+    if not parallel.enable_expert_parallel or parallel.enable_eplb or runner.ascend_config.eplb_config.dynamic_eplb:
+        raise ValueError("EPLB diagnostics requires EP enabled and EPLB disabled.")
+    config = runner.vllm_config
     if getattr(parallel, "enable_elastic_ep", False):
-        raise ValueError("EPLB benefit diagnostics requires a fixed EP group")
-    vconfig = runner.vllm_config
+        raise ValueError("EPLB diagnostics requires fixed EP membership.")
     capacity = max(
-        vconfig.scheduler_config.max_num_batched_tokens, max(vconfig.compilation_config.cudagraph_capture_sizes or [0])
+        config.scheduler_config.max_num_batched_tokens, max(config.compilation_config.cudagraph_capture_sizes or [0])
     )
-    source = torch.zeros((), dtype=torch.int64, device=runner.device)
+    source_tokens = torch.zeros((), dtype=torch.int64, device=runner.device)
     positions = torch.arange(capacity, device=runner.device)
     history_slot = torch.zeros(1, dtype=torch.int64, device=runner.device)
     for layer in runner.model.modules():
         probe = getattr(layer, "eplb_diagnostic_probe", None)
-        if not isinstance(probe, ExpertLoadProbe):
-            continue
-        mapping = logical_to_physical(layer)
-        if mapping is None or layer.moe_config.num_experts != layer.moe_config.num_logical_experts:
-            raise ValueError("EPLB benefit diagnostics requires explicit mappings and zero redundant experts")
-        if not layer._diagnostic_route_ownership_supported or layer.mix_placement:
-            raise ValueError("EPLB benefit diagnostics does not support context parallel or mixed expert placement")
-        probe.eplb_enabled = True
-        probe.logical_to_physical = mapping
-        ep_size = layer.moe_config.ep_size
-        probe.owner_totals = torch.zeros((ep_size, probe.num_experts), dtype=torch.int64, device=runner.device)
-        probe.source_token_count, probe.source_positions = source, positions
-        probe.history = torch.zeros(
-            (config.window_size, probe.num_experts + 2), dtype=torch.int64, device=runner.device
-        )
-        probe.comm_history = torch.zeros(config.window_size, dtype=torch.int64, device=runner.device)
-        probe.history_slot = history_slot
-    runner._eplb_diagnostics_source_tokens = source
+        if isinstance(probe, ExpertLoadProbe):
+            probe.source_token_count, probe.source_positions = source_tokens, positions
+            probe.history = torch.zeros(
+                (runner.ascend_config.eplb_diagnostics.window_size, probe.num_experts + 2),
+                dtype=torch.int64,
+                device=runner.device,
+            )
+            probe.history_slot = history_slot
+    runner._eplb_diagnostics_source_tokens = source_tokens
 
 
 def start_diagnostics(runner):
     if runner.ascend_config.eplb_diagnostics.mode == "off":
         return
+    # Import after worker initialization; portable tests do not initialize vLLM.
     from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 
     from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -427,31 +366,29 @@ def start_diagnostics(runner):
         for name, layer in runner.model.named_modules()
         if isinstance(getattr(layer, "eplb_diagnostic_probe", None), ExpertLoadProbe)
     ]
-    if not layers:
-        raise ValueError("No supported MoE layers for EPLB benefit diagnostics")
-    recorder = DiagnosticsRecorder(
+    if not layers or any(
+        layer.ascend_expert_map is None or layer.moe_config.num_experts != layer.moe_config.num_logical_experts
+        for _, layer in layers
+    ):
+        raise ValueError("EPLB diagnostics requires explicit expert ownership without redundant experts.")
+    group = get_mc2_group()
+    planner, policy = (None, "non_reporting_rank")
+    if group.rank_in_group == 0:
+        planner, policy = make_planner(runner, len(group.ranks))
+    runner._eplb_diagnostics_recorder = DiagnosticsRecorder(
         runner.ascend_config.eplb_diagnostics,
         layers,
         get_mc2_group(),
         get_tp_group().ranks,
         get_pp_group().rank_in_group,
         runner._eplb_diagnostics_source_tokens,
+        planner,
+        policy,
     )
-    runner._eplb_diagnostics_recorder = recorder
-    node = local_node_id()
-    nodes = gather(recorder.group, node)
-    recorder.monitor.peer_locality = {
-        rank: "unknown" if node is None or peer is None else "same_node" if node == peer else "cross_node"
-        for rank, peer in zip(recorder.group.ranks, nodes)
-    }
-    attach_monitor(runner, recorder.monitor)
-    _LOGGER.info("EPLB benefit diagnostics enabled; compare actual initial/current layouts; exclude dummy and padding")
-
-
-def annotate_batch(runner, **metadata):
-    recorder = getattr(runner, "_eplb_diagnostics_recorder", None)
-    if recorder is not None and recorder.collecting and recorder.real and recorder.metadata:
-        recorder.metadata[-1] = metadata
+    logging.getLogger(_LOG_NAME).info(
+        "EPLB diagnostics: per-layer valid MoE assignments across each EP group/stage; synchronous window summaries; "
+        "dummy/padding excluded. recommend_trial is workload evidence, not a measured speedup."
+    )
 
 
 def record_diagnostics(func):
@@ -474,11 +411,7 @@ def record_diagnostics(func):
             result = func(runner, scheduler_output, *args, **kwargs)
             recorder.end()
             return result
-        except BaseException:
-            recorder.monitor.pending_real = False
-            raise
         finally:
-            recorder.monitor.active = False
             runner._eplb_diagnostics_in_execution = False
 
     return wrapped
@@ -490,4 +423,5 @@ def _record_dummy_batch(runner, scheduler_output, num_tokens, *, dummy_run):
 
 
 def run_dummy_batch(runner, num_tokens):
-    return _record_dummy_batch(runner, SimpleNamespace(total_num_scheduled_tokens=0), num_tokens, dummy_run=True)
+    metadata = SimpleNamespace(total_num_scheduled_tokens=0)
+    return _record_dummy_batch(runner, metadata, num_tokens, dummy_run=True)
