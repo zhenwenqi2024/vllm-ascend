@@ -1,6 +1,7 @@
 import unittest
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -22,6 +23,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_ascend.ascend_config import FinegrainedTPConfig
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
@@ -39,6 +41,7 @@ class TestDPPaddingPolicy(unittest.TestCase):
         runner.dp_size = 2
         runner.dp_rank = dp_rank
         runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(enable_return_routed_experts=False))
+        runner.ascend_config = SimpleNamespace(finegrained_tp_config=FinegrainedTPConfig())
         return runner
 
     @staticmethod
@@ -117,6 +120,24 @@ class TestDPPaddingPolicy(unittest.TestCase):
                     self.assertEqual(maximum, 32)
                     self.assertEqual(synced_mode, graph_mode)
                     self.assertEqual(across_dp.tolist(), [32, 32] if should_pad else [8, 32])
+
+    def test_each_finegrained_tp_field_requires_uniform_inputs(self):
+        for field in fields(FinegrainedTPConfig):
+            for size in (0, 1, 2):
+                for comm_method in (MoECommType.ALLTOALL, MoECommType.FUSED_MC2):
+                    for tokens in ((0, 31), (8, 31)):
+                        for dp_rank in range(2):
+                            with self.subTest(
+                                field=field.name, size=size, comm_method=comm_method, tokens=tokens, dp_rank=dp_rank
+                            ):
+                                runner = self._make_runner(dp_rank)
+                                runner.ascend_config.finegrained_tp_config = FinegrainedTPConfig(**{field.name: size})
+                                maximum, across_dp, mode = self._run_sync(
+                                    runner, tokens=tokens, comm_method=comm_method
+                                )
+                                self.assertEqual(maximum, 31)
+                                self.assertEqual(mode, CUDAGraphMode.NONE)
+                                self.assertEqual(across_dp.tolist(), [31, 31] if size > 1 else list(tokens))
 
     def test_routing_capture_keeps_uniform_eager_inputs(self):
         for dp_rank in range(2):

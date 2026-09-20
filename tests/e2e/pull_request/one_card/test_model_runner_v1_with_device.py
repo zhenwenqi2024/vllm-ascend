@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 import vllm_ascend.compilation.acl_graph as acl_graph
+from vllm_ascend.ascend_config import FinegrainedTPConfig
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -451,6 +452,7 @@ def test_stateful_handoff_preserves_decode_graph(
         lora_id_to_lora_request={},
     )
     runner.cudagraph_dispatcher = CudagraphDispatcher(runner.vllm_config)
+    runner.ascend_config = SimpleNamespace(finegrained_tp_config=FinegrainedTPConfig())
     runner.cudagraph_dispatcher.initialize_cudagraph_keys(
         CUDAGraphMode.FULL_DECODE_ONLY, runner.uniform_decode_query_len
     )

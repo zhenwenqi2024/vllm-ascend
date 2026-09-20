@@ -752,10 +752,22 @@ class NPUModelRunner(GPUModelRunner):
         comm_method = select_moe_comm_method(max_tokens_across_dp, self.vllm_config)
         needs_uniform_moe_input = comm_method in {MoECommType.ALLGATHER, MoECommType.MC2}
         needs_uniform_mega_moe_input = comm_method == MoECommType.FUSED_MC2 and use_cann_megamoe(self.vllm_config)
+        finegrained_tp = self.ascend_config.finegrained_tp_config
+        needs_finegrained_tp = any(
+            size > 1
+            for size in (
+                finegrained_tp.oproj_tensor_parallel_size,
+                finegrained_tp.lmhead_tensor_parallel_size,
+                finegrained_tp.embedding_tensor_parallel_size,
+                finegrained_tp.mlp_tensor_parallel_size,
+                finegrained_tp.olora_tensor_parallel_size,
+            )
+        )
         # Routing capture assumes padding is at the end of the full DP batch,
         # not inside each SP shard after MC2 prepare.
         needs_uniform_routing_capture = self.vllm_config.model_config.enable_return_routed_experts
-        # Graph replay and these MoE paths require uniform runner inputs.
+        # Graph replay, these MoE paths and cross-DP fine-grained TP require
+        # uniform runner inputs.
         # Draft models retain their padding until their communication policy
         # is selected independently.
         if (
@@ -763,6 +775,7 @@ class NPUModelRunner(GPUModelRunner):
             or is_draft_model
             or needs_uniform_moe_input
             or needs_uniform_mega_moe_input
+            or needs_finegrained_tp
             or needs_uniform_routing_capture
         ):
             num_tokens_after_padding = torch.tensor(
