@@ -8,7 +8,7 @@ _MAP_BLOCK_SIZE = 256
 _MAX_HISTOGRAM_EXPERTS = 1024
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["numel"])
 def _map_to_physical_and_record_kernel(
     topk_ids_ptr,
     routing_table_ptr,
