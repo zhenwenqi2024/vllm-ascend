@@ -38,11 +38,13 @@ def _map_to_physical_and_record_kernel(
     tl.store(physical_ids_ptr + offsets, physical_id, mask=mask)
 
     record_enabled = tl.load(record_enabled_ptr) != 0
-    num_unpadded_tokens = tl.load(num_unpadded_tokens_ptr)
-    valid_physical_id = (physical_id >= 0) & (physical_id < num_physical_experts)
-    should_record = mask & valid_logical_id & valid_physical_id & record_enabled & (token_idx < num_unpadded_tokens)
-    safe_physical_id = tl.where(valid_physical_id, physical_id, 0)
-    tl.atomic_add(expert_load_ptr + safe_physical_id, 1, mask=should_record)
+    # Keep the device-side gate dynamic across graph replays.
+    if record_enabled:
+        num_unpadded_tokens = tl.load(num_unpadded_tokens_ptr)
+        valid_physical_id = (physical_id >= 0) & (physical_id < num_physical_experts)
+        should_record = mask & valid_logical_id & valid_physical_id & (token_idx < num_unpadded_tokens)
+        safe_physical_id = tl.where(valid_physical_id, physical_id, 0)
+        tl.atomic_add(expert_load_ptr + safe_physical_id, 1, mask=should_record)
 
 
 def map_to_physical_and_record_triton(
