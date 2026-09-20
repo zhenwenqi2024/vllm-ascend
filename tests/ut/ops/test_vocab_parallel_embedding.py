@@ -14,6 +14,7 @@
 # Adapted from vllm/tests/lora/test_layers.py
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock, patch
 
@@ -309,6 +310,7 @@ class TestPCPVocabParallelEmbedding(unittest.TestCase):
             ("lmhead_tp_enable", False),
             ("get_potential_max_tokens", 2),
             ("get_ascend_config", MagicMock(enable_reduce_sample=False)),
+            ("is_forward_context_available", False),
         ):
             patcher = patch(f"{self.module}.{name}", return_value=value)
             patcher.start()
@@ -442,7 +444,77 @@ class TestPCPVocabParallelEmbedding(unittest.TestCase):
             patch.object(layer, "_forward_embed_tp", side_effect=AssertionError("PCP needs prefill capacity")),
         ):
             self.assertIs(layer(ids), expected)
-            forward.assert_called_once_with(ids, 4)
+            forward.assert_called_once_with(ids, 4, active_tokens=None)
+
+    def test_pcp_layout_dispatch(self):
+        layer = self.make_layer()
+        ids = torch.tensor([0, 32])
+        for replicated in (True, False):
+            context = SimpleNamespace(attn_metadata=SimpleNamespace(pcp_inputs_replicated=replicated))
+            with (
+                patch(f"{self.module}.is_forward_context_available", return_value=True),
+                patch(f"{self.module}.get_forward_context", return_value=context),
+                patch.object(layer, "_forward_replicated_pcp") as decode,
+                patch.object(layer, "_forward_partitioned_inputs") as partitioned,
+            ):
+                layer(ids)
+                if replicated:
+                    decode.assert_called_once_with(ids)
+                    partitioned.assert_not_called()
+                else:
+                    partitioned.assert_called_once_with(ids, 4, active_tokens=2)
+                    decode.assert_not_called()
+
+    def test_decode_uses_one_all_reduce_without_id_gather(self):
+        weight = torch.arange(70 * 8, dtype=torch.float32).reshape(70, 8)
+        ids = torch.tensor([1, 69])
+        partials, outputs = [], []
+
+        def reduce(output, **kwargs):
+            self.assertEqual(output.shape, (2, 8))
+            self.assertIs(kwargs["group"], self.pcp_group.device_group)
+            partials.append(output.clone())
+
+        with (
+            patch(f"{self.module}.dist.all_reduce", side_effect=reduce) as all_reduce,
+            patch(f"{self.module}.dist.all_gather_into_tensor") as gather,
+            patch(f"{self.module}.dist.reduce_scatter_tensor") as scatter,
+        ):
+            for rank in range(4):
+                self.pcp_group.rank_in_group = rank
+                layer = self.make_layer()
+                layer.weight_loader(layer.weight, weight)
+                outputs.append(layer._forward_replicated_pcp(ids))
+            self.assertEqual(all_reduce.call_count, 4)
+            gather.assert_not_called()
+            scatter.assert_not_called()
+        result = torch.stack(partials).sum(0)
+        torch.testing.assert_close(result, weight[ids])
+
+    def test_prefill_communicates_current_padded_length(self):
+        layer = self.make_layer()
+        ids = torch.tensor([0, 1])
+        layer.weight.data.fill_(1)
+
+        def gather(out, inp, **kwargs):
+            self.assertEqual(inp.shape, (2,))
+            self.assertEqual(out.shape, (8,))
+            out.copy_(inp.repeat(4))
+
+        def scatter(out, inp, **kwargs):
+            self.assertEqual(inp.shape, (8, 8))
+            self.assertEqual(out.shape, (2, 8))
+            out.copy_(inp[:2])
+
+        with (
+            patch(f"{self.module}.dist.all_gather_into_tensor", side_effect=gather),
+            patch(f"{self.module}.dist.reduce_scatter_tensor", side_effect=scatter),
+        ):
+            output = layer._forward_partitioned_inputs(ids, 4, active_tokens=2)
+            self.assertEqual(output.shape, (2, 8))
+            address = layer._embed_rs_in_buf.data_ptr()
+            layer._forward_partitioned_inputs(ids, 4, active_tokens=2)
+            self.assertEqual(layer._embed_rs_in_buf.data_ptr(), address)
 
 
 class TestAscendLogitsProcessor(unittest.TestCase):
