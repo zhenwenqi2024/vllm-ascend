@@ -20,8 +20,9 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn.parameter import Parameter
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import divide
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -92,6 +93,27 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             self.forward_type = "embed_tp"
         else:
             self.comm_group = get_tp_group()
+            vllm_config = get_current_vllm_config_or_none()
+            if (
+                isinstance(self, AscendVocabParallelEmbedding)
+                and self.comm_group.world_size == 1
+                and vllm_config is not None
+                and vllm_config.parallel_config.prefill_context_parallel_size > 1
+                and vllm_config.model_config is not None
+                and not getattr(vllm_config.model_config.hf_text_config, "tie_word_embeddings", False)
+            ):
+                # Reuse vocab-row sharding and the checkpoint loader with PCP
+                # ranks. Unlike TP, PCP ranks own different token sequences,
+                # so lookup needs token all-gather and output reduce-scatter.
+                # Tied LM heads must retain the original TP weight layout.
+                self.comm_group = get_pcp_group()
+                self.forward_type = "embed_pcp"
+                # The existing embedding-TP capacity only covers decode.
+                # PCP also runs long prefills through this collective path.
+                self._pcp_embed_capacity = max(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+                )
 
         self.tp_size = self.comm_group.world_size
         self.tp_rank = self.comm_group.rank_in_group
@@ -188,20 +210,31 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         return input_, ~vocab_mask
 
     def forward(self, input_):
+        if self.forward_type == "embed_pcp":
+            return self._forward_embed_pcp(input_)
         if self.forward_type == "embed_tp":
             return self._forward_embed_tp(input_)
         return self._forward_origin(input_)
 
+    def _forward_embed_pcp(self, input_):
+        # PCP partitions input IDs before embedding. Gather those local inputs
+        # in PCP-rank order, look up this rank's vocab shard, then sum/scatter
+        # the embeddings back to the original local token layout. Replicated
+        # decode tokens use the same protocol: each copy occupies its own
+        # rank's segment and receives one complete embedding, without scaling.
+        return self._forward_partitioned_inputs(input_, self._pcp_embed_capacity)
+
     def _forward_embed_tp(self, input_):
+        return self._forward_partitioned_inputs(input_, get_potential_max_tokens())
+
+    def _forward_partitioned_inputs(self, input_, capacity):
+        assert self.comm_group is not None
         num_tokens = input_.shape[0]
 
-        # potential_max_tokens is computed once in the model runner __init__, so
-        # reading it here is a cheap global lookup. Validate before allocating so
-        # an oversized batch fails fast.
-        capacity = get_potential_max_tokens()
+        # All ranks use the same static capacity, including empty local inputs.
         if num_tokens > capacity:
             raise ValueError(
-                f"embedding_tp static capacity {capacity} < num_tokens "
+                f"{self.forward_type} static capacity {capacity} < num_tokens "
                 f"{num_tokens}; increase max_cudagraph_capture_size or "
                 f"max_num_batched_tokens."
             )
@@ -230,8 +263,8 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         dist.all_gather_into_tensor(self._embed_ag_out_buf, self._embed_ag_in_buf, group=self.comm_group.device_group)
         complete_input = self._embed_ag_out_buf
 
-        # Masking unchanged; padding rows map to OOB and get masked to 0
-        # via masked_fill_ below (token_id=0 stays in-range after shift).
+        # Mask tokens outside this rank's vocab shard. Capacity padding uses
+        # token 0; its embeddings are discarded when stripping output padding.
         masked_input, input_mask = self._mask_input_for_vocab_range(
             complete_input,
             self.shard_indices.org_vocab_start_index,
@@ -249,7 +282,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         dist.reduce_scatter_tensor(self._embed_rs_out_buf, self._embed_rs_in_buf, group=self.comm_group.device_group)
 
         # Strip padding rows; preserve the original return shape.
-        return self._embed_rs_out_buf[:num_tokens].view(num_tokens, -1)
+        return self._embed_rs_out_buf[:num_tokens].view(num_tokens, self.embedding_dim)
 
     def _forward_origin(self, input_):
         if self.tp_size > 1:
