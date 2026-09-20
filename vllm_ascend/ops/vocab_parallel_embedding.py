@@ -95,19 +95,21 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             self.comm_group = get_tp_group()
             vllm_config = get_current_vllm_config_or_none()
             if (
-                isinstance(self, AscendVocabParallelEmbedding)
-                and self.comm_group.world_size == 1
+                self.comm_group.world_size == 1
                 and vllm_config is not None
                 and vllm_config.parallel_config.prefill_context_parallel_size > 1
                 and vllm_config.model_config is not None
-                and not getattr(vllm_config.model_config.hf_text_config, "tie_word_embeddings", False)
+                and not embedding_tp_enable()
+                and not lmhead_tp_enable()
             ):
                 # Reuse vocab-row sharding and the checkpoint loader with PCP
                 # ranks. Unlike TP, PCP ranks own different token sequences,
                 # so lookup needs token all-gather and output reduce-scatter.
-                # Tied LM heads must retain the original TP weight layout.
+                # Both tables use the same layout, including tied weights.
+                if get_ascend_config().enable_reduce_sample:
+                    raise ValueError("PCP embedding/LM-head sharding does not support enable_reduce_sample.")
                 self.comm_group = get_pcp_group()
-                self.forward_type = "embed_pcp"
+                self.forward_type = "lmhead_pcp" if isinstance(self, ParallelLMHead) else "embed_pcp"
                 # The existing embedding-TP capacity only covers decode.
                 # PCP also runs long prefills through this collective path.
                 self._pcp_embed_capacity = max(
@@ -424,6 +426,8 @@ class AscendLogitsProcessor(LogitsProcessor):
         embedding_bias: torch.Tensor | None = None,
         skip_gather: bool = False,
     ) -> torch.Tensor | None:
+        if getattr(lm_head, "forward_type", None) in ("lmhead_pcp", "embed_pcp"):
+            return self._get_logits_pcp(hidden_states, lm_head, embedding_bias, skip_gather)
         # vLLM #50465 added skip_gather; when set, upstream returns the
         # untruncated apply_head result for spec-decode/top-k callers.
         if skip_gather:
@@ -436,6 +440,24 @@ class AscendLogitsProcessor(LogitsProcessor):
             return self._get_logits_lmheadtp(hidden_states, lm_head, embedding_bias)
         else:
             return self._get_logits_normal(hidden_states, lm_head, embedding_bias)
+
+    def _get_logits_pcp(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: AscendParallelLMHead,
+        embedding_bias: torch.Tensor | None,
+        skip_gather: bool,
+    ) -> torch.Tensor:
+        # MRV2 restores PCP hidden states to the global batch before sampling
+        # and prompt logprobs. Every rank projects the same token rows onto
+        # its vocab shard; concatenate vocab columns, never sum logits.
+        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        logits = lm_head.comm_group.all_gather(logits, dim=-1)
+        # skip_gather callers expect a TP-local vocabulary. TP=1 here, so
+        # reconstruct the full padded vocabulary even on that path.
+        if skip_gather:
+            return logits
+        return logits[..., : self.org_vocab_size]
 
     def _get_logits_lmheadtp(
         self,

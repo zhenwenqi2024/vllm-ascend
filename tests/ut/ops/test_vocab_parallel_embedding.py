@@ -308,6 +308,7 @@ class TestPCPVocabParallelEmbedding(unittest.TestCase):
             ("embedding_tp_enable", False),
             ("lmhead_tp_enable", False),
             ("get_potential_max_tokens", 2),
+            ("get_ascend_config", MagicMock(enable_reduce_sample=False)),
         ):
             patcher = patch(f"{self.module}.{name}", return_value=value)
             patcher.start()
@@ -321,6 +322,9 @@ class TestPCPVocabParallelEmbedding(unittest.TestCase):
 
     def test_replicated_decode_outputs(self):
         self._check_local_outputs(([69], [69], [69], [69]))
+
+    def test_mixed_prefill_decode_outputs(self):
+        self._check_local_outputs(([5, 0, 69], [5, 31], [5, 32, 64], [5]))
 
     def _check_local_outputs(self, sequences):
         # Different sequences, repeated IDs, vocab boundaries, padding and an
@@ -359,16 +363,70 @@ class TestPCPVocabParallelEmbedding(unittest.TestCase):
             torch.testing.assert_close(out, weight[ids])
 
     def test_other_layouts_keep_original_group(self):
-        self.assertIs(self.make_layer(AscendParallelLMHead).comm_group, self.tp_group)
+        self.assertIs(self.make_layer(AscendParallelLMHead).comm_group, self.pcp_group)
         self.assertEqual(self.make_layer(disable_tp=True).comm_group.world_size, 1)
-        self.config.model_config.hf_text_config.tie_word_embeddings = True
-        self.assertIs(self.make_layer().comm_group, self.tp_group)
-        self.config.model_config.hf_text_config.tie_word_embeddings = False
         self.tp_group.world_size = 2
         self.assertIs(self.make_layer().comm_group, self.tp_group)
         self.tp_group.world_size = 1
         self.config.parallel_config.prefill_context_parallel_size = 1
         self.assertIs(self.make_layer().comm_group, self.tp_group)
+
+    def test_tied_weights_share_pcp_partition(self):
+        self.config.model_config.hf_text_config.tie_word_embeddings = True
+        embed = self.make_layer()
+        head = self.make_layer(AscendParallelLMHead)
+        head.tie_weights(embed)
+        self.assertIs(head.weight, embed.weight)
+        self.assertEqual(head.shard_indices, embed.shard_indices)
+        self.assertEqual(head.forward_type, "lmhead_pcp")
+
+    def test_reduce_sample_rejected(self):
+        with (
+            patch(f"{self.module}.get_ascend_config", return_value=MagicMock(enable_reduce_sample=True)),
+            self.assertRaisesRegex(ValueError, "enable_reduce_sample"),
+        ):
+            self.make_layer(AscendParallelLMHead)
+
+    def test_lmhead_restored_prefill_decode_and_mixed_rows(self):
+        # PCP restores token rows before compute_logits for every batch type.
+        for num_rows in (1, 3, 7):
+            for skip_gather in (False, True):
+                with self.subTest(num_rows=num_rows, skip_gather=skip_gather):
+                    self._check_logits(num_rows, skip_gather)
+
+    def _check_logits(self, num_rows, skip_gather):
+        weight = torch.arange(70 * 8, dtype=torch.float32).reshape(70, 8) / 100
+        bias = torch.arange(70, dtype=torch.float32) / 10
+        hidden = torch.arange(num_rows * 8, dtype=torch.float32).reshape(num_rows, 8) / 10
+        processor = object.__new__(AscendLogitsProcessor)
+        torch.nn.Module.__init__(processor)
+        processor.org_vocab_size = 70
+        processor.head_dtype = None
+        partials, gathered, outputs = [], [], []
+
+        def gather(logits, dim):
+            self.assertEqual(dim, -1)
+            self.assertEqual(logits.shape, (num_rows, 32))
+            partials.append(logits.clone())
+            result = torch.empty(num_rows, 128)
+            gathered.append(result)
+            return result
+
+        with patch.object(self.pcp_group, "all_gather", side_effect=gather):
+            for rank in range(4):
+                self.pcp_group.rank_in_group = rank
+                head = self.make_layer(AscendParallelLMHead, bias=True)
+                head.weight_loader(head.weight, weight)
+                head.weight_loader(head.bias, bias)
+                outputs.append(processor._get_logits(hidden, head, head.bias, skip_gather))
+        full_logits = torch.cat(partials, dim=-1)
+        expected = torch.nn.functional.linear(hidden, weight, bias)
+        for buffer, output in zip(gathered, outputs):
+            buffer.copy_(full_logits)
+            self.assertEqual(output.shape, (num_rows, 128 if skip_gather else 70))
+            torch.testing.assert_close(output[:, :70], expected)
+            if skip_gather:
+                torch.testing.assert_close(output[:, 70:], torch.zeros(num_rows, 58))
 
     def test_capacity_overflow(self):
         with self.assertRaisesRegex(ValueError, "static capacity"):
