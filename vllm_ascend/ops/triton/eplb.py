@@ -43,21 +43,23 @@ def _map_to_physical_and_record_kernel(
     tl.store(physical_ids_ptr + offsets, physical_id, mask=mask)
 
     record_enabled = tl.load(record_enabled_ptr) != 0
-    num_unpadded_tokens = tl.load(num_unpadded_tokens_ptr)
-    valid_physical_id = (physical_id >= 0) & (physical_id < num_physical_experts)
-    should_record = mask & valid_logical_id & valid_physical_id & record_enabled & (token_idx < num_unpadded_tokens)
-    safe_physical_id = tl.where(valid_physical_id, physical_id, 0)
-    if SINGLE_PROGRAM:
-        # Layer forwards are ordered on the compute stream. With one program,
-        # each bin has a single writer, so no atomic updates are needed.
-        # Invalid/padded routes use a dedicated bin: negative histogram inputs
-        # are not ignored by every device implementation.
-        bins = tl.arange(0, NUM_BINS)
-        counts = tl.histogram(tl.where(should_record, physical_id, NUM_BINS - 1).to(tl.int32), NUM_BINS)
-        previous = tl.load(expert_load_ptr + bins, bins < num_physical_experts, other=0)
-        tl.store(expert_load_ptr + bins, previous + counts, (bins < num_physical_experts) & record_enabled)
-    else:
-        tl.atomic_add(expert_load_ptr + safe_physical_id, 1, mask=should_record)
+    # Keep the device-side gate dynamic across graph replays.
+    if record_enabled:
+        num_unpadded_tokens = tl.load(num_unpadded_tokens_ptr)
+        valid_physical_id = (physical_id >= 0) & (physical_id < num_physical_experts)
+        should_record = mask & valid_logical_id & valid_physical_id & (token_idx < num_unpadded_tokens)
+        safe_physical_id = tl.where(valid_physical_id, physical_id, 0)
+        if SINGLE_PROGRAM:
+            # Layer forwards are ordered on the compute stream. With one program,
+            # each bin has a single writer, so no atomic updates are needed.
+            # Invalid/padded routes use a dedicated bin: negative histogram inputs
+            # are not ignored by every device implementation.
+            bins = tl.arange(0, NUM_BINS)
+            counts = tl.histogram(tl.where(should_record, physical_id, NUM_BINS - 1).to(tl.int32), NUM_BINS)
+            previous = tl.load(expert_load_ptr + bins, bins < num_physical_experts, other=0)
+            tl.store(expert_load_ptr + bins, previous + counts, (bins < num_physical_experts))
+        else:
+            tl.atomic_add(expert_load_ptr + safe_physical_id, 1, mask=should_record)
 
 
 def map_to_physical_and_record_triton(
