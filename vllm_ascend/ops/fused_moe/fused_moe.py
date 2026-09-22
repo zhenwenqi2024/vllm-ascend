@@ -384,6 +384,29 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             shared_experts.wait_for_output()
         return fused_output
 
+    def _prepare_router_input(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prepare only the input needed by a pre-cast FP32 router gate."""
+        gate = self.gate
+        assert gate is not None
+        if not hasattr(gate, "weight_fp32"):
+            return hidden_states
+        return router_logits if router_logits.dtype == torch.float32 else hidden_states.float()
+
+    def _apply_router_linear(self, router_input: torch.Tensor) -> torch.Tensor:
+        """Apply the internal router gate to an already prepared input."""
+        gate = self.gate
+        assert gate is not None
+        # Models with pre-cast FP32 weights use the direct linear path; other
+        # gates retain their registered forward and its dtype semantics.
+        if hasattr(gate, "weight_fp32"):
+            return F.linear(router_input, gate.weight_fp32)
+        gate_out = gate(router_input)
+        return gate_out[0] if isinstance(gate_out, tuple) else gate_out
+
     def _compute_router_logits(
         self,
         hidden_states: torch.Tensor,
@@ -391,21 +414,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
     ) -> torch.Tensor:
         """Compute router logits without extending a fresh FP32 cast's lifetime.
 
-        The FP32 activation stays local to this helper and becomes releasable
-        after the gate linear is enqueued. An existing FP32 ``router_logits``
-        remains caller-owned. Gates without a pre-cast weight keep using their
-        registered forward path and must not allocate an unused FP32 input.
+        Gates without a pre-cast weight retain their registered forward path
+        and do not allocate an unused FP32 input.
         """
-        gate = self.gate
-        assert gate is not None
-        if not hasattr(gate, "weight_fp32"):
-            gate_out = gate(hidden_states)
-            return gate_out[0] if isinstance(gate_out, tuple) else gate_out
-
-        # AscendUnquantizedLinearMethod normally pre-casts the weight so the
-        # hot path only needs to materialize the FP32 activation when required.
-        router_input = router_logits if router_logits.dtype == torch.float32 else hidden_states.float()
-        return F.linear(router_input, gate.weight_fp32)
+        router_input = self._prepare_router_input(hidden_states, router_logits)
+        return self._apply_router_linear(router_input)
 
     def _prepare_router_and_milestones(
         self,
@@ -413,8 +426,12 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         router_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.npu.Event, torch.npu.Event]:
         if self.is_internal_router:
+            router_input = self._prepare_router_input(shared_hidden_states, router_logits)
+            # Release shared Vector/AIV preparation only after the router input
+            # Cast. It then overlaps the Cube-heavy gate matmul instead of
+            # competing with another Vector/AIV operation.
             shared_input_ready = torch.npu.current_stream().record_event()
-            router_logits = self._compute_router_logits(shared_hidden_states, router_logits)
+            router_logits = self._apply_router_linear(router_input)
             router_output_ready = torch.npu.current_stream().record_event()
         else:
             shared_input_ready = torch.npu.current_stream().record_event()
