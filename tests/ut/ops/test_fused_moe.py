@@ -2407,6 +2407,62 @@ def test_forward_impl_records_router_milestones(monkeypatch):
     torch.testing.assert_close(routed_router_logits, F.linear(router_input_fp32, gate_weight))
 
 
+def test_internal_router_releases_shared_stream_after_input_cast(monkeypatch):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
+    gate_weight = torch.randn(3, 4, dtype=torch.float32)
+    runner.gate = SimpleNamespace(weight_fp32=gate_weight)
+    operation_order = []
+    shared_input_ready = MagicMock()
+    router_output_ready = MagicMock()
+    events = iter(
+        [
+            ("record_shared_input_ready", shared_input_ready),
+            ("record_router_output_ready", router_output_ready),
+        ]
+    )
+    current_stream = MagicMock()
+
+    def record_event():
+        name, event = next(events)
+        operation_order.append(name)
+        return event
+
+    current_stream.record_event.side_effect = record_event
+    original_prepare_router_input = runner._prepare_router_input
+
+    def prepare_router_input(*args):
+        operation_order.append("cast_router_input")
+        return original_prepare_router_input(*args)
+
+    original_linear = F.linear
+
+    def router_linear(*args, **kwargs):
+        operation_order.append("router_matmul")
+        return original_linear(*args, **kwargs)
+
+    runner._prepare_router_input = MagicMock(side_effect=prepare_router_input)
+    monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: True))
+    monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(fused_moe_module.F, "linear", MagicMock(side_effect=router_linear))
+
+    router_logits, actual_shared_ready, actual_router_ready = runner._prepare_router_and_milestones(
+        hidden_states,
+        hidden_states,
+    )
+
+    assert operation_order == [
+        "cast_router_input",
+        "record_shared_input_ready",
+        "router_matmul",
+        "record_router_output_ready",
+    ]
+    assert actual_shared_ready is shared_input_ready
+    assert actual_router_ready is router_output_ready
+    torch.testing.assert_close(router_logits, original_linear(hidden_states.float(), gate_weight))
+
+
 @pytest.mark.parametrize("has_shared_experts", [False, True])
 @pytest.mark.parametrize("has_fp32_input", [False, True])
 def test_internal_router_reuses_fused_fp32_input(monkeypatch, has_shared_experts, has_fp32_input):
