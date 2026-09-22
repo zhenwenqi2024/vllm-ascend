@@ -39,6 +39,8 @@ from vllm_ascend.ops.fused_moe.shared_experts import (
     SharedExpertMLPPath,
     SharedExpertParallelMode,
 )
+from vllm_ascend.quantization.methods.base import PreparedLinearInput
+from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
 from vllm_ascend.quantization.quant_type import QuantType
 
 
@@ -1430,6 +1432,72 @@ def test_linear_wrapper_uses_cv_parallel_milestones(monkeypatch):
     shared_experts.part1.assert_called_once_with(hidden_states)
     activation.assert_called_once_with(part1_out)
     down_proj.assert_called_once_with(shared_act)
+
+
+def test_linear_wrapper_prequantizes_before_router_wait(monkeypatch):
+    operation_order = []
+    hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
+    quantized_input = torch.ones(2, 6, dtype=torch.float8_e4m3fn)
+    input_scale = torch.ones(2, 1)
+    gate_up = torch.randn(2, 8, dtype=torch.bfloat16)
+    shared_act = torch.randn(2, 4, dtype=torch.bfloat16)
+    expected = torch.randn(2, 4, dtype=torch.bfloat16)
+
+    quant_scheme = AscendW8A8MXFP8DynamicLinearMethod.__new__(AscendW8A8MXFP8DynamicLinearMethod)
+    quant_scheme.dynamic_mx_quant_scale_alg = 1
+    gate_up_proj = SimpleNamespace(quant_method=SimpleNamespace(quant_method=quant_scheme), mxfp8_tp_padding=(1, 1))
+    shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts.layer = SimpleNamespace(gate_up_proj=gate_up_proj)
+    shared_experts.multistream_overlap = True
+    shared_experts.quant_type = QuantType.W8A8MXFP
+    shared_experts.lora_context = None
+    shared_experts.part1 = MagicMock(side_effect=lambda value: (operation_order.append("gate_up"), gate_up)[1])
+    shared_experts.apply_activation = MagicMock(return_value=shared_act)
+    shared_experts.part2 = MagicMock(return_value=expected)
+    milestones = RoutedMoEMilestones(
+        router_output_ready=MagicMock(),
+        routed_gmm2_start=MagicMock(),
+        routed_combine_start=MagicMock(),
+    )
+    stream = MagicMock()
+    event_names = {
+        milestones.router_output_ready: "router",
+        milestones.routed_gmm2_start: "gmm2",
+        milestones.routed_combine_start: "combine",
+    }
+    stream.wait_event.side_effect = lambda event: operation_order.append(f"wait_{event_names[event]}")
+
+    monkeypatch.setattr(shared_experts_module, "has_lora", lambda _: False)
+    monkeypatch.setattr(shared_experts_module.torch.npu, "current_stream", lambda: stream)
+    dynamic_quant = MagicMock(
+        side_effect=lambda *_args, **_kwargs: (
+            operation_order.append("prequantize"),
+            (quantized_input, input_scale),
+        )[1]
+    )
+    monkeypatch.setattr(shared_experts_module.torch_npu, "npu_dynamic_mx_quant", dynamic_quant)
+
+    result = shared_experts._run_linear_wrapped_mlp(
+        hidden_states,
+        milestones,
+        milestones.routed_combine_start,
+        "routed_combine_start",
+    )
+
+    assert result is expected
+    assert operation_order == ["prequantize", "wait_router", "gate_up", "wait_gmm2", "wait_combine"]
+    quant_input = dynamic_quant.call_args.args[0]
+    assert quant_input.shape == (2, 6)
+    torch.testing.assert_close(quant_input[:, 1:5], hidden_states)
+    assert dynamic_quant.call_args.kwargs == {
+        "dst_type": torch.float8_e4m3fn,
+        "scale_alg": 1,
+    }
+    prepared_input = shared_experts.part1.call_args.args[0]
+    assert isinstance(prepared_input, PreparedLinearInput)
+    assert prepared_input.quantized is quantized_input
+    assert prepared_input.scale is input_scale
+    assert prepared_input.output_dtype == torch.bfloat16
 
 
 @pytest.mark.parametrize(

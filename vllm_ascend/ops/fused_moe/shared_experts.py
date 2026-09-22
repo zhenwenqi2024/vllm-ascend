@@ -33,6 +33,7 @@ from vllm_ascend.ops.fused_moe.dataclass.shared_experts import (
     PreparedSharedExpertInput,
     RoutedMoEMilestones,
 )
+from vllm_ascend.quantization.methods.base import PreparedLinearInput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stream
 
@@ -149,7 +150,10 @@ class AscendSharedExperts:
             " Integrated and split-path results are consistent."
         )
 
-    def part1(self, hidden_states: torch.Tensor):
+    def part1(
+        self,
+        hidden_states: torch.Tensor | PreparedLinearInput | tuple[torch.Tensor, torch.Tensor],
+    ):
         shared_gate_up, _ = self.layer.gate_up_proj(hidden_states)  # type: ignore
         return shared_gate_up
 
@@ -478,11 +482,25 @@ class AscendSharedExperts:
         down_projection_ready: torch.npu.Event | None,
         down_projection_milestone: str,
     ) -> torch.Tensor:
+        gate_up_input: torch.Tensor | PreparedLinearInput | tuple[torch.Tensor, torch.Tensor] = hidden_states
+        if self.multistream_overlap and not has_lora(self.lora_context):
+            # Quant schemes can opt in to running their Vector/AIV input
+            # preprocessing before router_output_ready. The Cube-heavy
+            # Gate-Up remains after the wait, avoiding contention with the
+            # routed Router Gate. A None result preserves the full wrapper.
+            linear_method = getattr(self.layer.gate_up_proj, "quant_method", None)
+            quant_scheme = getattr(linear_method, "quant_method", linear_method)
+            prepare_input = getattr(quant_scheme, "prepare_input_for_overlap", None)
+            if prepare_input is not None:
+                prepared_input = prepare_input(self.layer.gate_up_proj, hidden_states)
+                if prepared_input is not None:
+                    gate_up_input = prepared_input
+
         self._wait_for_milestone(
             milestones.router_output_ready,
             "router_output_ready",
         )
-        gate_up = self.part1(hidden_states)
+        gate_up = self.part1(gate_up_input)
 
         self._wait_for_routed_stage(
             milestones,
@@ -542,8 +560,13 @@ class AscendSharedExperts:
             and hasattr(self.layer.gate_up_proj, "weight_scale")
             and hasattr(self.layer.down_proj, "weight_scale")
         )
+        # W8A8 and W4A8 share an INT8-activation implementation; A8 names
+        # the activation width and does not imply that weights are INT8.
         if has_quantized_shared_without_lora and self.quant_type in (QuantType.W8A8, QuantType.W4A8):
             return SharedExpertMLPPath.A8_INT_FUSED
+        # This MXFP path currently represents W4A8MXFP only (MXFP4 weights
+        # with MXFP8 activations). W8A8MXFP keeps its registered linear
+        # wrapper and uses prepare_input_for_overlap when it is safe.
         if has_quantized_shared_without_lora and self.quant_type == QuantType.W4A8MXFP:
             return SharedExpertMLPPath.A8_MXFP_FUSED
         return SharedExpertMLPPath.LINEAR_WRAPPER
