@@ -160,8 +160,12 @@ class AscendSharedExperts:
     def apply_activation(self, shared_gate_up: torch.Tensor):
         return self.layer.act_fn(shared_gate_up)  # type: ignore
 
-    def part2(self, hidden_states: torch.Tensor, shared_act: torch.Tensor):
-        shared_out, _ = self.layer.down_proj(shared_act)  # type: ignore
+    def part2(
+        self,
+        hidden_states: torch.Tensor,
+        down_input: torch.Tensor | PreparedLinearInput | tuple[torch.Tensor, torch.Tensor],
+    ):
+        shared_out, _ = self.layer.down_proj(down_input)  # type: ignore
 
         # Qwen3-Next specific gating mechanism
         if hasattr(self.layer, "expert_gate") and self.layer.expert_gate is not None:
@@ -482,19 +486,7 @@ class AscendSharedExperts:
         down_projection_ready: torch.npu.Event | None,
         down_projection_milestone: str,
     ) -> torch.Tensor:
-        gate_up_input: torch.Tensor | PreparedLinearInput | tuple[torch.Tensor, torch.Tensor] = hidden_states
-        if self.multistream_overlap and not has_lora(self.lora_context):
-            # Quant schemes can opt in to running their Vector/AIV input
-            # preprocessing before router_output_ready. The Cube-heavy
-            # Gate-Up remains after the wait, avoiding contention with the
-            # routed Router Gate. A None result preserves the full wrapper.
-            linear_method = getattr(self.layer.gate_up_proj, "quant_method", None)
-            quant_scheme = getattr(linear_method, "quant_method", linear_method)
-            prepare_input = getattr(quant_scheme, "prepare_input_for_overlap", None)
-            if prepare_input is not None:
-                prepared_input = prepare_input(self.layer.gate_up_proj, hidden_states)
-                if prepared_input is not None:
-                    gate_up_input = prepared_input
+        gate_up_input = self._prepare_linear_input_for_overlap(self.layer.gate_up_proj, hidden_states)
 
         self._wait_for_milestone(
             milestones.router_output_ready,
@@ -508,12 +500,35 @@ class AscendSharedExperts:
             "routed_gmm2_start",
         )
         shared_act = self.apply_activation(gate_up)
+        # Prepare the Down input while routed GMM2 is running. The Down Cube
+        # matmul remains after routed_combine_start so it can overlap the
+        # routed combine communication without delaying its own Vector/AIV
+        # quantization until that communication has already started.
+        down_input = self._prepare_linear_input_for_overlap(self.layer.down_proj, shared_act)
         self._wait_for_routed_stage(
             milestones,
             down_projection_ready,
             down_projection_milestone,
         )
-        return self.part2(hidden_states, shared_act)
+        return self.part2(hidden_states, down_input)
+
+    def _prepare_linear_input_for_overlap(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | PreparedLinearInput | tuple[torch.Tensor, torch.Tensor]:
+        """Run scheme-owned Vector/AIV preparation before a stage barrier."""
+        if not self.multistream_overlap or has_lora(self.lora_context):
+            return hidden_states
+
+        linear_method = getattr(layer, "quant_method", None)
+        quant_scheme = getattr(linear_method, "quant_method", linear_method)
+        prepare_input = getattr(quant_scheme, "prepare_input_for_overlap", None)
+        if prepare_input is None:
+            return hidden_states
+
+        prepared_input = prepare_input(layer, hidden_states)
+        return hidden_states if prepared_input is None else prepared_input
 
     def _run_shared_mlp(
         self,
