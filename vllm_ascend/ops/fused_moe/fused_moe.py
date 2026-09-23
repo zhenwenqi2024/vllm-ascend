@@ -38,6 +38,7 @@ from vllm_ascend.ops.fused_moe.shared_experts import (
     AscendSharedExperts,
     PreparedSharedExpertExecution,
     SharedExpertParallelMode,
+    SubmittedSharedExpertGateUp,
 )
 
 
@@ -430,7 +431,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         torch.Tensor,
         torch.npu.Event,
         torch.npu.Event,
-        PreparedSharedExpertExecution | None,
+        SubmittedSharedExpertGateUp | None,
     ]:
         if self.is_internal_router:
             router_input = self._prepare_router_input(shared_hidden_states, router_logits)
@@ -451,7 +452,20 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 shared_input_ready,
             )
             router_output_ready = shared_input_ready
-        return router_logits, shared_input_ready, router_output_ready, prepared_execution
+        # Submit Gate-Up now, before routed_experts.forward_impl enqueues TopK
+        # and dispatch. The auxiliary stream waits for router_output_ready, so
+        # Gate-Up starts together with routed TopK and can cover dispatch.
+        shared_experts = self.ascend_shared_experts
+        assert shared_experts is not None
+        submitted_gate_up = (
+            shared_experts.enqueue_gate_up_after_router(
+                prepared_execution,
+                router_output_ready,
+            )
+            if prepared_execution is not None
+            else None
+        )
+        return router_logits, shared_input_ready, router_output_ready, submitted_gate_up
 
     def _forward_impl(
         self,
@@ -477,7 +491,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 if shared_input_is_gathered
                 else self.ascend_shared_experts.prepare_input_before_routed(shared_hidden_states)
             )
-            router_logits, shared_input_ready, router_output_ready, prepared_execution = (
+            router_logits, shared_input_ready, router_output_ready, submitted_gate_up = (
                 self._prepare_router_and_milestones(
                     prepared_shared_input,
                     shared_hidden_states,
@@ -495,7 +509,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             if prepared_shared_input.is_gathered:
                 milestones.routed_finalize_done = torch.npu.current_stream().record_event()
 
-            if prepared_execution is None:
+            if submitted_gate_up is None:
                 shared_out = self.ascend_shared_experts.forward(
                     prepared_shared_input,
                     milestones,
@@ -506,6 +520,6 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     prepared_shared_input,
                     milestones,
                     defer_output_wait=defer_shared_output_wait,
-                    prepared_execution=prepared_execution,
+                    submitted_gate_up=submitted_gate_up,
                 )
             return shared_out, routed_out
