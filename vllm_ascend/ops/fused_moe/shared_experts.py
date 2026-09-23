@@ -383,8 +383,8 @@ class AscendSharedExperts:
 
         self._wait_for_routed_stage(
             milestones,
-            milestones.routed_gmm2_start,
-            "routed_gmm2_start",
+            milestones.shared_activation_overlap_start,
+            "shared_activation_overlap_start",
         )
         if self.situ_activation is not None:
             quantized_x, swiglu_out_scale = torch.ops._C_ascend.dequant_situ_quant(
@@ -452,8 +452,8 @@ class AscendSharedExperts:
 
         self._wait_for_routed_stage(
             milestones,
-            milestones.routed_gmm2_start,
-            "routed_gmm2_start",
+            milestones.shared_activation_overlap_start,
+            "shared_activation_overlap_start",
         )
         if self.situ_activation is not None:
             quantized_x, swiglu_out_scale = torch.ops._C_ascend.situ_mx_quant(
@@ -496,14 +496,15 @@ class AscendSharedExperts:
 
         self._wait_for_routed_stage(
             milestones,
-            milestones.routed_gmm2_start,
-            "routed_gmm2_start",
+            milestones.shared_activation_overlap_start,
+            "shared_activation_overlap_start",
         )
         shared_act = self.apply_activation(gate_up)
-        # Prepare the Down input while routed GMM2 is running. The Down Cube
-        # matmul remains after routed_combine_start so it can overlap the
-        # routed combine communication without delaying its own Vector/AIV
-        # quantization until that communication has already started.
+        # Prepare the Down input in the backend-selected routed Cube window.
+        # MC2 starts at GMM1 to provide more decode headroom; other staged
+        # backends start at GMM2. The Down Cube matmul remains after
+        # routed_combine_start so its Vector/AIV preparation can finish before
+        # the routed combine communication begins.
         down_input = self._prepare_linear_input_for_overlap(self.layer.down_proj, shared_act)
         self._wait_for_routed_stage(
             milestones,
