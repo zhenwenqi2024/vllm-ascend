@@ -25,6 +25,7 @@ from vllm_ascend.ops.fused_moe.dataclass.shared_experts import (
     RoutedMoEMilestones,
 )
 from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
+from vllm_ascend.ops.fused_moe.moe_comm_method import AlltoAllCommImpl, MC2CommImpl
 from vllm_ascend.ops.fused_moe.routed_experts import (
     AscendRoutedExperts,
     AscendUnquantizedFusedMoEMethod,
@@ -72,6 +73,11 @@ def _build_weight_layer():
         w13_weight=nn.Parameter(torch.randn(2, 3, 4)),
         w2_weight=nn.Parameter(torch.randn(2, 4, 3)),
     )
+
+
+def test_comm_backend_selects_shared_activation_overlap_window():
+    assert MC2CommImpl.shared_activation_overlaps_routed_gmm1
+    assert not AlltoAllCommImpl.shared_activation_overlaps_routed_gmm1
 
 
 def _build_apply_layer():
@@ -943,6 +949,7 @@ def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_
             before_dispatch_evt=None,
             before_gmm2_evt=None,
             before_combine_evt=None,
+            shared_activation_overlap_start_evt=None,
             swiglu_limit=0.0,
         )
     )
@@ -1028,7 +1035,7 @@ def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_
         assert fused_moe_events.shared_input_ready is None
         assert fused_moe_events.router_output_ready is None
         assert fused_moe_events.routed_dispatch_start is None
-        assert fused_moe_events.routed_gmm2_start is None
+        assert fused_moe_events.shared_activation_overlap_start is None
         assert fused_moe_events.routed_combine_start is None
         assert not fused_moe_events.has_fine_grained_stage_events
     else:
@@ -1114,7 +1121,7 @@ def _make_shared_expert_events():
         shared_input_ready=event,
         router_output_ready=event,
         routed_dispatch_start=event,
-        routed_gmm2_start=event,
+        shared_activation_overlap_start=event,
         routed_combine_start=event,
     )
 
@@ -1176,11 +1183,11 @@ def test_partially_missing_routed_stage_milestones_fail_fast():
         routed_combine_start=MagicMock(),
     )
 
-    with pytest.raises(RuntimeError, match="routed_gmm2_start"):
+    with pytest.raises(RuntimeError, match="shared_activation_overlap_start"):
         shared_experts._wait_for_routed_stage(
             milestones,
-            milestones.routed_gmm2_start,
-            "routed_gmm2_start",
+            milestones.shared_activation_overlap_start,
+            "shared_activation_overlap_start",
         )
 
 
@@ -1352,7 +1359,7 @@ def test_w4a8_mxfp_gate_up_waits_for_router_output(monkeypatch):
         shared_input_ready=MagicMock(),
         router_output_ready=MagicMock(),
         routed_dispatch_start=MagicMock(),
-        routed_gmm2_start=MagicMock(),
+        shared_activation_overlap_start=MagicMock(),
         routed_combine_start=MagicMock(),
     )
     auxiliary_stream = MagicMock()
@@ -1411,7 +1418,7 @@ def test_linear_wrapper_uses_cv_parallel_milestones(monkeypatch):
         shared_input_ready=MagicMock(),
         router_output_ready=MagicMock(),
         routed_dispatch_start=MagicMock(),
-        routed_gmm2_start=MagicMock(),
+        shared_activation_overlap_start=MagicMock(),
         routed_combine_start=MagicMock(),
     )
     auxiliary_stream = MagicMock()
@@ -1442,7 +1449,7 @@ def test_linear_wrapper_uses_cv_parallel_milestones(monkeypatch):
     assert auxiliary_stream.wait_event.call_args_list == [
         call(milestones.shared_input_ready),
         call(milestones.router_output_ready),
-        call(milestones.routed_gmm2_start),
+        call(milestones.shared_activation_overlap_start),
         call(milestones.routed_combine_start),
     ]
     main_stream.wait_stream.assert_called_once_with(auxiliary_stream)
@@ -1481,13 +1488,13 @@ def test_linear_wrapper_prequantizes_before_stage_waits(monkeypatch):
     shared_experts.part2 = MagicMock(side_effect=lambda *_args: (operation_order.append("down"), expected)[1])
     milestones = RoutedMoEMilestones(
         router_output_ready=MagicMock(),
-        routed_gmm2_start=MagicMock(),
+        shared_activation_overlap_start=MagicMock(),
         routed_combine_start=MagicMock(),
     )
     stream = MagicMock()
     event_names = {
         milestones.router_output_ready: "router",
-        milestones.routed_gmm2_start: "gmm2",
+        milestones.shared_activation_overlap_start: "activation_overlap",
         milestones.routed_combine_start: "combine",
     }
     stream.wait_event.side_effect = lambda event: operation_order.append(f"wait_{event_names[event]}")
@@ -1517,7 +1524,7 @@ def test_linear_wrapper_prequantizes_before_stage_waits(monkeypatch):
         "prequantize_gate_up",
         "wait_router",
         "gate_up",
-        "wait_gmm2",
+        "wait_activation_overlap",
         "activation",
         "prequantize_down",
         "wait_combine",
@@ -1579,14 +1586,14 @@ def test_k3_w4a8_mxfp_multistream_schedule_on_a3_and_a5(monkeypatch, device_type
         shared_input_ready=MagicMock(),
         router_output_ready=MagicMock(),
         routed_dispatch_start=MagicMock(),
-        routed_gmm2_start=MagicMock(),
+        shared_activation_overlap_start=MagicMock(),
         routed_combine_start=MagicMock(),
         routed_finalize_done=MagicMock(),
     )
     event_names = {
         milestones.shared_input_ready: "shared_input_ready",
         milestones.router_output_ready: "router_output_ready",
-        milestones.routed_gmm2_start: "routed_gmm2_start",
+        milestones.shared_activation_overlap_start: "shared_activation_overlap_start",
         milestones.routed_combine_start: "routed_combine_start",
         milestones.routed_finalize_done: "routed_finalize_done",
     }
@@ -1650,7 +1657,7 @@ def test_k3_w4a8_mxfp_multistream_schedule_on_a3_and_a5(monkeypatch, device_type
         "dynamic_quant",
         "wait_router_output_ready",
         "shared_gate_up",
-        "wait_routed_gmm2_start",
+        "wait_shared_activation_overlap_start",
         "shared_activation",
         "wait_routed_combine_start",
         "shared_down",
@@ -2101,7 +2108,7 @@ def test_sp_multistream_down_projection_overlaps_combine_and_reduce_scatter_wait
         shared_input_ready=MagicMock(),
         router_output_ready=MagicMock(),
         routed_dispatch_start=MagicMock(),
-        routed_gmm2_start=MagicMock(),
+        shared_activation_overlap_start=MagicMock(),
         routed_combine_start=MagicMock(),
         routed_finalize_done=MagicMock(),
     )
@@ -2146,7 +2153,7 @@ def test_sp_multistream_down_projection_overlaps_combine_and_reduce_scatter_wait
         "wait_after_routed_finalize",
         "reduce_scatter",
     ]
-    auxiliary_stream.wait_event.assert_any_call(milestones.routed_gmm2_start)
+    auxiliary_stream.wait_event.assert_any_call(milestones.shared_activation_overlap_start)
     shared_experts.apply_activation.assert_called_once_with(part1_out)
     shared_experts.part2.assert_called_once()
     part2_hidden_states, part2_shared_act = shared_experts.part2.call_args.args
