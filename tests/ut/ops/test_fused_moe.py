@@ -37,6 +37,7 @@ from vllm_ascend.ops.fused_moe.router.fused_topk_router import (
 from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
 from vllm_ascend.ops.fused_moe.shared_experts import (
     AscendSharedExperts,
+    PreparedSharedExpertExecution,
     SharedExpertMLPPath,
     SharedExpertParallelMode,
 )
@@ -2327,6 +2328,11 @@ def test_forward_impl_gathers_sp_input_before_routed_collectives(monkeypatch):
     shared_out = torch.randn(2, 4)
     milestones = RoutedMoEMilestones()
     operation_order = []
+    prepared_execution = PreparedSharedExpertExecution(
+        hidden_states=gathered_states,
+        gate_up_input=gathered_states,
+        local_dp_metadata=None,
+    )
 
     def prepare_input(states):
         operation_order.append("tp_all_gather")
@@ -2338,17 +2344,27 @@ def test_forward_impl_gathers_sp_input_before_routed_collectives(monkeypatch):
         assert kwargs["hidden_states"] is hidden_states
         return routed_out, milestones
 
+    def prepare_for_router_overlap(prepared_input, event):
+        operation_order.append("shared_prepare")
+        assert prepared_input.hidden_states is gathered_states
+        assert event is shared_input_ready
+        return prepared_execution
+
     def shared_forward(prepared_input, routed_milestones, **kwargs):
         operation_order.append("shared_compute")
         assert prepared_input.hidden_states is gathered_states
         assert routed_milestones is milestones
-        assert kwargs == {"defer_output_wait": False}
+        assert kwargs == {
+            "defer_output_wait": False,
+            "prepared_execution": prepared_execution,
+        }
         return shared_out
 
     runner.ascend_shared_experts = SimpleNamespace(
         multistream_overlap=True,
         parallel_mode=MagicMock(return_value=SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY),
         prepare_input_before_routed=MagicMock(side_effect=prepare_input),
+        prepare_for_router_overlap=MagicMock(side_effect=prepare_for_router_overlap),
         forward=MagicMock(side_effect=shared_forward),
     )
     runner.routed_experts = SimpleNamespace(forward_impl=MagicMock(side_effect=routed_forward))
@@ -2368,7 +2384,7 @@ def test_forward_impl_gathers_sp_input_before_routed_collectives(monkeypatch):
     )
 
     assert result == (shared_out, routed_out)
-    assert operation_order == ["tp_all_gather", "routed_collectives", "shared_compute"]
+    assert operation_order == ["tp_all_gather", "shared_prepare", "routed_collectives", "shared_compute"]
     assert milestones.shared_input_ready is shared_input_ready
     assert milestones.router_output_ready is shared_input_ready
     assert milestones.routed_finalize_done is routed_finalize_done
@@ -2421,6 +2437,12 @@ def test_internal_router_releases_shared_stream_after_input_cast(monkeypatch):
     hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
     gate_weight = torch.randn(3, 4, dtype=torch.float32)
     runner.gate = SimpleNamespace(weight_fp32=gate_weight)
+    prepared_shared_input = PreparedSharedExpertInput(hidden_states)
+    prepared_execution = PreparedSharedExpertExecution(
+        hidden_states=hidden_states,
+        gate_up_input=hidden_states,
+        local_dp_metadata=None,
+    )
     operation_order = []
     shared_input_ready = MagicMock()
     router_output_ready = MagicMock()
@@ -2450,24 +2472,39 @@ def test_internal_router_releases_shared_stream_after_input_cast(monkeypatch):
         operation_order.append("router_matmul")
         return original_linear(*args, **kwargs)
 
+    def prepare_for_router_overlap(actual_input, actual_event):
+        operation_order.append("prepare_shared_input")
+        assert actual_input is prepared_shared_input
+        assert actual_event is shared_input_ready
+        return prepared_execution
+
     runner._prepare_router_input = MagicMock(side_effect=prepare_router_input)
+    runner.ascend_shared_experts = SimpleNamespace(
+        multistream_overlap=True,
+        prepare_for_router_overlap=MagicMock(side_effect=prepare_for_router_overlap),
+    )
     monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: True))
     monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
     monkeypatch.setattr(fused_moe_module.F, "linear", MagicMock(side_effect=router_linear))
 
-    router_logits, actual_shared_ready, actual_router_ready = runner._prepare_router_and_milestones(
-        hidden_states,
-        hidden_states,
+    router_logits, actual_shared_ready, actual_router_ready, actual_prepared_execution = (
+        runner._prepare_router_and_milestones(
+            prepared_shared_input,
+            hidden_states,
+            hidden_states,
+        )
     )
 
     assert operation_order == [
         "cast_router_input",
         "record_shared_input_ready",
+        "prepare_shared_input",
         "router_matmul",
         "record_router_output_ready",
     ]
     assert actual_shared_ready is shared_input_ready
     assert actual_router_ready is router_output_ready
+    assert actual_prepared_execution is prepared_execution
     torch.testing.assert_close(router_logits, original_linear(hidden_states.float(), gate_weight))
 
 
@@ -2528,6 +2565,11 @@ def test_forward_impl_keeps_full_width_input_for_shared_experts(monkeypatch):
     routed_out = torch.randn(2, 4)
     shared_out = torch.randn(2, 8)
     milestones = RoutedMoEMilestones()
+    prepared_execution = PreparedSharedExpertExecution(
+        hidden_states=shared_hidden_states,
+        gate_up_input=shared_hidden_states,
+        local_dp_metadata=None,
+    )
     runner.routed_experts = SimpleNamespace(forward_impl=MagicMock(return_value=(routed_out, milestones)))
     runner.routed_input_transform = object()
     runner.routed_output_transform = object()
@@ -2535,6 +2577,7 @@ def test_forward_impl_keeps_full_width_input_for_shared_experts(monkeypatch):
         multistream_overlap=True,
         parallel_mode=MagicMock(return_value=SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY),
         prepare_input_async=MagicMock(),
+        prepare_for_router_overlap=MagicMock(return_value=prepared_execution),
         forward=MagicMock(return_value=shared_out),
     )
     runner._sequence_parallel_context = MagicMock(return_value=nullcontext())
@@ -2569,7 +2612,10 @@ def test_forward_impl_keeps_full_width_input_for_shared_experts(monkeypatch):
     assert prepared_arg.hidden_states is shared_hidden_states
     assert prepared_arg.is_gathered
     assert milestones_arg is milestones
-    assert runner.ascend_shared_experts.forward.call_args.kwargs == {"defer_output_wait": True}
+    assert runner.ascend_shared_experts.forward.call_args.kwargs == {
+        "defer_output_wait": True,
+        "prepared_execution": prepared_execution,
+    }
     assert result[0] is shared_out
     assert result[1] is routed_out
 

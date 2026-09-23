@@ -36,6 +36,7 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method, setup
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
 from vllm_ascend.ops.fused_moe.shared_experts import (
     AscendSharedExperts,
+    PreparedSharedExpertExecution,
     SharedExpertParallelMode,
 )
 
@@ -406,23 +407,51 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         router_input = self._prepare_router_input(hidden_states, router_logits)
         return self._apply_router_linear(router_input)
 
+    def _prepare_shared_for_router_overlap(
+        self,
+        prepared_shared_input: PreparedSharedExpertInput,
+        shared_input_ready: torch.npu.Event,
+    ) -> PreparedSharedExpertExecution | None:
+        shared_experts = self.ascend_shared_experts
+        assert shared_experts is not None
+        if not getattr(shared_experts, "multistream_overlap", False):
+            return None
+        return shared_experts.prepare_for_router_overlap(
+            prepared_shared_input,
+            shared_input_ready,
+        )
+
     def _prepare_router_and_milestones(
         self,
+        prepared_shared_input: PreparedSharedExpertInput,
         shared_hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.npu.Event, torch.npu.Event]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.npu.Event,
+        torch.npu.Event,
+        PreparedSharedExpertExecution | None,
+    ]:
         if self.is_internal_router:
             router_input = self._prepare_router_input(shared_hidden_states, router_logits)
             # Release shared Vector/AIV preparation only after the router input
             # Cast. It then overlaps the Cube-heavy gate matmul instead of
             # competing with another Vector/AIV operation.
             shared_input_ready = torch.npu.current_stream().record_event()
+            prepared_execution = self._prepare_shared_for_router_overlap(
+                prepared_shared_input,
+                shared_input_ready,
+            )
             router_logits = self._apply_router_linear(router_input)
             router_output_ready = torch.npu.current_stream().record_event()
         else:
             shared_input_ready = torch.npu.current_stream().record_event()
+            prepared_execution = self._prepare_shared_for_router_overlap(
+                prepared_shared_input,
+                shared_input_ready,
+            )
             router_output_ready = shared_input_ready
-        return router_logits, shared_input_ready, router_output_ready
+        return router_logits, shared_input_ready, router_output_ready, prepared_execution
 
     def _forward_impl(
         self,
@@ -448,9 +477,12 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 if shared_input_is_gathered
                 else self.ascend_shared_experts.prepare_input_before_routed(shared_hidden_states)
             )
-            router_logits, shared_input_ready, router_output_ready = self._prepare_router_and_milestones(
-                shared_hidden_states,
-                router_logits,
+            router_logits, shared_input_ready, router_output_ready, prepared_execution = (
+                self._prepare_router_and_milestones(
+                    prepared_shared_input,
+                    shared_hidden_states,
+                    router_logits,
+                )
             )
             routed_out, milestones = self.routed_experts.forward_impl(
                 hidden_states=hidden_states,
@@ -463,9 +495,17 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             if prepared_shared_input.is_gathered:
                 milestones.routed_finalize_done = torch.npu.current_stream().record_event()
 
-            shared_out = self.ascend_shared_experts.forward(
-                prepared_shared_input,
-                milestones,
-                defer_output_wait=defer_shared_output_wait,
-            )
+            if prepared_execution is None:
+                shared_out = self.ascend_shared_experts.forward(
+                    prepared_shared_input,
+                    milestones,
+                    defer_output_wait=defer_shared_output_wait,
+                )
+            else:
+                shared_out = self.ascend_shared_experts.forward(
+                    prepared_shared_input,
+                    milestones,
+                    defer_output_wait=defer_shared_output_wait,
+                    prepared_execution=prepared_execution,
+                )
             return shared_out, routed_out
