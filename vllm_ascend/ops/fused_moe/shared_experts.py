@@ -501,10 +501,10 @@ class AscendSharedExperts:
         )
         shared_act = self.apply_activation(gate_up)
         # Prepare the Down input in the backend-selected routed Cube window.
-        # MC2 starts at GMM1 to provide more decode headroom; other staged
-        # backends start at GMM2. The Down Cube matmul remains after
-        # routed_combine_start so its Vector/AIV preparation can finish before
-        # the routed combine communication begins.
+        # MC2 and All2All start at GMM1 after dispatch; AllGather starts at
+        # GMM2. The Down Cube matmul remains after routed_combine_start so its
+        # Vector/AIV preparation can finish before the routed combine
+        # communication begins.
         down_input = self._prepare_linear_input_for_overlap(self.layer.down_proj, shared_act)
         self._wait_for_routed_stage(
             milestones,

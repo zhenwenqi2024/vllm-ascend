@@ -82,8 +82,8 @@ class MoECommMethod(ABC):
     """Base class for MoE communication methods."""
 
     # Staged communication backends normally place shared activation work at
-    # routed GMM2. MC2 decode has a shorter communication pipeline, so its
-    # implementation opts into the larger routed GMM1 + GMM2 Cube window.
+    # routed GMM2. Dispatch-based MC2 and All2All opt into the larger routed
+    # GMM1 + GMM2 Cube window.
     shared_activation_overlaps_routed_gmm1 = False
 
     def __init__(self, moe_config: FusedMoEConfig):
@@ -257,6 +257,8 @@ class AlltoAllCommImpl(MoECommMethod):
     between data parallel ranks before and after the MLP computation. It should
     have better performance than AllGatherCommImpl when DP size > 1.
     """
+
+    shared_activation_overlaps_routed_gmm1 = True
 
     def pad_and_split_input_ids(self, input_ids):
         return self.prepare_finalize.pad_and_split_input_ids(input_ids)  # type: ignore[attr-defined]

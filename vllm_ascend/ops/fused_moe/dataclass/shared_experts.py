@@ -41,8 +41,8 @@ class RoutedMoEMilestones:
     cover the routed input AllGather, or All2All preprocessing plus its forward
     exchange, without embedding communication-type branches in the shared
     expert implementation. ``shared_activation_overlap_start`` is selected by
-    the routed backend: MC2 exposes routed GMM1 start for its short decode
-    pipeline, while AllGather and All2All expose routed GMM2 start.
+    the routed backend: MC2 and All2All expose routed GMM1 start after their
+    dispatch stage, while AllGather exposes routed GMM2 start.
     """
 
     shared_input_ready: torch.npu.Event | None = None
