@@ -1444,7 +1444,7 @@ def test_linear_wrapper_uses_cv_parallel_milestones(monkeypatch):
     down_proj.assert_called_once_with(shared_act)
 
 
-def test_linear_wrapper_prequantizes_before_stage_waits(monkeypatch):
+def test_linear_wrapper_prepares_gate_input_before_router_stage(monkeypatch):
     operation_order = []
     hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
     quantized_gate_input = torch.ones(2, 6, dtype=torch.float8_e4m3fn)
@@ -1464,18 +1464,21 @@ def test_linear_wrapper_prequantizes_before_stage_waits(monkeypatch):
     shared_experts.multistream_overlap = True
     shared_experts.quant_type = QuantType.W8A8MXFP
     shared_experts.lora_context = None
+    shared_experts.parallel_mode = MagicMock(return_value=SharedExpertParallelMode.TENSOR_PARALLEL)
     shared_experts.part1 = MagicMock(side_effect=lambda value: (operation_order.append("gate_up"), gate_up)[1])
     shared_experts.apply_activation = MagicMock(
         side_effect=lambda _value: (operation_order.append("activation"), shared_act)[1]
     )
     shared_experts.part2 = MagicMock(side_effect=lambda *_args: (operation_order.append("down"), expected)[1])
     milestones = RoutedMoEMilestones(
+        shared_input_ready=MagicMock(),
         router_output_ready=MagicMock(),
         shared_activation_overlap_start=MagicMock(),
         routed_combine_start=MagicMock(),
     )
     stream = MagicMock()
     event_names = {
+        milestones.shared_input_ready: "shared_input",
         milestones.router_output_ready: "router",
         milestones.shared_activation_overlap_start: "activation_overlap",
         milestones.routed_combine_start: "combine",
@@ -1483,6 +1486,8 @@ def test_linear_wrapper_prequantizes_before_stage_waits(monkeypatch):
     stream.wait_event.side_effect = lambda event: operation_order.append(f"wait_{event_names[event]}")
 
     monkeypatch.setattr(shared_experts_module, "has_lora", lambda _: False)
+    monkeypatch.setattr(shared_experts_module, "npu_stream_switch", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(shared_experts_module, "shared_experts_calculation_stream", lambda: stream)
     monkeypatch.setattr(shared_experts_module.torch.npu, "current_stream", lambda: stream)
 
     def dynamic_quant(value, **_kwargs):
@@ -1495,15 +1500,22 @@ def test_linear_wrapper_prequantizes_before_stage_waits(monkeypatch):
     dynamic_quant = MagicMock(side_effect=dynamic_quant)
     monkeypatch.setattr(shared_experts_module.torch_npu, "npu_dynamic_mx_quant", dynamic_quant)
 
+    prepared_execution = shared_experts.prepare_for_router_overlap(
+        PreparedSharedExpertInput(hidden_states),
+        milestones.shared_input_ready,
+    )
+    assert prepared_execution is not None
     result = shared_experts._run_linear_wrapped_mlp(
         hidden_states,
         milestones,
         milestones.routed_combine_start,
         "routed_combine_start",
+        prepared_execution.gate_up_input,
     )
 
     assert result is expected
     assert operation_order == [
+        "wait_shared_input",
         "prequantize_gate_up",
         "wait_router",
         "gate_up",
