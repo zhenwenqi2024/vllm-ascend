@@ -1486,11 +1486,22 @@ def test_linear_wrapper_prepares_gate_input_before_router_stage(monkeypatch):
     shared_experts.quant_type = QuantType.W8A8MXFP
     shared_experts.lora_context = None
     shared_experts.parallel_mode = MagicMock(return_value=SharedExpertParallelMode.TENSOR_PARALLEL)
-    shared_experts.part1 = MagicMock(side_effect=lambda value: (operation_order.append("gate_up"), gate_up)[1])
-    shared_experts.apply_activation = MagicMock(
-        side_effect=lambda _value: (operation_order.append("activation"), shared_act)[1]
-    )
-    shared_experts.part2 = MagicMock(side_effect=lambda *_args: (operation_order.append("down"), expected)[1])
+
+    def gate_up_side_effect(_value):
+        operation_order.append("gate_up")
+        return gate_up
+
+    def activation_side_effect(_value):
+        operation_order.append("activation")
+        return shared_act
+
+    def down_side_effect(*_args):
+        operation_order.append("down")
+        return expected
+
+    shared_experts.part1 = MagicMock(side_effect=gate_up_side_effect)
+    shared_experts.apply_activation = MagicMock(side_effect=activation_side_effect)
+    shared_experts.part2 = MagicMock(side_effect=down_side_effect)
     milestones = RoutedMoEMilestones(
         shared_input_ready=MagicMock(),
         router_output_ready=MagicMock(),
