@@ -308,8 +308,11 @@ def test_load_model_reads_validated_draft_window_size():
     mock_adapter.assert_called_once_with(4096, 16, 8, 4, "cpu")
 
 
-@pytest.mark.parametrize("method,has_post_process", [("dspark", True), ("dspark", False), ("eagle3", True)])
-def test_load_model_aligns_dspark_before_precomputing_hidden_states(method, has_post_process):
+@pytest.mark.parametrize(
+    "method,has_post_process",
+    [("dspark", True), ("dspark", False), ("dflash", True), ("dflash", False), ("eagle3", True), ("mtp", True)],
+)
+def test_load_model_aligns_draft_after_sharing_before_precomputing_hidden_states(method, has_post_process):
     proposer = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
     proposer.vllm_config = SimpleNamespace(quant_config=object())
     proposer.maybe_eager_context = nullcontext()
@@ -354,7 +357,7 @@ def test_load_model_aligns_dspark_before_precomputing_hidden_states(method, has_
     ):
         proposer.load_model(MagicMock())
 
-    should_process = method == "dspark" and has_post_process
+    should_process = method in ("dspark", "dflash") and has_post_process
     expected = ["embeddings", "indices", "lm_head"]
     if should_process:
         expected.append("post_process")

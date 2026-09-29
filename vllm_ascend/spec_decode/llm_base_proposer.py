@@ -468,7 +468,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self._maybe_share_lm_head(target_language_model)
 
         # Align draft weights before precomputing draft hidden states.
-        if self.method == "dspark" and hasattr(self.model, "post_process"):
+        if self.method in ("dspark", "dflash") and hasattr(self.model, "post_process"):
             self.model.post_process(self.vllm_config)
 
         if (
