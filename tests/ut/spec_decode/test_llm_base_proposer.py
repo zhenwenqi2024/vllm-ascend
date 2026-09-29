@@ -353,6 +353,7 @@ def test_load_model_aligns_draft_after_sharing_before_precomputing_hidden_states
             side_effect=[{}, {"draft": draft_layer}, {"draft": draft_layer}],
         ),
         patch("vllm_ascend.ascend_config.get_ascend_config", return_value=SimpleNamespace(draft_window_size=None)),
+        patch(f"{module}.get_ascend_config", return_value=SimpleNamespace(draft_window_size=None)),
         patch(f"{module}.supports_multimodal", return_value=False),
     ):
         proposer.load_model(MagicMock())
