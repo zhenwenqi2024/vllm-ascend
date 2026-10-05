@@ -21,7 +21,8 @@ from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 def _make_runner(need_timing: bool = True):
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.ascend_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing))
+        scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing)),
+        sparse_kv_offload_config=SimpleNamespace(enabled=False),
     )
     runner.vllm_config = SimpleNamespace()
     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="other_model"))
@@ -827,6 +828,55 @@ def test_profile_run_skips_mc2_dummy_without_capacity():
     ):
         runner.profile_run()
     runner._dummy_run.assert_not_called()
+
+
+def test_profile_run_reserves_sparse_offload_topk_buffers():
+    runner = _make_runner()
+    sparse_cfg = SimpleNamespace(enabled=True)
+    runner.ascend_config.sparse_kv_offload_config = sparse_cfg
+    runner.get_kv_cache_spec = MagicMock(return_value={"layer.0": "host-spec"})
+    with (
+        patch("vllm_ascend.worker.v2.model_runner.allocate_kv_offload_topk_profile_buffers") as reserve,
+        patch("vllm_ascend.worker.v2.model_runner.get_mc2_tokens_capacity", return_value=None),
+        patch("vllm_ascend.worker.v2.model_runner.override_mrv2_in_profile_run", return_value=nullcontext()),
+        patch.object(GPUModelRunner, "profile_run"),
+    ):
+        runner.profile_run()
+
+    reserve.assert_called_once_with({"layer.0": "host-spec"}, runner.vllm_config, sparse_cfg)
+
+
+def test_register_sparse_kv_caches_binds_fused_target_and_draft_layers():
+    class FakeSFAOffloadImpl:
+        def __init__(self, shared, skip_topk):
+            self.topk_indices_buffer = shared
+            self.skip_topk = skip_topk
+            self.lim_indexer_owner = None
+            self.bind_copy_sfa_kv_cache = MagicMock()
+
+    runner = _make_runner()
+    manager = MagicMock()
+    manager.offload_layer_names = ["target.layer", "draft.layer"]
+    runner.sparse_kv_offload_manager = manager
+    runner.ascend_config.sparse_kv_offload_config.use_fused_copy_sfa = True
+    shared = torch.zeros(1, dtype=torch.int32)
+    owner = FakeSFAOffloadImpl(shared, False)
+    follower = FakeSFAOffloadImpl(shared, True)
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={
+            "target.layer": SimpleNamespace(impl=owner),
+            "draft.layer": SimpleNamespace(impl=follower),
+        }
+    )
+    caches = {"target.layer": object(), "draft.layer": object()}
+
+    with patch("vllm_ascend.attention.sfa_kv_offload.AscendSFAKVOffloadImpl", FakeSFAOffloadImpl):
+        runner._register_sparse_kv_caches(caches)
+
+    manager.register_kv_caches.assert_called_once_with(caches)
+    assert follower.lim_indexer_owner is owner
+    owner.bind_copy_sfa_kv_cache.assert_called_once_with(manager, "target.layer")
+    follower.bind_copy_sfa_kv_cache.assert_called_once_with(manager, "draft.layer")
 
 
 @pytest.mark.parametrize(("query_width", "expected_reqs"), [(7, 4), (None, 32)])

@@ -15,8 +15,12 @@ from vllm.logger import logger
 from vllm.utils.network_utils import make_zmq_path
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
+    MEMFABRIC_HANDSHAKE_BYTES,
+    MF_JOINED,
     MF_META,
     MF_META_ACK,
+    MF_NOT_READY,
+    MF_READY,
     READ_DONE,
     READ_FAILED,
     READ_READY_BATCH,
@@ -40,12 +44,22 @@ class ProducerSendState:
     layer_storage_slots: dict[int, tuple[int, ...]]
     producer_pp_rank: int = 0
     producer_pp_size: int = 1
+    handshake_engine: Any | None = None
+    handshake_ptr: int = 0
+
+
+@dataclass
+class PreconnectTask:
+    host: str
+    port: int
+    done_event: threading.Event
+    error: str | None = None
 
 
 class MembPullSendingThread(threading.Thread):
     """P-side sending thread for memfabric pull mode.
 
-    Does NOT push (no batch_transfer_sync_write). Instead, after each layer's
+    Does not push KV. Instead, after each layer's
     KV is ready in P HBM, notifies D via READ_READY_BATCH (ZMQ), and drains
     READ_DONE / READ_FAILED replies. First call sends MF_META (P session +
     layer addresses) to D.
@@ -63,7 +77,7 @@ class MembPullSendingThread(threading.Thread):
         self._state = state
         self.last_layer_idx = state.last_layer_idx
         self.ready_event = ready_event
-        self.send_queue: queue.Queue[SendTask] = queue.Queue()
+        self.send_queue: queue.Queue[SendTask | PreconnectTask] = queue.Queue()
         self._persist_ctx = zmq.Context()  # type: ignore[attr-defined]
         self._dealers: dict[str, Any] = {}
         self._stopped = False
@@ -117,6 +131,17 @@ class MembPullSendingThread(threading.Thread):
             while not self._stopped:
                 try:
                     send_task = self.send_queue.get(timeout=0.001)
+                    if isinstance(send_task, PreconnectTask):
+                        try:
+                            path = make_zmq_path("tcp", send_task.host, send_task.port)
+                            dealer = self._ensure_dealer(path)
+                            if path not in self._mf_meta_sent_paths:
+                                self._send_mf_meta(path, dealer, encoder)
+                        except Exception as error:
+                            send_task.error = str(error)
+                        finally:
+                            send_task.done_event.set()
+                        continue
                     try:
                         self._process_send_task(send_task, encoder)
                     except Exception as e:
@@ -164,6 +189,15 @@ class MembPullSendingThread(threading.Thread):
             self.join(timeout=timeout)
         if self.is_alive():
             logger.warning("MembPull send thread did not stop within %.1f seconds", timeout)
+
+    def preconnect(self, host: str, port: int) -> None:
+        """Block worker startup until D has read this P session once."""
+        task = PreconnectTask(host, port, threading.Event())
+        self.send_queue.put(task)
+        if not task.done_event.wait(timeout=self.timeout + 10.0):
+            raise RuntimeError(f"SFAPD preconnect to {host}:{port} timed out")
+        if task.error is not None:
+            raise RuntimeError(f"SFAPD preconnect to {host}:{port} failed: {task.error}")
 
     def record_p_save_event(self, layer_idx: int) -> None:
         evt = torch.npu.Event()
@@ -317,7 +351,41 @@ class MembPullSendingThread(threading.Thread):
                     raise RuntimeError("SFAPD producer PP>1 requires a PP-aware D; received a legacy MF_META ACK")
             elif len(payload) == 1:
                 reply = msgspec.msgpack.Decoder(type=tuple).decode(payload[0])
-                if reply != (MF_META_ACK, SFAPD_PROTOCOL_VERSION):
+                if reply == (MF_META_ACK, SFAPD_PROTOCOL_VERSION):
+                    if self._state.handshake_engine is not None:
+                        raise RuntimeError("D did not advertise a MemFabric handshake destination")
+                elif (
+                    len(reply) == 4
+                    and reply[:2] == (MF_META_ACK, SFAPD_PROTOCOL_VERSION)
+                    and self._state.handshake_engine is not None
+                ):
+                    d_session, d_handshake_ptr = reply[2:]
+                    if not isinstance(d_session, str) or not isinstance(d_handshake_ptr, int) or d_handshake_ptr <= 0:
+                        raise RuntimeError(f"Invalid MemFabric handshake destination: {reply!r}")
+                    ret = self._state.handshake_engine.batch_transfer_sync_write(
+                        d_session,
+                        [self._state.handshake_ptr],
+                        [d_handshake_ptr],
+                        [MEMFABRIC_HANDSHAKE_BYTES],
+                    )
+                    if ret != 0:
+                        raise RuntimeError(f"MemFabric P-to-D handshake transfer failed: ret={ret}")
+                    # A successful P-to-D write only establishes the client
+                    # connection. D must prove that it can read this P session
+                    # before the first layer notification is allowed through.
+                    dealer.send(encoder.encode((MF_JOINED, SFAPD_PROTOCOL_VERSION, self._state.handshake_ptr)))
+                    if not dealer.poll(timeout=int(self.timeout * 1000)):
+                        raise RuntimeError("MemFabric D-to-P readiness probe timed out")
+                    ready_frames = dealer.recv_multipart()
+                    ready_payload = [frame for frame in ready_frames if frame != b""]
+                    if len(ready_payload) != 1:
+                        raise RuntimeError(f"Invalid MemFabric readiness response: {ready_payload!r}")
+                    ready_reply = msgspec.msgpack.Decoder(type=tuple).decode(ready_payload[0])
+                    if ready_reply != (MF_READY, SFAPD_PROTOCOL_VERSION):
+                        if ready_reply[:2] == (MF_NOT_READY, SFAPD_PROTOCOL_VERSION):
+                            raise RuntimeError(f"MemFabric D-to-P readiness probe failed: {ready_reply[2:]!r}")
+                        raise RuntimeError(f"Unexpected MemFabric readiness response: {ready_reply!r}")
+                else:
                     raise RuntimeError(f"MembPull P MF_META got unexpected reply: {reply!r}")
             else:
                 raise RuntimeError(f"MembPull P MF_META got unexpected reply: {payload!r}")

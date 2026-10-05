@@ -64,6 +64,10 @@ from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+    allocate_kv_offload_topk_profile_buffers,
+    init_sparse_kv_offload_manager,
+)
 from vllm_ascend.models.deepseek_v41.cache_config import uses_a5_packed_cache
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import (
@@ -116,6 +120,7 @@ class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.sparse_kv_offload_manager = None
         self.kvpp = KVPPRuntime()
         # Adaptive verification uses this flag to apply FIA-specific query
         # boundary and sequence length padding during FULL graph execution.
@@ -316,6 +321,15 @@ class NPUModelRunner(GPUModelRunner):
         kv_cache_config: KVCacheConfig,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> None:
+        sparse_cfg = self.ascend_config.sparse_kv_offload_config
+        if sparse_cfg.enabled:
+            self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
+                self.vllm_config, kv_cache_config, sparse_cfg
+            )
+            self.model_state._offload_live_req_ids = self.req_states.req_id_to_index
+            self.model_state._offload_draft_layer_names = (
+                getattr(self.speculator, "draft_attn_layer_names", set()) if sparse_cfg.use_fused_copy_sfa else set()
+            )
         with graph_manager_wrapper(self):
             super().initialize_kv_cache(
                 kv_cache_config,
@@ -328,6 +342,8 @@ class NPUModelRunner(GPUModelRunner):
                 self.model_state.pcp_manager = self.pcp_manager
                 if self.speculator is not None:
                     self.speculator.pcp_manager = self.pcp_manager
+        if sparse_cfg.enabled and self.speculator is not None:
+            self.model_state._offload_draft_attn_groups = getattr(self.speculator, "attn_groups", [])
         if any(is_circular_kv_cache_spec(group.kv_cache_spec) for group in self.kv_cache_config.kv_cache_groups):
             from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
 
@@ -373,6 +389,36 @@ class NPUModelRunner(GPUModelRunner):
             static_forward_context=self.compilation_config.static_forward_context,
         )
         self.model_state.kvpp_runtime = self.kvpp
+
+    def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
+        """Bind host pools before the V2 KV connector registers its destinations."""
+        manager = self.sparse_kv_offload_manager
+        if manager is None:
+            return
+        manager.register_kv_caches(kv_caches)
+        if not self.ascend_config.sparse_kv_offload_config.use_fused_copy_sfa:
+            return
+
+        from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl
+
+        owners: dict[int, AscendSFAKVOffloadImpl] = {}
+        for layer in self.compilation_config.static_forward_context.values():
+            impl = getattr(layer, "impl", None)
+            if not isinstance(impl, AscendSFAKVOffloadImpl):
+                continue
+            shared = impl.topk_indices_buffer
+            if shared is None:
+                continue
+            key = shared.data_ptr()
+            if impl.skip_topk:
+                if key not in owners:
+                    raise RuntimeError("fused_copy_sfa shared attention precedes its indexer owner")
+                impl.lim_indexer_owner = owners[key]
+            else:
+                owners[key] = impl
+        for layer_name in manager.offload_layer_names:
+            layer = self.compilation_config.static_forward_context[layer_name]
+            layer.impl.bind_copy_sfa_kv_cache(manager, layer_name)
 
     @torch.inference_mode()
     def execute_model(
@@ -449,6 +495,9 @@ class NPUModelRunner(GPUModelRunner):
         necessary HCCL buffer for the MC2 operator before standard `profile_run`. Additionally, we set
         override_mrv2_in_profile_run to True to force moe load to be balanced when executing `profile_run`
         """
+        sparse_cfg = self.ascend_config.sparse_kv_offload_config
+        if sparse_cfg.enabled:
+            allocate_kv_offload_topk_profile_buffers(self.get_kv_cache_spec(), self.vllm_config, sparse_cfg)
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         with override_mrv2_in_profile_run(True):
             if (

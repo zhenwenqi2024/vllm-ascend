@@ -18,8 +18,13 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
+    MEMFABRIC_HANDSHAKE_BYTES,
+    MEMFABRIC_HANDSHAKE_SLOTS,
+    MF_JOINED,
     MF_META,
     MF_META_ACK,
+    MF_NOT_READY,
+    MF_READY,
     READ_DONE,
     READ_FAILED,
     READ_READY_BATCH,
@@ -31,6 +36,8 @@ READ_THREAD_POLL_TIMEOUT_MS = 100
 THREAD_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 DEST_BLOCK_WAIT_TIMEOUT = 2.0
 DEST_BLOCK_WAIT_INTERVAL = 0.001
+MEMFABRIC_READY_TIMEOUT = 10.0
+MEMFABRIC_READY_RETRY_INTERVAL = 0.05
 
 
 @dataclass
@@ -100,6 +107,8 @@ class MembPullReadThread(threading.Thread):
         side_channel_port: int,
         engine: Any,
         state: ConsumerReadState,
+        handshake_session: str | None = None,
+        handshake_ptr: int = 0,
     ):
         super().__init__(daemon=True, name=f"MembPullReadThread-TP{tp_rank}")
         self.tp_rank = tp_rank
@@ -112,6 +121,12 @@ class MembPullReadThread(threading.Thread):
         self._p_sessions: dict[bytes, str] = {}
         self._p_layer_metas: dict[bytes, dict[str, Any]] = {}
         self._p_pp_topology: dict[bytes, tuple[int, int]] = {}
+        self._handshake_session = handshake_session
+        self._handshake_ptr = handshake_ptr
+        self._handshake_slots: dict[bytes, int] = {}
+        self._free_handshake_slots: list[int] = []
+        self._next_handshake_slot = 0
+        self._ready_sessions: set[bytes] = set()
         self._done_requests: set[str] = set()
         self._failed_requests: set[str] = set()
         # Request completion needs every flattened PP/TP contributor.
@@ -155,6 +170,17 @@ class MembPullReadThread(threading.Thread):
             failed = self._failed_requests
             self._failed_requests = set()
             return failed
+
+    def _await_session_readable(self, p_session: str, probe_source: int, probe_dest: int) -> int:
+        """Bound the initial reverse-read race before any layer KV is pulled."""
+        deadline = time.monotonic() + MEMFABRIC_READY_TIMEOUT
+        while True:
+            ret = self.engine.batch_transfer_sync_read(
+                p_session, [probe_dest], [probe_source], [MEMFABRIC_HANDSHAKE_BYTES]
+            )
+            if ret == 0 or time.monotonic() >= deadline:
+                return ret
+            time.sleep(MEMFABRIC_READY_RETRY_INTERVAL)
 
     def run(self):
         from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
@@ -221,6 +247,7 @@ class MembPullReadThread(threading.Thread):
                         self._p_sessions[identity] = p_session
                         self._p_layer_metas[identity] = p_layer_meta
                         self._p_pp_topology[identity] = (pp_rank, pp_size)
+                        self._ready_sessions.discard(identity)
                         logger.info(
                             "Received MF_META: P session=%s, %d layers", self._p_session, len(self._p_layer_meta)
                         )
@@ -236,8 +263,55 @@ class MembPullReadThread(threading.Thread):
                                 )
                         if len(msg) == 3:
                             sock.send_multipart((identity, b"", b"ACK"))
+                        elif self._handshake_session is not None:
+                            slot = self._handshake_slots.get(identity)
+                            if slot is None:
+                                if self._free_handshake_slots:
+                                    slot = self._free_handshake_slots.pop()
+                                else:
+                                    slot = self._next_handshake_slot
+                                    if slot >= MEMFABRIC_HANDSHAKE_SLOTS:
+                                        raise RuntimeError("Too many concurrent MemFabric P handshakes")
+                                    self._next_handshake_slot += 1
+                                self._handshake_slots[identity] = slot
+                            ptr = self._handshake_ptr + slot * MEMFABRIC_HANDSHAKE_BYTES
+                            sock.send_multipart(
+                                (
+                                    identity,
+                                    b"",
+                                    encoder.encode((MF_META_ACK, SFAPD_PROTOCOL_VERSION, self._handshake_session, ptr)),
+                                )
+                            )
                         else:
                             sock.send_multipart((identity, b"", encoder.encode((MF_META_ACK, SFAPD_PROTOCOL_VERSION))))
+
+                    elif msg_type == MF_JOINED:
+                        p_session = self._p_sessions.get(identity)
+                        slot = self._handshake_slots.get(identity)
+                        if (
+                            len(msg) != 3
+                            or msg[1] != SFAPD_PROTOCOL_VERSION
+                            or not isinstance(msg[2], int)
+                            or msg[2] <= 0
+                            or p_session is None
+                            or slot is None
+                            or self._handshake_session is None
+                        ):
+                            raise ValueError("Invalid MemFabric join request")
+                        probe_dest = self._handshake_ptr + slot * MEMFABRIC_HANDSHAKE_BYTES
+                        ret = self._await_session_readable(p_session, msg[2], probe_dest)
+                        if ret == 0:
+                            self._ready_sessions.add(identity)
+                            sock.send_multipart((identity, b"", encoder.encode((MF_READY, SFAPD_PROTOCOL_VERSION))))
+                            logger.info("MemFabric D-to-P session ready: %s", p_session)
+                        else:
+                            sock.send_multipart(
+                                (identity, b"", encoder.encode((MF_NOT_READY, SFAPD_PROTOCOL_VERSION, str(ret))))
+                            )
+                            logger.error(
+                                "MemFabric D-to-P readiness probe timed out: session=%s, ret=%s", p_session, ret
+                            )
+                        self._free_handshake_slots.append(self._handshake_slots.pop(identity))
 
                     elif msg_type == READ_READY_BATCH:
                         layer_idx = msg[1]
@@ -281,6 +355,8 @@ class MembPullReadThread(threading.Thread):
                                 raise RuntimeError(
                                     "MF_META was not received from this P connection before READ_READY_BATCH"
                                 )
+                            if self._handshake_session is not None and identity not in self._ready_sessions:
+                                raise RuntimeError("MemFabric D-to-P session is not ready before READ_READY_BATCH")
                             if read_reqs:
                                 self._do_read_batch(
                                     layer_name,

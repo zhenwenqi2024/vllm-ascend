@@ -1732,7 +1732,7 @@ class SparseKVOffloadConfig:
         if parallel_config.prefill_context_parallel_size * parallel_config.decode_context_parallel_size > 1:
             raise ValueError("Sparse KV offload don't support context parallel now.")
         if parallel_config.pipeline_parallel_size > 1:
-            raise ValueError("Sparse KV offload don't support pipeline parallel now.")
+            raise ValueError("Sparse KV offload requires a single-stage D node; P-side PP is supported.")
         if self.keep_device_kv_cache:
             logger.warning_once(
                 "Init sparse KV offload with keep_device_kv_cache enabled, "
@@ -1747,9 +1747,6 @@ class SparseKVOffloadConfig:
                     "and can only be used in D node. For debugging in PD colocate scenario, "
                     "you can enable keep_device_kv_cache."
                 )
-        if vllm_config.use_v2_model_runner:
-            raise ValueError("Sparse KV offload doesn't support model_runner_v2 now.")
-
         self.topk = vllm_config.model_config.hf_text_config.index_topk
         if self.use_fused_copy_sfa:
             if vllm_config.speculative_config and vllm_config.speculative_config.method == "dspark":

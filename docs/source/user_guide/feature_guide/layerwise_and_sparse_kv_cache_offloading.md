@@ -232,6 +232,7 @@ The `SfaRemoteD2HConnector` entry accepts the following options:
 | :--- | :--- |
 | `transfer_backend` | Transfer backend. `memfabric` is the only supported value. |
 | `memfabric_transfer_protocol` | MemFabric data-path protocol: `sdma` (default) and `device_rdma` for A3 series, `device_urma` for 950PR&950DT Products. Must be set to the same value on Prefill and Decode. Invalid values abort startup. |
+| `memfabric_store_server_role` | MemFabric configuration-store owner: `Prefill` (default) or `Decode`. For Prefill-side PP greater than 1, set `Decode` on both P and D so all P stages join one address domain per D TP rank. The connector performs a small registered handshake transfer before the first KV pull. |
 
 The following log confirms that buffer reuse is enabled:
 
@@ -245,7 +246,30 @@ Requirements:
 
 - use disaggregated Prefill/Decode deployment;
 - enable the feature only on Decode; and
-- use Model Runner V1.
+- use Model Runner V1 or V2 on Decode. Keep Decode at pipeline parallel size 1;
+  Prefill can use pipeline parallelism with the producer connector.
+- for Prefill-side PP greater than 1, set
+  `"memfabric_store_server_role": "Decode"` in
+  `kv_connector_extra_config` on both Prefill and Decode.
+
+For a fixed P/D topology, start Decode first and add these Prefill-side
+`kv_connector_extra_config` fields to make Prefill startup wait until every
+producer worker has passed a real MemFabric reverse-read probe:
+
+```json
+{
+    "memfabric_preconnect_decode_host": "decode-host",
+    "memfabric_preconnect_decode_port": 20050,
+    "memfabric_preconnect_decode_tp_size": 8
+}
+```
+
+The port is Decode's base `kv_port`; each Prefill TP rank maps to the
+corresponding Decode TP port. Without these fields, the connector performs
+the same bounded readiness handshake on first use of each P/D session before
+notifying Decode of ready KV layers. A successful `/health` response alone
+does not check remote sessions. Deploy the same connector protocol version on
+both sides.
 
 Add the following options to the Decode launch command:
 
@@ -323,6 +347,7 @@ The fused path has these additional requirements:
 | :--- | :--- | :--- |
 | No speculative decoding | 1 | 2048 |
 | MTP1 | 2 | 4096 |
+| MTP2 | 3 | 6144 |
 | MTP3 | 4 | 8192 |
 | MTP5 | 6 | 12288 |
 
@@ -373,6 +398,10 @@ graph mode configured by `--compilation-config`; do not add a top-level
 disabled, and `keep_device_kv_cache=false` keeps the full main KV in the host
 pool. With DP2, the example reserves `2 * 128 = 256` GiB of host KV memory.
 
+Model Runner V2 uses the same sparse-offload configuration, including MTP and
+`fused_copy_sfa`: set `VLLM_USE_V2_MODEL_RUNNER=1`. For an eager V2 launch,
+replace the graph compilation option with a top-level `--enforce-eager`.
+
 ## 4. Start the P/D Proxy
 
 Start Prefill and Decode with the configurations above. After both nodes are
@@ -395,7 +424,8 @@ For multi-node deployment, advertise reachable addresses instead of
 
 - Shared-buffer Layerwise Prefill Offload requires Memcache and eager mode.
 - Context parallelism has not been validated with Layerwise Prefill Offload.
-- Sparse Decode Offload supports DP and TP; CP and PP are not supported.
+- Sparse Decode Offload supports DP and TP on Decode; CP and Decode-side PP
+  are not supported. Prefill-side PP is supported with the producer connector.
 - MemFabric is the only supported `SfaRemoteD2HConnector` transfer backend.
 - The MemFabric data-path protocol is selected by launch configuration instead
   of hardware detection: use `sdma` (default) or `device_rdma` on A3 series and

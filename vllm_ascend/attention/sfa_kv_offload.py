@@ -38,6 +38,7 @@ from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.indexer import (
     INDEXER_K_CACHE_SLOT,
@@ -630,7 +631,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             "cudagraph_runtime_mode",
             CUDAGraphMode.NONE,
         )
-        return forward_context.capturing or runtime_mode not in (
+        return bool(_EXTRA_CTX.capturing) or runtime_mode not in (
             None,
             CUDAGraphMode.NONE,
         )
@@ -1087,7 +1088,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             or self.fused_overlap_last_req_ids.device != device
         )
         if needs_realloc:
-            if get_forward_context().capturing:
+            if _EXTRA_CTX.capturing:
                 raise RuntimeError(
                     "fused_overlap selection state must be preallocated before "
                     "NPUGraph capture: "
@@ -1153,7 +1154,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             raise RuntimeError("fused_overlap offload requires req_ids_tensor metadata for selection invalidation")
         device = last_req_ids.device
         token_to_req = attn_metadata.token_to_req[:num_tokens].to(device=device, dtype=torch.long)
-        if not get_forward_context().capturing:
+        if not _EXTRA_CTX.capturing:
             invalid_req_mapping = (token_to_req < 0) | (token_to_req >= num_reqs)
             if bool(invalid_req_mapping.any().item()):
                 raise RuntimeError(
@@ -1222,7 +1223,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 "fused_overlap full_kv_actual_seq must have one entry per decode "
                 f"request: got {full_kv_actual_seq.numel()} for num_reqs={num_reqs}"
             )
-        if get_forward_context().capturing:
+        if _EXTRA_CTX.capturing:
             return
         token_to_req = attn_metadata.token_to_req[:num_tokens]
         if token_to_req.numel() != num_tokens:
@@ -1268,7 +1269,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             .to(dtype=torch.int32)
             .contiguous()
         )
-        if not get_forward_context().capturing and bool((token_kv_lens <= 0).any().item()):
+        if not _EXTRA_CTX.capturing and bool((token_kv_lens <= 0).any().item()):
             raise RuntimeError(
                 "fused_overlap MTP flatten produced non-positive per-token kv lenses: "
                 f"token_kv_lens={token_kv_lens.detach().cpu().tolist()}"
@@ -1503,7 +1504,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             stable_prefix_lens_npu=common_inputs.stable_prefix_lens,
             visible_seq_lens_npu=full_kv_actual_seq,
             selection_membership_map=selection_membership_map,
-            capturing=get_forward_context().capturing,
+            capturing=bool(_EXTRA_CTX.capturing),
             skip_topk=self.skip_topk,
         )
         if not external_plan_prepared:
@@ -1545,11 +1546,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             num_tokens=num_tokens,
             selection_kv_cache=selection_kv_cache,
             selection_k_rope=selection_k_rope,
-            capturing=get_forward_context().capturing,
+            capturing=bool(_EXTRA_CTX.capturing),
         )
         attn_output = fused_op(**fused_inputs)
         attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
-        manager.wait_for_current_kv_writeback(get_forward_context().capturing)
+        manager.wait_for_current_kv_writeback(bool(_EXTRA_CTX.capturing))
         return attn_output
 
     def _execute_sparse_flash_attention_process(

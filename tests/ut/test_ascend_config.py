@@ -917,6 +917,58 @@ class TestSparseKVOffloadConfig(TestBase):
         self.assertFalse(config.keep_device_kv_cache)
         self.assertTrue(config.use_fused_overlap)
 
+    def test_v2_decode_offload_allows_p_side_pp(self):
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=128)),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                pipeline_parallel_size=1,
+            ),
+            kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
+            use_v2_model_runner=True,
+            speculative_config=None,
+        )
+
+        config = SparseKVOffloadConfig.from_additional_config(vllm_config, {"enabled": True})
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.topk, 128)
+
+        # P-side PP does not enable offload; D-side PP remains unsupported.
+        vllm_config.parallel_config.pipeline_parallel_size = 2
+        with self.assertRaisesRegex(ValueError, "single-stage D node"):
+            SparseKVOffloadConfig.from_additional_config(vllm_config, {"enabled": True})
+
+    def test_v2_offload_accepts_v1_fused_and_mtp_combinations(self):
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=2048)),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                pipeline_parallel_size=1,
+            ),
+            kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
+            use_v2_model_runner=True,
+            speculative_config=None,
+        )
+        fused = SparseKVOffloadConfig.from_additional_config(
+            vllm_config, {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": 4096}
+        )
+        self.assertTrue(fused.use_fused_copy_sfa)
+
+        vllm_config.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=1)
+        self.assertTrue(SparseKVOffloadConfig.from_additional_config(vllm_config, {"enabled": True}).enabled)
+        fused_mtp = SparseKVOffloadConfig.from_additional_config(
+            vllm_config, {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": 4096}
+        )
+        self.assertTrue(fused_mtp.use_fused_copy_sfa)
+
+        vllm_config.speculative_config.num_speculative_tokens = 2
+        fused_mtp2 = SparseKVOffloadConfig.from_additional_config(
+            vllm_config, {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": 6144}
+        )
+        self.assertTrue(fused_mtp2.use_fused_copy_sfa)
+
     def test_fused_copy_sfa_rejects_dspark(self):
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=2048)),

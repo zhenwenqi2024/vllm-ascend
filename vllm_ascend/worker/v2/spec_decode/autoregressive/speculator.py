@@ -27,8 +27,10 @@ import torch
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dcp_group
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -37,11 +39,15 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import AutoRegressiveSpeculator
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+    update_sparse_kv_offload_metadata,
+)
 from vllm_ascend.worker.dcp_utils import DCPManager
 from vllm_ascend.worker.v2.aclgraph_utils import _get_graph_update_backend
 from vllm_ascend.worker.v2.attn_utils import (
@@ -115,6 +121,17 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         # draft model's input_batch. so we keep a reference here.
         self.input_batch: InputBatch | None = None
         self.pcp_manager: AscendPCPManager | None = None
+        self._offload_draft_req_ids: list[CpuGpuBuffer] = []
+        self._offload_draft_token_to_req: list[CpuGpuBuffer] = []
+        if get_ascend_config().sparse_kv_offload_config.enabled:
+            pin_memory = is_pin_memory_available()
+            for _ in range(self.num_speculative_steps):
+                self._offload_draft_req_ids.append(
+                    CpuGpuBuffer(self.max_num_reqs, dtype=torch.int64, device=device, pin_memory=pin_memory)
+                )
+                self._offload_draft_token_to_req.append(
+                    CpuGpuBuffer(self.max_num_tokens, dtype=torch.int32, device=device, pin_memory=pin_memory)
+                )
 
     def _init_dcp(self) -> None:
         self.use_dcp = self.draft_vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -542,12 +559,43 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
 
         # Upstream's uniform builder calls self._build_attn_metadata, so this
         # single hook also covers graph capture and eager draft decode.
+        offload_kwargs = None
+        if self._offload_draft_req_ids:
+            num_reqs_padded = batch_desc.num_reqs or num_reqs
+            num_tokens = int(query_start_loc_np[num_reqs])
+            num_tokens_padded = batch_desc.num_tokens if batch_desc.cg_mode == CUDAGraphMode.FULL else num_tokens
+            req_ids_buffer = self._offload_draft_req_ids[step]
+            token_to_req_buffer = self._offload_draft_token_to_req[step]
+            req_ids = self.input_batch.req_ids[:num_reqs]
+            if getattr(self.input_batch, "is_dummy", False):
+                req_ids = [f"offload-dummy-{row}" for row in range(num_reqs)]
+            update_sparse_kv_offload_metadata(
+                num_tokens,
+                num_reqs,
+                num_tokens_padded,
+                num_reqs_padded,
+                req_ids,
+                query_start_loc_np,
+                req_ids_buffer,
+                token_to_req_buffer,
+            )
+            pool_slots = self.model_state._offload_pool_slots
+            pool_active = self.model_state._offload_pool_active
+            offload_kwargs = {
+                "req_ids_tensor": req_ids_buffer.gpu[:num_reqs_padded],
+                "token_to_req": token_to_req_buffer.gpu[:num_tokens_padded],
+                "req_topk_buffer_slots": pool_slots.cpu[:num_reqs_padded] if pool_slots is not None else None,
+                "req_topk_buffer_active": pool_active.cpu[:num_reqs_padded] if pool_active is not None else None,
+                "copy_sfa_draft_index": step,
+                "offload_dummy": getattr(self.input_batch, "is_dummy", False),
+            }
         with build_attn_metadata_factory(
             self.input_buffers.positions,
             batch_desc.num_tokens,
             is_prefilling,
             seq_lens_cpu=seq_lens_cpu,
             parallel_config=self.draft_vllm_config.parallel_config,
+            offload_kwargs=offload_kwargs,
         ):
             attn_metadata = super()._build_attn_metadata(
                 num_reqs,

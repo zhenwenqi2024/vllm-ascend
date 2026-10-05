@@ -407,7 +407,7 @@ def update_sparse_kv_offload_metadata(
     num_tokens_padded: int,
     num_reqs_padded: int,
     req_ids: list[str],
-    query_start_loc: CpuGpuBuffer,
+    query_start_loc: CpuGpuBuffer | torch.Tensor | np.ndarray,
     offload_req_ids_tensor: CpuGpuBuffer,
     offload_token_to_req: CpuGpuBuffer,
 ) -> None:
@@ -428,8 +428,15 @@ def update_sparse_kv_offload_metadata(
     offload_req_ids_tensor.np[:effective_num_reqs] = req_id_values
     offload_req_ids_tensor.copy_to_gpu(num_reqs_padded)
 
-    query_start_loc_cpu = query_start_loc.cpu[: num_reqs + 1]
-    query_lens = np.diff(query_start_loc_cpu.numpy()).astype(np.int32, copy=False)
+    if isinstance(query_start_loc, CpuGpuBuffer):
+        query_start_loc_cpu = query_start_loc.cpu[: num_reqs + 1].numpy()
+    elif isinstance(query_start_loc, torch.Tensor):
+        if query_start_loc.device.type != "cpu":
+            raise ValueError("Sparse KV offload query boundaries must have a CPU mirror")
+        query_start_loc_cpu = query_start_loc[: num_reqs + 1].numpy()
+    else:
+        query_start_loc_cpu = query_start_loc[: num_reqs + 1]
+    query_lens = np.diff(query_start_loc_cpu).astype(np.int32, copy=False)
     token_to_req = np.repeat(np.arange(num_reqs, dtype=np.int32), query_lens)
     if token_to_req.shape[0] < num_tokens:
         raise RuntimeError(
@@ -1117,14 +1124,15 @@ class SparseKVOffloadManager:
         dense_fills: dict[int, tuple[int, int]],
         *,
         block_size: int,
-        block_table: np.ndarray,
+        block_table: np.ndarray | torch.Tensor,
     ) -> None:
         """Restore whole short rows from the host pool after prefix rollback.
 
         A rollback across the hot boundary leaves a sparse-layout row under a
-        dense (-3) reader. Restore it using the input batch's CPU block table
-        and block size, outside graph capture at metadata-build time. Host and
-        device bases are bound during cache registration.
+        dense (-3) reader. Restore it using the input batch's block table
+        (a CPU mirror in V1 or a device tensor in V2) and block size, outside
+        graph capture at metadata-build time. Host and device bases are bound
+        during cache registration.
         """
         topk_k = self.topk_buffers_k[0]
         stride_tokens = topk_k.shape[1]
@@ -1138,9 +1146,12 @@ class SparseKVOffloadManager:
         )
         for slot, (row, computed) in dense_fills.items():
             nblocks = (computed + block_size - 1) // block_size
-            src_tokens = torch.tensor(
-                [int(block_table[row, b]) * block_size for b in range(nblocks)], dtype=torch.int64
-            ).to(topk_k.device)
+            if isinstance(block_table, torch.Tensor):
+                src_tokens = block_table[row, :nblocks].to(device=topk_k.device, dtype=torch.int64) * block_size
+            else:
+                src_tokens = torch.tensor(
+                    [int(block_table[row, b]) * block_size for b in range(nblocks)], dtype=torch.int64
+                ).to(topk_k.device)
             lengths = torch.clamp(
                 torch.arange(nblocks, dtype=torch.int64, device=topk_k.device) * (-block_size) + computed,
                 min=0,
