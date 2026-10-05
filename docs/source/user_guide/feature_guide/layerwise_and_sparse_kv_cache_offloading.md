@@ -232,7 +232,7 @@ The `SfaRemoteD2HConnector` entry accepts the following options:
 | :--- | :--- |
 | `transfer_backend` | Transfer backend. `memfabric` is the only supported value. |
 | `memfabric_transfer_protocol` | MemFabric data-path protocol: `sdma` (default) and `device_rdma` for A3 series, `device_urma` for 950PR&950DT Products. Must be set to the same value on Prefill and Decode. Invalid values abort startup. |
-| `memfabric_store_server_role` | MemFabric configuration-store owner: `Prefill` (default) or `Decode`. For Prefill-side PP greater than 1, set `Decode` on both P and D so all P stages join one address domain per D TP rank. The connector performs a small registered handshake transfer before the first KV pull. |
+| `memfabric_store_server_role` | MemFabric configuration-store owner: `Prefill` (default) or `Decode`. For Prefill-side PP greater than 1, set `Decode` on both P and D so all P stages join one address domain per D TP rank. A P-owned store per stage restarts MemFabric rank numbering at zero, causing the D worker to import overlapping GVA windows; the connector rejects that topology at startup. The connector performs a small registered handshake transfer before the first KV pull. |
 
 The following log confirms that buffer reuse is enabled:
 

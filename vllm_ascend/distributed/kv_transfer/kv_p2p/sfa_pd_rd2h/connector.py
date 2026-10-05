@@ -32,6 +32,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.worker import (
     SFAPDRD2HConsumerWorker,
     SFAPDRD2HProducerWorker,
 )
+from vllm_ascend.distributed.kv_transfer.utils.memfabric_transfer_engine import MEMFABRIC_ROLE_PREFILL
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -39,6 +40,22 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 _LAYER_IDX_RE = re.compile(r"layers\.(\d+)")
+
+
+def _validate_memfabric_store_topology(vllm_config: VllmConfig, is_producer: bool) -> None:
+    """Reject separate P-owned GVA domains for a multi-stage Prefill."""
+    if not is_producer or vllm_config.parallel_config.pipeline_parallel_size <= 1:
+        return
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+    if extra.get("transfer_backend") != "memfabric":
+        return
+    if extra.get("memfabric_store_server_role", MEMFABRIC_ROLE_PREFILL) == MEMFABRIC_ROLE_PREFILL:
+        raise ValueError(
+            "SfaRemoteD2HConnector with Prefill PP > 1 requires "
+            'kv_connector_extra_config["memfabric_store_server_role"]="Decode" on both P and D. '
+            "With a Prefill-owned store, each P stage creates a separate MemFabric rank-0 GVA domain; "
+            "the D worker cannot import both into one address space."
+        )
 
 
 class SfaRemoteD2HConnector(KVConnectorBase_V1, SupportsHMA):
@@ -64,6 +81,7 @@ class SfaRemoteD2HConnector(KVConnectorBase_V1, SupportsHMA):
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.is_producer = vllm_config.kv_transfer_config.is_kv_producer
         self.is_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+        _validate_memfabric_store_topology(vllm_config, self.is_producer)
         self.requires_full_blocks_on_update_after_alloc = role == KVConnectorRole.SCHEDULER and self.is_producer
         # SFA path is layer-wise on both sides.
         self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", True)

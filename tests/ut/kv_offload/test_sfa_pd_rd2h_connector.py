@@ -27,6 +27,7 @@ from examples.disaggregated_prefill_v1.load_balance_proxy_layerwise_server_examp
 from vllm_ascend.distributed.kv_transfer import register_connector  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.connector import (  # noqa: E402
     SfaRemoteD2HConnector,
+    _validate_memfabric_store_topology,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (  # noqa: E402
     BATCH_KV_TRANSFER_PARAMS,
@@ -80,6 +81,25 @@ def test_sfa_remote_d2h_connector_is_registered():
         "vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.connector",
         "SfaRemoteD2HConnector",
     )
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+@pytest.mark.parametrize("store_role", [None, "Prefill", "Decode"])
+def test_prefill_pp_memfabric_store_topology(pp_size, store_role):
+    extra = {"transfer_backend": "memfabric"}
+    if store_role is not None:
+        extra["memfabric_store_server_role"] = store_role
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
+        kv_transfer_config=SimpleNamespace(kv_connector_extra_config=extra),
+    )
+
+    if pp_size > 1 and store_role != "Decode":
+        with pytest.raises(ValueError, match="separate MemFabric rank-0 GVA domain"):
+            _validate_memfabric_store_topology(config, is_producer=True)
+    else:
+        _validate_memfabric_store_topology(config, is_producer=True)
+    _validate_memfabric_store_topology(config, is_producer=False)
 
 
 def test_infer_separate_main_and_indexer_groups():
