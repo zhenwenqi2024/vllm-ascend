@@ -94,6 +94,33 @@ def test_fused_dense_fill_accepts_v1_cpu_or_v2_tensor_block_table(device_block_t
     assert count.tolist() == [4]
 
 
+def test_fused_dense_fill_tensor_block_table_promotes_offsets_without_to():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.topk_buffers_k = [torch.empty((1, 512, 4), dtype=torch.int8)]
+    manager.topk_buffers_v = [torch.empty((1, 512, 4), dtype=torch.int8)]
+    manager.copy_sfa_host_bases = [torch.tensor([[1000], [2000]], dtype=torch.int64)]
+    manager.copy_sfa_device_bases = [torch.tensor([[3000], [4000]], dtype=torch.int64)]
+    manager.copy_sfa_kv = MagicMock()
+    block_table = torch.tensor([[17_000_000]], dtype=torch.int32)
+
+    with patch.object(torch.Tensor, "to", side_effect=AssertionError("Tensor block table must not call to()")):
+        manager.dense_fill_copy_sfa_rows({0: (0, 128)}, block_size=128, block_table=block_table)
+
+    sources = manager.copy_sfa_kv.call_args.args[0]
+    assert sources.dtype == torch.int64
+    assert sources.tolist() == [8_704_001_000, 8_704_002_000]
+
+
+def test_fused_dense_fill_rejects_tensor_block_table_on_another_device():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.topk_buffers_k = [torch.empty((1, 512, 4), dtype=torch.int8)]
+    manager.topk_buffers_v = [torch.empty((1, 512, 4), dtype=torch.int8)]
+    block_table = torch.empty((1, 1), dtype=torch.int32, device="meta")
+
+    with pytest.raises(ValueError, match="same device"):
+        manager.dense_fill_copy_sfa_rows({0: (0, 128)}, block_size=128, block_table=block_table)
+
+
 def _make_sparse_kv_ops():
     return SimpleNamespace(
         sparse_kv_warmup_lru_resident_threads=MagicMock(return_value=8),

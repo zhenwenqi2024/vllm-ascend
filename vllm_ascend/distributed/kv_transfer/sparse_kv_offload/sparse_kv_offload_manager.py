@@ -1144,20 +1144,24 @@ class SparseKVOffloadManager:
             dtype=torch.int64,
             device=topk_k.device,
         )
+        block_bytes = token_bytes * block_size
         for slot, (row, computed) in dense_fills.items():
             nblocks = (computed + block_size - 1) // block_size
             if isinstance(block_table, torch.Tensor):
-                src_tokens = block_table[row, :nblocks].to(device=topk_k.device, dtype=torch.int64) * block_size
+                if block_table.device != topk_k.device:
+                    raise ValueError("Tensor block table must be on the same device as the top-k buffers")
+                # int32 block IDs promote to int64 when multiplied by byte strides.
+                src_offsets = block_table[row, :nblocks].view(1, -1) * block_bytes
             else:
                 src_tokens = torch.tensor(
                     [int(block_table[row, b]) * block_size for b in range(nblocks)], dtype=torch.int64
                 ).to(topk_k.device)
+                src_offsets = src_tokens.view(1, -1) * token_bytes
             lengths = torch.clamp(
                 torch.arange(nblocks, dtype=torch.int64, device=topk_k.device) * (-block_size) + computed,
                 min=0,
                 max=block_size,
             )
-            src_offsets = src_tokens.view(1, -1).expand(2, -1) * token_bytes
             dst_block_tokens = torch.arange(nblocks, dtype=torch.int64, device=topk_k.device) * block_size
             dst_offsets = (slot * stride_tokens + dst_block_tokens.view(1, -1).expand(2, -1)) * token_bytes
             lengths_bytes = lengths.view(1, -1).expand(2, -1) * token_bytes
