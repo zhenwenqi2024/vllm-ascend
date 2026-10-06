@@ -435,7 +435,7 @@ class NPUPlatform(Platform):
                 for layer_id in range(start_layer, end_layer):
                     if get_dsv4_compress_ratio(config, layer_id) != 4:
                         continue
-                    if dsv4_skips_indexer_topk(config, layer_id):
+                    if dsv4_skips_indexer_topk(config, layer_id, start_layer):
                         if not has_topk:
                             raise ValueError(
                                 "Index cache dependency crosses a pipeline-parallel stage boundary: "

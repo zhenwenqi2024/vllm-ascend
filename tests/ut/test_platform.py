@@ -31,19 +31,10 @@ from vllm_ascend.utils import (
 
 
 @pytest.mark.parametrize(
-    ("partition", "error_layer"),
-    [
-        ("20,23", None),
-        ("19,24", None),
-        ("28,15", None),
-        ("20,8,15", None),
-        ("23,20", 24),
-        ("21,22", 22),
-        ("17,26", 18),
-        ("20,4,19", 24),
-    ],
+    "partition",
+    ["20,23", "19,24", "28,15", "20,8,15", "23,20", "21,22", "17,26", "20,4,19"],
 )
-def test_validate_v4_index_cache_pp_partition(partition, error_layer):
+def test_validate_v4_index_cache_pp_partition(partition):
     config = SimpleNamespace(
         num_hidden_layers=43,
         compress_ratios=[0, 0] + [4, 128] * 20 + [4] + [0, 0, 0],
@@ -55,11 +46,7 @@ def test_validate_v4_index_cache_pp_partition(partition, error_layer):
         parallel_config=SimpleNamespace(pipeline_parallel_size=len(partition.split(","))),
     )
     with patch("vllm.envs.VLLM_PP_LAYER_PARTITION", partition):
-        if error_layer is None:
-            NPUPlatform._validate_indexer_pp_config(vllm_config)
-        else:
-            with pytest.raises(ValueError, match=f"layer {error_layer} skips Top-K computation"):
-                NPUPlatform._validate_indexer_pp_config(vllm_config)
+        NPUPlatform._validate_indexer_pp_config(vllm_config)
 
 
 @pytest.mark.parametrize("pattern", [None, "FFSFFS", "F"])
@@ -73,6 +60,7 @@ def test_v4_index_cache_schedule_uses_indexer_ordinals(pattern):
     recompute = [2, 4, 12] if pattern is None else ([2, 4, 8, 10] if pattern == "FFSFFS" else [2, 4, 6, 8, 10, 12])
     for layer_id, ratio in enumerate(config.compress_ratios):
         assert dsv4_skips_indexer_topk(config, layer_id) == (ratio == 4 and layer_id not in recompute)
+        assert dsv4_skips_indexer_topk(config, layer_id, 0) == dsv4_skips_indexer_topk(config, layer_id)
 
 
 def test_validate_v4_index_cache_pp_pattern():
@@ -86,13 +74,28 @@ def test_validate_v4_index_cache_pp_pattern():
         model_config=SimpleNamespace(hf_text_config=config),
         parallel_config=SimpleNamespace(pipeline_parallel_size=2),
     )
-    with (
-        patch("vllm.envs.VLLM_PP_LAYER_PARTITION", "5,7"),
-        pytest.raises(ValueError, match="layer 6 skips Top-K computation"),
-    ):
+    with patch("vllm.envs.VLLM_PP_LAYER_PARTITION", "5,7"):
         NPUPlatform._validate_indexer_pp_config(vllm_config)
     with patch("vllm.envs.VLLM_PP_LAYER_PARTITION", "7,5"):
         NPUPlatform._validate_indexer_pp_config(vllm_config)
+
+
+@pytest.mark.parametrize("stage_start", [21, 22, 23, 24])
+@pytest.mark.parametrize("pattern", [None, "F" + "S" * 20])
+def test_v4_index_cache_recomputes_first_local_c4(stage_start, pattern):
+    config = SimpleNamespace(
+        compress_ratios=[0, 0] + [4, 128] * 20 + [4],
+        use_index_cache=True,
+        index_topk_freq=4,
+        index_topk_pattern=pattern,
+    )
+    first_c4 = stage_start if stage_start % 2 == 0 else stage_start + 1
+    assert dsv4_skips_indexer_topk(config, first_c4)
+    assert not dsv4_skips_indexer_topk(config, first_c4, stage_start)
+    for layer_id in range(first_c4 + 1, len(config.compress_ratios)):
+        assert dsv4_skips_indexer_topk(config, layer_id, stage_start) == dsv4_skips_indexer_topk(config, layer_id)
+    config.use_index_cache = False
+    assert not dsv4_skips_indexer_topk(config, first_c4, stage_start)
 
 
 @pytest.mark.parametrize(

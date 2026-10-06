@@ -42,6 +42,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, fused_moe_make_expert_params_mapping
@@ -578,7 +579,9 @@ class DeepseekV4Attention(nn.Module):
         # only, leaving impl-level references stale.
         skip_topk = False
         if self.compress_ratio == 4 and use_index_cache and ".mtp." not in prefix:
-            skip_topk = dsv4_skips_indexer_topk(config, config_layer_idx)
+            pp_group = get_pp_group()
+            pp_start_layer, _ = get_pp_indices(config.num_hidden_layers, pp_group.rank_in_group, pp_group.world_size)
+            skip_topk = dsv4_skips_indexer_topk(config, config_layer_idx, pp_start_layer)
 
         if self.compress_ratio > 1:
             self.compressor = Compressor(
