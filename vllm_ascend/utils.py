@@ -117,6 +117,20 @@ def get_dsv4_compress_ratio(config: Any, layer_idx: int) -> int:
     return compress_ratios[layer_idx]
 
 
+def dsv4_skips_indexer_topk(config: Any, layer_idx: int) -> bool:
+    """Whether a main-model V4 layer reuses another Indexer's Top-K indices."""
+    if not getattr(config, "use_index_cache", False) or get_dsv4_compress_ratio(config, layer_idx) != 4:
+        return False
+    compress_ratios = getattr(config, "compress_ratios", None) or []
+    indexer_seq_idx = sum(ratio == 4 for ratio in compress_ratios[:layer_idx])
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is None:
+        freq = getattr(config, "index_topk_freq", 1)
+        return max(indexer_seq_idx - 1, 0) % freq != 0
+    assert pattern[0] == "F", "index_topk_pattern must start with 'F'"
+    return indexer_seq_idx < len(pattern) and pattern[indexer_seq_idx] == "S"
+
+
 def is_deepseek_v41(hf_config: Any) -> bool:
     """Identify the released V4.1 config at the model boundary."""
     model_types = ("deepseek_v41", "deepseek_v41_text")
