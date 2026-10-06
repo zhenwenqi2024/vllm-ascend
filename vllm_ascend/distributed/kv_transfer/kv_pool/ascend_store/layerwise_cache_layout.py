@@ -423,9 +423,9 @@ def apply_layerwise_kv_cache_plan(
                 f"{backing_size} > {original_backing_size} bytes."
             )
         offset = 0
-        new_tensors = []
+        v4_tensors: list[KVCacheTensor] = []
         for names, spec in component_descriptors:
-            new_tensors.append(
+            v4_tensors.append(
                 KVCacheTensor(
                     layers=names,
                     size=backing_size,
@@ -435,10 +435,10 @@ def apply_layerwise_kv_cache_plan(
                 )
             )
             offset += kv_cache_config.num_blocks * spec.page_size_bytes
-        kv_cache_config.kv_cache_tensors = new_tensors
+        kv_cache_config.kv_cache_tensors = v4_tensors
         logger.info(
             "DeepSeek-V4 layerwise KV cache reuse planned %d components in %d physical slots (%d bytes).",
-            len(new_tensors),
+            len(v4_tensors),
             len(reuse_layout.buffer_slots),
             backing_size,
         )
