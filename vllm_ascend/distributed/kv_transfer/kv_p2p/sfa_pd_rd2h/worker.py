@@ -30,8 +30,6 @@ from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
-    MEMFABRIC_HANDSHAKE_BYTES,
-    MEMFABRIC_HANDSHAKE_SLOTS,
     CopySfaTailDest,
     LayerMetadata,
     SendTask,
@@ -108,12 +106,6 @@ def _resolve_memfabric_transfer_protocol(vllm_config: VllmConfig) -> str | None:
     return extra.get("memfabric_transfer_protocol")
 
 
-def _resolve_memfabric_store_server_role(vllm_config: VllmConfig) -> str:
-    """Use a D-hosted store for multiple P sessions sharing one GVA domain."""
-    extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
-    return extra.get("memfabric_store_server_role", MEMFABRIC_ROLE_PREFILL)
-
-
 def _validate_tcp_port(port: int, *, description: str) -> None:
     if not MIN_TCP_PORT <= port <= MAX_TCP_PORT:
         raise ValueError(f"{description} must be in [{MIN_TCP_PORT}, {MAX_TCP_PORT}], got {port}")
@@ -146,7 +138,6 @@ class SFAPDRD2HConsumerWorker:
         self.layer_metadata: dict[str, LayerMetadata] = {}
         self.engine = None
         self._mf_read_thread: MembPullReadThread | None = None
-        self._mf_handshake_tensor: torch.Tensor | None = None
 
         self.offload_manager = None
         self._cpu_blocks_by_req: dict[str, int] = {}
@@ -188,7 +179,6 @@ class SFAPDRD2HConsumerWorker:
                 role=MEMFABRIC_ROLE_DECODE,
                 device_id=torch.npu.current_device(),
                 transfer_protocol=_resolve_memfabric_transfer_protocol(self.vllm_config),
-                store_server_role=_resolve_memfabric_store_server_role(self.vllm_config),
             )
             self.engine = global_memfabric_te.get_transfer_engine(self.side_channel_host)
         return self.engine
@@ -451,18 +441,6 @@ class SFAPDRD2HConsumerWorker:
 
         # Create memfabric engine (no registration)
         self._ensure_engine()
-        handshake_session = None
-        handshake_ptr = 0
-        if _resolve_memfabric_store_server_role(self.vllm_config) == MEMFABRIC_ROLE_DECODE:
-            self._mf_handshake_tensor = torch.empty(
-                (MEMFABRIC_HANDSHAKE_BYTES * MEMFABRIC_HANDSHAKE_SLOTS,),
-                dtype=torch.uint8,
-                device=f"npu:{torch.npu.current_device()}",
-            )
-            handshake_ptr = self._mf_handshake_tensor.data_ptr()
-            if self.engine.register_memory(handshake_ptr, self._mf_handshake_tensor.numel()) != 0:
-                raise RuntimeError("Failed to register D MemFabric handshake buffer")
-            handshake_session = global_memfabric_te.unique_id
         self._bind_copy_sfa_tail_destinations()
         read_state = self._build_consumer_read_state()
         # Start MembPullReadThread (ZMQ ROUTER + memfabric read)
@@ -471,8 +449,6 @@ class SFAPDRD2HConsumerWorker:
             side_channel_port=self.side_channel_port,
             engine=self.engine,
             state=read_state,
-            handshake_session=handshake_session,
-            handshake_ptr=handshake_ptr,
         )
         self._mf_read_thread.start()
         if not self._mf_read_thread.ready_event.wait(timeout=CONNECTOR_THREAD_STARTUP_TIMEOUT_SECONDS):
@@ -539,7 +515,6 @@ class SFAPDRD2HProducerWorker:
             role=MEMFABRIC_ROLE_PREFILL,
             device_id=torch.npu.current_device(),
             transfer_protocol=_resolve_memfabric_transfer_protocol(vllm_config),
-            store_server_role=_resolve_memfabric_store_server_role(vllm_config),
         )
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -561,7 +536,6 @@ class SFAPDRD2HProducerWorker:
         self.main_group_idx, self.indexer_group_idx = infer_sfa_component_group_ids(self.kv_cache_config)
         self.use_mla = self.vllm_config.model_config.use_mla
         self.layer_metadata: dict[str, LayerMetadata] = {}
-        self._mf_handshake_tensor: torch.Tensor | None = None
         self.stage_layer_names: list[str] = []
         # A layer can touch a main storage slot and, optionally, a separate
         # indexer storage slot. The send thread owns one completion gate per
@@ -678,10 +652,6 @@ class SFAPDRD2HProducerWorker:
             layer_storage_slots=self.layer_storage_slots,
             producer_pp_rank=self.pp_rank,
             producer_pp_size=self.pp_size,
-            handshake_engine=(
-                self.engine if _resolve_memfabric_store_server_role(self.vllm_config) == MEMFABRIC_ROLE_DECODE else None
-            ),
-            handshake_ptr=self._mf_handshake_tensor.data_ptr() if self._mf_handshake_tensor is not None else 0,
         )
 
     @staticmethod
@@ -762,12 +732,6 @@ class SFAPDRD2HProducerWorker:
         self.layer_storage_slots = self._infer_layer_storage_slots(self.layer_metadata)
 
         register_regions = collect_storage_merged_register_regions(kv_caches)
-        if _resolve_memfabric_store_server_role(self.vllm_config) == MEMFABRIC_ROLE_DECODE:
-            self._mf_handshake_tensor = torch.zeros(
-                (MEMFABRIC_HANDSHAKE_BYTES,), dtype=torch.uint8, device=f"npu:{torch.npu.current_device()}"
-            )
-            register_regions.ptrs.append(self._mf_handshake_tensor.data_ptr())
-            register_regions.lengths.append(MEMFABRIC_HANDSHAKE_BYTES)
         validate_register_region_count(register_regions)
         global_memfabric_te.register_buffer(register_regions.ptrs, register_regions.lengths)
 
@@ -785,48 +749,11 @@ class SFAPDRD2HProducerWorker:
             error = self.kv_send_layer_thread.startup_error
             self.kv_send_layer_thread.stop()
             raise RuntimeError("SFAPD P-side send thread failed during startup") from error
-        self._preconnect_decode_if_configured()
         logger.info(
             "MembPull P registered kv caches: layers=%d, p_session=%s",
             len(self.layer_metadata),
             global_memfabric_te.unique_id,
         )
-
-    def _preconnect_decode_if_configured(self) -> None:
-        """Make fixed-topology P startup wait for a real D reverse read."""
-        extra = self.vllm_config.kv_transfer_config.kv_connector_extra_config or {}
-        preconnect_host = extra.get("memfabric_preconnect_decode_host")
-        preconnect_port = extra.get("memfabric_preconnect_decode_port")
-        preconnect_tp_size = extra.get("memfabric_preconnect_decode_tp_size", self.tp_size)
-        if any(
-            key in extra
-            for key in (
-                "memfabric_preconnect_decode_host",
-                "memfabric_preconnect_decode_port",
-                "memfabric_preconnect_decode_tp_size",
-            )
-        ):
-            if _resolve_memfabric_store_server_role(self.vllm_config) != MEMFABRIC_ROLE_DECODE:
-                raise ValueError("SFAPD startup preconnect requires a Decode-hosted MemFabric store")
-            if not isinstance(preconnect_host, str) or not preconnect_host:
-                raise ValueError("memfabric_preconnect_decode_host must be a non-empty host")
-            if not isinstance(preconnect_port, int) or isinstance(preconnect_port, bool):
-                raise ValueError("memfabric_preconnect_decode_port must be an integer TCP port")
-            if not isinstance(preconnect_tp_size, int) or isinstance(preconnect_tp_size, bool):
-                raise ValueError("memfabric_preconnect_decode_tp_size must be an integer")
-            remote_tp_rank = self._map_prefill_rank_to_decode_rank(
-                prefill_tp_size=self.tp_size,
-                decode_tp_size=preconnect_tp_size,
-                prefill_tp_rank=self.tp_rank,
-            )
-            remote_port = preconnect_port + remote_tp_rank
-            _validate_tcp_port(remote_port, description="SFAPD startup preconnect D-side TP control-plane port")
-            assert self.kv_send_layer_thread is not None
-            try:
-                self.kv_send_layer_thread.preconnect(preconnect_host, remote_port)
-            except Exception:
-                self.kv_send_layer_thread.stop()
-                raise
 
     def _has_memfabric_pull_target(
         self,

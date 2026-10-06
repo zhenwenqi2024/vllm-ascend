@@ -690,7 +690,9 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
     runner = _make_runner()
     runner.compilation_config = SimpleNamespace(static_forward_context={})
     runner.vllm_config = SimpleNamespace(
-        compilation_config=runner.compilation_config, scheduler_config=SimpleNamespace(max_num_seqs=8)
+        compilation_config=runner.compilation_config,
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        kv_transfer_config=None,
     )
     runner.pcp_manager = MagicMock(spec=AscendPCPManager)
     runner.model_state = SimpleNamespace(pcp_manager=None, kvpp_runtime=None)
@@ -714,7 +716,8 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
 
     def _prepare_kda(context, maximum):
         """Check that the parent bound cache before the startup hook runs."""
-        assert runner.kv_cache_config is kv_cache_config
+        assert runner.kv_cache_config == kv_cache_config
+        assert runner.kv_cache_config is not kv_cache_config
         assert context is runner.compilation_config.static_forward_context
         assert maximum == 8
 
@@ -738,6 +741,7 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
     )
     assert metadata_cls.call_count == int(a5 and architecture == "DeepseekV41ForCausalLM")
     assert seen["cfg"] == kv_cache_config
+    assert seen["cfg"] is not kv_cache_config
     assert vllm_model_runner.ModelCudaGraphManager is original
     acl_cls.assert_called_once()
     create_kvpp.assert_called_once()
@@ -754,7 +758,9 @@ def test_initialize_kv_cache_forwards_allocation_context():
     runner = _make_runner()
     runner.compilation_config = SimpleNamespace(static_forward_context={})
     runner.vllm_config = SimpleNamespace(
-        compilation_config=runner.compilation_config, scheduler_config=SimpleNamespace(max_num_seqs=8)
+        compilation_config=runner.compilation_config,
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        kv_transfer_config=None,
     )
     runner.pcp_manager = None
     runner.model_state = SimpleNamespace(pcp_manager=None, kvpp_runtime=None)
@@ -778,7 +784,8 @@ def test_initialize_kv_cache_forwards_allocation_context():
 
     def _prepare_kda(context, maximum):
         """Check cache binding and configuration at the startup boundary."""
-        assert runner.kv_cache_config is kv_cache_config
+        assert runner.kv_cache_config == kv_cache_config
+        assert runner.kv_cache_config is not kv_cache_config
         assert context is runner.compilation_config.static_forward_context
         assert maximum == 8
 

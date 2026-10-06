@@ -1732,7 +1732,7 @@ class SparseKVOffloadConfig:
         if parallel_config.prefill_context_parallel_size * parallel_config.decode_context_parallel_size > 1:
             raise ValueError("Sparse KV offload don't support context parallel now.")
         if parallel_config.pipeline_parallel_size > 1:
-            raise ValueError("Sparse KV offload requires a single-stage D node; P-side PP is supported.")
+            raise ValueError("Sparse KV offload don't support pipeline parallel now.")
         if self.keep_device_kv_cache:
             logger.warning_once(
                 "Init sparse KV offload with keep_device_kv_cache enabled, "

@@ -12,22 +12,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 
 BATCH_KV_TRANSFER_PARAMS = "batch_kv_transfer_params"
 MF_META = b"mf_meta"
-MF_JOINED = b"mf_joined"
-MF_READY = b"mf_ready"
-MF_NOT_READY = b"mf_not_ready"
 READ_READY_BATCH = b"read_ready_batch"
 READ_DONE = b"read_done"
 READ_FAILED = b"read_failed"
 
 # PP-aware MF_META handshake.  A bare ACK is the legacy PP=1 response;
 # producers with PP>1 require the structured acknowledgement below.
-SFAPD_PROTOCOL_VERSION = 2
+SFAPD_PROTOCOL_VERSION = 1
 MF_META_ACK = b"mf_meta_ack"
-# A small, separately registered NPU region is used to join P clients to a
-# D-hosted MemFabric store before the first pull. Each P identity gets a
-# distinct slot so concurrent PP stages never write the same destination.
-MEMFABRIC_HANDSHAKE_BYTES = 4096
-MEMFABRIC_HANDSHAKE_SLOTS = 512
 
 
 def infer_sfa_component_group_ids(kv_cache_config: Any) -> tuple[int, int]:

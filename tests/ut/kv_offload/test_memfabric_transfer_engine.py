@@ -79,33 +79,6 @@ def test_memfabric_configuration_is_idempotent_but_role_bound():
         manager.configure(role=MEMFABRIC_ROLE_DECODE, device_id=1, transfer_protocol="device_urma")
     with pytest.raises(RuntimeError, match="already configured"):
         manager.configure(role=MEMFABRIC_ROLE_DECODE, device_id=0, transfer_protocol="sdma")
-    with pytest.raises(RuntimeError, match="already configured"):
-        manager.configure(
-            role=MEMFABRIC_ROLE_DECODE,
-            device_id=0,
-            transfer_protocol="device_urma",
-            store_server_role=MEMFABRIC_ROLE_DECODE,
-        )
-
-
-def test_memfabric_decode_hosted_store_and_handshake_write():
-    raw_engine = MagicMock()
-    raw_engine.get_rpc_port.return_value = 23456
-    raw_engine.initialize.return_value = 0
-    raw_engine.batch_transfer_sync_write.return_value = 0
-    manager = GlobalMemfabricTE()
-    manager.configure(
-        role=MEMFABRIC_ROLE_DECODE,
-        device_id=0,
-        store_server_role=MEMFABRIC_ROLE_DECODE,
-    )
-
-    with patch.dict(sys.modules, {"memfabric_hybrid": _fake_memfabric(raw_engine)}):
-        engine = manager.get_transfer_engine("127.0.0.1")
-
-    assert raw_engine.initialize.call_args.kwargs["store_server_role"] == MEMFABRIC_ROLE_DECODE
-    assert engine.batch_transfer_sync_write("peer", [100], [200], [4096]) == 0
-    raw_engine.batch_transfer_sync_write.assert_called_once_with("peer", [100], [200], [4096])
 
 
 def test_memfabric_engine_is_bound_to_initial_hostname():
@@ -174,6 +147,7 @@ def test_memfabric_transfer_protocol_defaults_to_sdma():
         manager.get_transfer_engine("127.0.0.1")
 
     assert raw_engine.initialize.call_args.kwargs["data_op_type"] == _FakeTransDataOpType.SDMA
+    assert raw_engine.initialize.call_args.kwargs["store_server_role"] == MEMFABRIC_ROLE_PREFILL
 
 
 @pytest.mark.parametrize(

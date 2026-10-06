@@ -18,6 +18,7 @@
 #
 
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
@@ -63,6 +64,9 @@ from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+    apply_layerwise_kv_cache_plan,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     allocate_kv_offload_topk_profile_buffers,
@@ -321,6 +325,10 @@ class NPUModelRunner(GPUModelRunner):
         kv_cache_config: KVCacheConfig,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> None:
+        # Match V1's physical buffer plan without mutating the scheduler's
+        # logical cache configuration. Allocation must honor zero-stride aliases.
+        kv_cache_config = deepcopy(kv_cache_config)
+        apply_layerwise_kv_cache_plan(kv_cache_config, self.vllm_config)
         sparse_cfg = self.ascend_config.sparse_kv_offload_config
         if sparse_cfg.enabled:
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(

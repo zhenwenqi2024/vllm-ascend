@@ -79,6 +79,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import get_layerwise_reuse_config
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     allocate_kv_cache_tensors_for_sparse_kv_offload,
     reshape_kv_cache_tensors_for_sparse_kv_offload,
@@ -977,10 +978,21 @@ def _allocate_kv_cache(
             )
             hybrid_backing = _align_memory(hybrid_backing, alignment)[:tensor_size]
 
+    layerwise_reuse = get_layerwise_reuse_config(vllm_config.kv_transfer_config) is not None
+    layerwise_aliases: dict[str, str] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         shared_names = get_kv_cache_tensor_layers(kv_cache_tensor)
         if not shared_names:
             continue
+
+        # Only the layerwise planner's zero-stride descriptors share a
+        # physical slot. Ordinary packed descriptors still own private layers.
+        if layerwise_reuse and kv_cache_tensor.layer_stride == 0:
+            owner = shared_names[0]
+            if any(layer_kv_cache_spec[name] != layer_kv_cache_spec[owner] for name in shared_names[1:]):
+                raise ValueError("Layerwise V2 KV aliases require identical cache specs.")
+            layerwise_aliases.update({name: owner for name in shared_names[1:]})
+            shared_names = shared_names[:1]
 
         if dsv4_backing is not None:
             continue
@@ -1187,6 +1199,9 @@ def _allocate_kv_cache(
                 k_tensor = _allocate_int8_cache_tensor(k_size, alignment, device)
                 v_tensor = _allocate_int8_cache_tensor(v_size, alignment, device)
                 kv_cache_raw_tensors[layer_name] = (k_tensor, v_tensor)
+
+    for layer_name, owner in layerwise_aliases.items():
+        kv_cache_raw_tensors[layer_name] = kv_cache_raw_tensors[owner]
 
     layer_names = {layer_name for group in kv_cache_config.kv_cache_groups for layer_name in group.layer_names}
     assert layer_names == (kv_cache_raw_tensors.keys() | shared_layers.keys()), (

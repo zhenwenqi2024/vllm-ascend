@@ -936,7 +936,7 @@ class TestSparseKVOffloadConfig(TestBase):
 
         # P-side PP does not enable offload; D-side PP remains unsupported.
         vllm_config.parallel_config.pipeline_parallel_size = 2
-        with self.assertRaisesRegex(ValueError, "single-stage D node"):
+        with self.assertRaisesRegex(ValueError, "Sparse KV offload don't support pipeline parallel"):
             SparseKVOffloadConfig.from_additional_config(vllm_config, {"enabled": True})
 
     def test_v2_offload_accepts_v1_fused_and_mtp_combinations(self):

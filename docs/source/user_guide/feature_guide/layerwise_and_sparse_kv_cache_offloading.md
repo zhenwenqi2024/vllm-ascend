@@ -232,7 +232,6 @@ The `SfaRemoteD2HConnector` entry accepts the following options:
 | :--- | :--- |
 | `transfer_backend` | Transfer backend. `memfabric` is the only supported value. |
 | `memfabric_transfer_protocol` | MemFabric data-path protocol: `sdma` (default) and `device_rdma` for A3 series, `device_urma` for 950PR&950DT Products. Must be set to the same value on Prefill and Decode. Invalid values abort startup. |
-| `memfabric_store_server_role` | MemFabric configuration-store owner: `Prefill` (default) or `Decode`. For Prefill-side PP greater than 1, set `Decode` on both P and D so all P stages join one address domain per D TP rank. A P-owned store per stage restarts MemFabric rank numbering at zero, causing the D worker to import overlapping GVA windows; the connector rejects that topology at startup. The connector performs a small registered handshake transfer before the first KV pull. |
 
 The following log confirms that buffer reuse is enabled:
 
@@ -248,28 +247,17 @@ Requirements:
 - enable the feature only on Decode; and
 - use Model Runner V1 or V2 on Decode. Keep Decode at pipeline parallel size 1;
   Prefill can use pipeline parallelism with the producer connector.
-- for Prefill-side PP greater than 1, set
-  `"memfabric_store_server_role": "Decode"` in
-  `kv_connector_extra_config` on both Prefill and Decode.
 
-For a fixed P/D topology, start Decode first and add these Prefill-side
-`kv_connector_extra_config` fields to make Prefill startup wait until every
-producer worker has passed a real MemFabric reverse-read probe:
+MemFabric configuration-store ownership stays on Prefill, using the official
+transfer-engine initialization. No additional store-role or preconnection
+configuration is needed. Deploy the same connector protocol version on both
+sides, and validate actual remote KV reads rather than relying on `/health`.
 
-```json
-{
-    "memfabric_preconnect_decode_host": "decode-host",
-    "memfabric_preconnect_decode_port": 20050,
-    "memfabric_preconnect_decode_tp_size": 8
-}
-```
-
-The port is Decode's base `kv_port`; each Prefill TP rank maps to the
-corresponding Decode TP port. Without these fields, the connector performs
-the same bounded readiness handshake on first use of each P/D session before
-notifying Decode of ready KV layers. A successful `/health` response alone
-does not check remote sessions. Deploy the same connector protocol version on
-both sides.
+For the validated GLM-5.2 Prefill PP2 deployment on 16 NPUs, use DP1 × PP2 ×
+TP8, not DP2 × PP2 × TP8. Set `VLLM_PP_LAYER_PARTITION=38,40`: each stage
+must contain the full Indexer owner for its shared Indexer layers. A balanced
+39/39 partition is rejected by the existing stage-boundary guard; cross-stage
+TopK sharing is not supported. Decode remains DP2 × TP8 with PP size 1.
 
 Add the following options to the Decode launch command:
 

@@ -17,6 +17,7 @@ pytest.importorskip("vllm")
 from vllm.distributed.kv_transfer.kv_connector.factory import (  # noqa: E402
     KVConnectorFactory,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole  # noqa: E402
 
 from examples.disaggregated_prefill_v1 import (  # noqa: E402
     load_balance_proxy_layerwise_server_example as proxy_example,
@@ -27,15 +28,10 @@ from examples.disaggregated_prefill_v1.load_balance_proxy_layerwise_server_examp
 from vllm_ascend.distributed.kv_transfer import register_connector  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.connector import (  # noqa: E402
     SfaRemoteD2HConnector,
-    _validate_memfabric_store_topology,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (  # noqa: E402
     BATCH_KV_TRANSFER_PARAMS,
-    MEMFABRIC_HANDSHAKE_BYTES,
-    MF_JOINED,
     MF_META_ACK,
-    MF_NOT_READY,
-    MF_READY,
     READ_READY_BATCH,
     SFAPD_PROTOCOL_VERSION,
     CopySfaTailDest,
@@ -84,22 +80,37 @@ def test_sfa_remote_d2h_connector_is_registered():
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
-@pytest.mark.parametrize("store_role", [None, "Prefill", "Decode"])
-def test_prefill_pp_memfabric_store_topology(pp_size, store_role):
-    extra = {"transfer_backend": "memfabric"}
-    if store_role is not None:
-        extra["memfabric_store_server_role"] = store_role
+def test_prefill_pp_uses_default_store_without_extra_topology_guard(pp_size):
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
-        kv_transfer_config=SimpleNamespace(kv_connector_extra_config=extra),
+        kv_transfer_config=SimpleNamespace(
+            kv_role="kv_producer",
+            is_kv_producer=True,
+            is_kv_consumer=False,
+            kv_connector_extra_config={"transfer_backend": "memfabric"},
+            engine_id="prefill",
+        ),
     )
+    cache_config = MagicMock()
+    with (
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.connector.KVConnectorBase_V1.__init__",
+            return_value=None,
+        ),
+        patch("vllm_ascend.ascend_config.init_ascend_config"),
+        patch(
+            "vllm_ascend.ascend_config.get_ascend_config",
+            return_value=SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(enabled=False)),
+        ),
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.connector.SFAPDRD2HProducerScheduler"
+        ) as scheduler,
+    ):
+        connector = SfaRemoteD2HConnector(config, KVConnectorRole.SCHEDULER, cache_config)
 
-    if pp_size > 1 and store_role != "Decode":
-        with pytest.raises(ValueError, match="separate MemFabric rank-0 GVA domain"):
-            _validate_memfabric_store_topology(config, is_producer=True)
-    else:
-        _validate_memfabric_store_topology(config, is_producer=True)
-    _validate_memfabric_store_topology(config, is_producer=False)
+    scheduler.assert_called_once_with(config, cache_config, "prefill")
+    assert connector.connector_scheduler is scheduler.return_value
+    assert connector.is_producer
 
 
 def test_infer_separate_main_and_indexer_groups():
@@ -1474,143 +1485,6 @@ def test_pp_producer_requires_structured_mf_meta_ack():
     thread._send_mf_meta("tcp://d:1", dealer, msgspec.msgpack.Encoder())
 
     assert "tcp://d:1" in thread._mf_meta_sent_paths
-
-
-def test_pp_producer_joins_decode_hosted_memfabric_store_before_reads():
-    thread = MembPullSendingThread.__new__(MembPullSendingThread)
-    thread.timeout = 0.01
-    engine = MagicMock()
-    engine.batch_transfer_sync_write.return_value = 0
-    thread._state = ProducerSendState(
-        last_layer_idx=6,
-        layer_metadata={},
-        p_session="p-session",
-        main_group_idx=0,
-        indexer_group_idx=0,
-        block_sizes=(16,),
-        layer_storage_slots={},
-        producer_pp_rank=1,
-        producer_pp_size=2,
-        handshake_engine=engine,
-        handshake_ptr=1234,
-    )
-    thread._mf_meta_sent_paths = set()
-    dealer = MagicMock()
-    dealer.poll.return_value = True
-    dealer.recv_multipart.side_effect = [
-        [msgspec.msgpack.encode((MF_META_ACK, SFAPD_PROTOCOL_VERSION, "d-session", 5678))],
-        [msgspec.msgpack.encode((MF_READY, SFAPD_PROTOCOL_VERSION))],
-    ]
-
-    thread._send_mf_meta("tcp://d:1", dealer, msgspec.msgpack.Encoder())
-
-    engine.batch_transfer_sync_write.assert_called_once_with("d-session", [1234], [5678], [MEMFABRIC_HANDSHAKE_BYTES])
-    assert msgspec.msgpack.Decoder(type=tuple).decode(dealer.send.call_args.args[0]) == (
-        MF_JOINED,
-        SFAPD_PROTOCOL_VERSION,
-        1234,
-    )
-    assert "tcp://d:1" in thread._mf_meta_sent_paths
-
-
-def test_pp_producer_does_not_mark_session_ready_when_reverse_probe_fails():
-    thread = MembPullSendingThread.__new__(MembPullSendingThread)
-    thread.timeout = 0.01
-    engine = MagicMock()
-    engine.batch_transfer_sync_write.return_value = 0
-    thread._state = ProducerSendState(
-        last_layer_idx=6,
-        layer_metadata={},
-        p_session="p-session",
-        main_group_idx=0,
-        indexer_group_idx=0,
-        block_sizes=(16,),
-        layer_storage_slots={},
-        producer_pp_rank=1,
-        producer_pp_size=2,
-        handshake_engine=engine,
-        handshake_ptr=1234,
-    )
-    thread._mf_meta_sent_paths = set()
-    dealer = MagicMock()
-    dealer.poll.return_value = True
-    dealer.recv_multipart.side_effect = [
-        [msgspec.msgpack.encode((MF_META_ACK, SFAPD_PROTOCOL_VERSION, "d-session", 5678))],
-        [msgspec.msgpack.encode((MF_NOT_READY, SFAPD_PROTOCOL_VERSION, "-1"))],
-    ]
-
-    with pytest.raises(RuntimeError, match="readiness probe failed"):
-        thread._send_mf_meta("tcp://d:1", dealer, msgspec.msgpack.Encoder())
-
-    assert "tcp://d:1" not in thread._mf_meta_sent_paths
-
-
-def test_decode_readiness_probe_retries_until_session_is_visible():
-    thread = MembPullReadThread.__new__(MembPullReadThread)
-    thread.engine = MagicMock()
-    thread.engine.batch_transfer_sync_read.side_effect = [-1, -1, 0]
-
-    with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.read_thread.time.sleep") as sleep:
-        ret = thread._await_session_readable("p-session", 1234, 5678)
-
-    assert ret == 0
-    assert thread.engine.batch_transfer_sync_read.call_count == 3
-    sleep.assert_called()
-
-
-def test_decode_readiness_probe_stops_at_deadline():
-    thread = MembPullReadThread.__new__(MembPullReadThread)
-    thread.engine = MagicMock()
-    thread.engine.batch_transfer_sync_read.return_value = -1
-
-    with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.read_thread.MEMFABRIC_READY_TIMEOUT", 0):
-        ret = thread._await_session_readable("p-session", 1234, 5678)
-
-    assert ret == -1
-    thread.engine.batch_transfer_sync_read.assert_called_once_with(
-        "p-session", [5678], [1234], [MEMFABRIC_HANDSHAKE_BYTES]
-    )
-
-
-def test_prefill_startup_preconnect_maps_each_tp_rank_to_decode():
-    worker = SFAPDRD2HProducerWorker.__new__(SFAPDRD2HProducerWorker)
-    worker.vllm_config = SimpleNamespace(
-        kv_transfer_config=SimpleNamespace(
-            kv_connector_extra_config={
-                "memfabric_store_server_role": "Decode",
-                "memfabric_preconnect_decode_host": "80.5.9.130",
-                "memfabric_preconnect_decode_port": 20050,
-                "memfabric_preconnect_decode_tp_size": 4,
-            }
-        )
-    )
-    worker.tp_size = 8
-    worker.tp_rank = 5
-    worker.kv_send_layer_thread = MagicMock()
-
-    worker._preconnect_decode_if_configured()
-
-    worker.kv_send_layer_thread.preconnect.assert_called_once_with("80.5.9.130", 20052)
-
-
-def test_prefill_startup_preconnect_fails_closed_on_incomplete_endpoint():
-    worker = SFAPDRD2HProducerWorker.__new__(SFAPDRD2HProducerWorker)
-    worker.vllm_config = SimpleNamespace(
-        kv_transfer_config=SimpleNamespace(
-            kv_connector_extra_config={
-                "memfabric_store_server_role": "Decode",
-                "memfabric_preconnect_decode_host": "80.5.9.130",
-            }
-        )
-    )
-    worker.tp_size = 8
-    worker.tp_rank = 0
-    worker.kv_send_layer_thread = MagicMock()
-
-    with pytest.raises(ValueError, match="memfabric_preconnect_decode_port"):
-        worker._preconnect_decode_if_configured()
-
-    worker.kv_send_layer_thread.preconnect.assert_not_called()
 
 
 def test_consumer_scheduler_binds_copy_sfa_tail_at_alloc():

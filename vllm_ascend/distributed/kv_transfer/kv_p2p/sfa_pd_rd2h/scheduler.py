@@ -295,11 +295,18 @@ class SFAPDRD2HScheduler:
     # ------------------------------------------------------------------
     # D side (kv_consumer)
     # ------------------------------------------------------------------
-    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int | None, bool]:
         # Pull the entire prompt KV from the remote P node into D's CPU pool
         # (main MLA) / HBM (indexer). Async relative to engine execution.
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_prefill"):
+            allocator = getattr(self, "_copy_sfa_slot_allocator", None)
+            if allocator is not None and not allocator.can_bind(request.request_id):
+                # Async KV receivers are waiting, not RUNNING, so max_num_seqs
+                # does not bound the number of stable top-k rows they own.
+                # None defers this request without local recomputation or an
+                # allocation/rendezvous until an existing owner finishes.
+                return None, False
             assert num_computed_tokens % min(self.block_size) == 0
             count = max(len(request.prompt_token_ids) - num_computed_tokens, 0)
             return count, count > 0
