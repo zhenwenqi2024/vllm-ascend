@@ -21,7 +21,7 @@ def build_local_metadata_triton(
     num_reqs,
     start_pos_out_ptr,  # [max_num_seqs], int32      (output)
     COMPUTE_START_POS,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr = 1024,
 ):
     """Fused NPU kernel for local token metadata computation
 
