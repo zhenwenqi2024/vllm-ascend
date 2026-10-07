@@ -19,8 +19,8 @@ MF_META = b"mf_meta"
 READ_READY_BATCH = b"read_ready_batch"
 READ_DONE = b"read_done"
 READ_FAILED = b"read_failed"
-DSPARK_CONTEXT_CHUNK = b"dspark_context_chunk"
-DSPARK_CONTEXT_ACK = b"dspark_context_ack"
+DSPARK_DRAFT_KV = b"dspark_draft_kv"
+DSPARK_DRAFT_KV_ACK = b"dspark_draft_kv_ack"
 
 # PP-aware MF_META handshake.  A bare ACK is the legacy PP=1 response;
 # producers with PP>1 require the structured acknowledgement below.

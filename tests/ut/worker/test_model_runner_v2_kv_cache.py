@@ -14,14 +14,11 @@ from vllm_ascend.patch.worker.patch_v2 import patch_model_runner  # noqa: F401
 
 
 @pytest.mark.parametrize("is_profiling", [False, True])
-@pytest.mark.parametrize("resident_draft", [False, True])
-def test_initialize_preserves_connector_containers_and_flattens_runner_cache(is_profiling, resident_draft):
+def test_initialize_preserves_connector_containers_and_flattens_runner_cache(is_profiling):
     k, v, conv, ssm, single = [torch.empty(3, 4) for _ in range(5)]
     other = torch.empty(3, 4, device="meta")
     caches = {"attention": (k, None, v), "mamba": [conv, ssm], "single": single, "other": other}
     runner = MagicMock()
-    connector_caches = {name: cache for name, cache in caches.items() if name != "single"} if resident_draft else caches
-    runner._get_kv_connector_caches.side_effect = lambda _: connector_caches
     runner.device = torch.device("cpu")
     runner.is_encoder_decoder = False
     runner.speculator = None
@@ -59,8 +56,7 @@ def test_initialize_preserves_connector_containers_and_flattens_runner_cache(is_
         assert runner.kv_connector is upstream.NO_OP_KV_CONNECTOR
     else:
         assert registration_order == ["offload", "connector"]
-        assert connector.call_args.args[1] is connector_caches
-        assert ("single" in connector.call_args.args[1]) is not resident_draft
+        assert connector.call_args.args[1] is caches
         assert type(caches["attention"]) is tuple
         assert type(caches["mamba"]) is list
         assert caches["attention"][2] is v

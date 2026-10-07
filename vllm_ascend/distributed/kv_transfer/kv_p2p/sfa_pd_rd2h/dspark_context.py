@@ -1,16 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded hand-off of DSpark prompt context from a reader to its model worker.
-
-This does not perform network reads or target forward recomputation. Readers
-submit lossless, ordered auxiliary tensors; only the owning model thread may
-write the draft KV and join that completion with target KV readiness.
-"""
+"""DSpark P-to-D draft-KV readiness and cache-group helpers."""
 
 from __future__ import annotations
 
 import threading
-from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections import OrderedDict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
@@ -24,33 +19,35 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 MAX_DSPARK_CONTEXT_CHUNK_TOKENS = 64
-BF16_BYTES = 2
 
 
 def get_pd_dspark_aux_layer_ids(vllm_config: VllmConfig) -> tuple[int, ...]:
-    """Resolve and validate opt-in P-side context capture before model loading.
+    """Resolve P-side DSpark context boundaries before model loading.
 
-    Keep transport/schema constraints in this backend. Unconfigured runners
-    return immediately without applying DSpark-specific restrictions.
+    The P worker must load the DSpark drafter so it can write draft KV locally
+    before transferring those pages to D. This is intentionally different from
+    a target-only feature-capture path.
     """
     transfer = getattr(vllm_config, "kv_transfer_config", None)
-    extra = getattr(transfer, "kv_connector_extra_config", None) or {}
-    layer_ids = extra.get("dspark_aux_hidden_state_layer_ids")
-    if layer_ids is None:
+    speculative = getattr(vllm_config, "speculative_config", None)
+    if speculative is None or getattr(speculative, "method", None) != "dspark":
         return ()
-    if transfer.is_kv_consumer or not transfer.is_kv_producer or vllm_config.speculative_config is not None:
-        raise ValueError("DSpark auxiliary capture requires a P-only producer without speculative decoding.")
+    if transfer is None or transfer.is_kv_consumer or not transfer.is_kv_producer:
+        return ()
     parallel = vllm_config.parallel_config
     if parallel.prefill_context_parallel_size * parallel.decode_context_parallel_size != 1:
-        raise ValueError("P-side DSpark auxiliary capture does not support context parallelism.")
+        raise ValueError("P-side DSpark draft KV generation does not support context parallelism.")
     model_config = vllm_config.model_config
     if not model_config.enforce_eager:
-        raise ValueError("P-side DSpark auxiliary capture currently requires eager prefill.")
+        raise ValueError("P-side DSpark draft KV generation currently requires eager prefill.")
     if vllm_config.cache_config.enable_prefix_caching:
         raise ValueError(
-            "P-side DSpark auxiliary capture requires prefix caching disabled until auxiliary caching exists."
+            "P-side DSpark draft KV generation requires prefix caching disabled until draft-cache reuse exists."
         )
-    return get_dspark_aux_layer_ids(vllm_config)
+    layer_ids = get_dspark_aux_layer_ids(vllm_config)
+    if not layer_ids:
+        raise ValueError("P-side DSpark draft KV generation requires auxiliary boundaries from the draft checkpoint.")
+    return layer_ids
 
 
 def resident_mla_context_group_ids(groups: Sequence[Any]) -> tuple[int, ...]:
@@ -86,11 +83,29 @@ def find_dspark_context_connector(connector: Any, metadata: Any) -> tuple[Any, A
                 raise RuntimeError("DSpark MultiConnector children and metadata are not aligned")
             pending.extend(zip(children, child_metadata))
         elif callable(getattr(current, "get_dspark_context_descriptor", None)) and callable(
-            getattr(current, "send_dspark_context_chunk", None)
+            getattr(current, "send_dspark_draft_kv", None)
         ):
             matches.append((current, current_meta))
     if len(matches) != 1:
         raise RuntimeError("DSpark prefill requires exactly one PD context connector")
+    return matches[0]
+
+
+def find_dspark_kv_connector(connector: Any) -> Any:
+    """Find the unique SFA PD child that owns DSpark KV pages."""
+    pending = [connector]
+    matches = []
+    while pending:
+        current = pending.pop()
+        children = getattr(current, "_connectors", ())
+        if children:
+            pending.extend(children)
+        elif callable(getattr(current, "configure_dspark_draft_layers", None)) and callable(
+            getattr(current, "send_dspark_draft_kv", None)
+        ):
+            matches.append(current)
+    if len(matches) != 1:
+        raise RuntimeError("DSpark KV transfer requires exactly one SFA PD connector")
     return matches[0]
 
 
@@ -131,121 +146,126 @@ class DSparkContextChunk:
     num_tokens: int
 
 
+def send_dspark_prefill_kv(
+    speculator: Any,
+    batch: Any,
+    aux_hidden_states: Sequence[torch.Tensor],
+    requests: Mapping[str, Any],
+    connector: Any,
+    progress: dict[str, tuple[str, int]],
+    finished_req_ids: Sequence[str],
+) -> None:
+    """Project each P prefill chunk locally, then transfer completed draft pages.
+
+    Target layerwise scratch buffers may be reused after this call, while
+    draft pages remain persistent until the remote consumer acknowledges them.
+    Only prompt rows are projected; target verification rows are not context.
+    """
+    for request_id in finished_req_ids:
+        progress.pop(request_id, None)
+    if speculator is None or not hasattr(speculator, "initialize_local_context"):
+        raise RuntimeError("P-side DSpark prompt KV generation requires the loaded DSpark speculator")
+    features = torch.cat(aux_hidden_states, dim=-1)
+    draft_group_ids, _, block_sizes = speculator.get_draft_context_group_layout()
+    for req_idx in range(batch.num_reqs):
+        request_id = batch.req_ids[req_idx]
+        prompt_tokens = int(batch.prefill_len_np[req_idx])
+        offset = int(batch.num_computed_tokens_np[req_idx])
+        scheduled = int(batch.num_scheduled_tokens[req_idx])
+        context_tokens = min(scheduled, max(prompt_tokens - offset, 0))
+        if context_tokens == 0:
+            continue
+        descriptor = connector.get_dspark_context_descriptor(request_id, prompt_tokens)
+        if descriptor is None:
+            continue
+        if descriptor.prompt_tokens != prompt_tokens:
+            raise RuntimeError("P/D DSpark prompt lengths disagree for a remote request")
+        if len(aux_hidden_states) != len(descriptor.aux_layer_ids):
+            raise RuntimeError("P produced a different number of DSpark auxiliary states than the configured schema")
+        if features.ndim != 2 or features.shape[1] != descriptor.feature_width or features.dtype != torch.bfloat16:
+            raise RuntimeError("P DSpark context must be a [tokens, aux_layers * hidden_size] BF16 tensor")
+        previous = progress.get(request_id)
+        expected_offset = 0 if previous is None else previous[1]
+        if previous is not None and previous[0] != descriptor.generation:
+            raise RuntimeError("P DSpark allocation generation changed during prompt prefill")
+        if offset != expected_offset:
+            raise RuntimeError(
+                f"P DSpark prefill chunks are not contiguous for {request_id}: "
+                f"expected offset {expected_offset}, received {offset}"
+            )
+        row_begin = int(batch.query_start_loc_np[req_idx])
+        if row_begin + scheduled > features.shape[0]:
+            raise RuntimeError("P DSpark auxiliary rows do not cover the scheduled prompt chunk")
+        local_block_ids = requests[request_id].local_block_ids
+        source_blocks_by_group = {}
+        for group_id in draft_group_ids:
+            if group_id >= len(local_block_ids):
+                raise RuntimeError(f"P request is missing DSpark draft KV group {group_id}")
+            block_size = block_sizes[group_id]
+            # Chunked prefill allocates pages incrementally; require coverage
+            # through this chunk's end, not the entire prompt on its first step.
+            needed = (offset + context_tokens + block_size - 1) // block_size
+            source_blocks_by_group[group_id] = tuple(local_block_ids[group_id][:needed])
+            if len(source_blocks_by_group[group_id]) != needed:
+                raise RuntimeError(f"P DSpark draft KV group {group_id} does not cover the prefill chunk")
+        for sent in range(0, context_tokens, MAX_DSPARK_CONTEXT_CHUNK_TOKENS):
+            count = min(MAX_DSPARK_CONTEXT_CHUNK_TOKENS, context_tokens - sent)
+            speculator.initialize_local_context(
+                DSparkContextChunk(descriptor, offset + sent, count),
+                features[row_begin + sent : row_begin + sent + count].contiguous(),
+                source_blocks_by_group,
+            )
+        next_offset = offset + context_tokens
+        progress[request_id] = (descriptor.generation, next_offset)
+        if next_offset == prompt_tokens:
+            connector.send_dspark_draft_kv(request_id, descriptor, source_blocks_by_group)
+            progress.pop(request_id, None)
+
+
 class DSparkContextSubmission(Enum):
     ACCEPTED = auto()
     BACKPRESSURE = auto()
     STALE = auto()
 
 
-def build_dspark_context_inputs(
-    chunk: DSparkContextChunk,
-    block_ids_by_group: Mapping[int, Sequence[int]],
-    layer_group_ids: Sequence[int],
-    *,
-    block_size: int,
-    num_blocks: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """Build absolute positions and real resident-draft slots, never target slots.
-
-    ``layer_group_ids`` are the actual global KV group IDs discovered by the
-    draft loader. Copy only the block-table slice touched by this chunk, and
-    reuse its mapping for draft layers sharing one physical cache group.
-    """
-    if type(block_size) is not int or block_size <= 0 or type(num_blocks) is not int or num_blocks <= 0:
-        raise ValueError("DSpark context requires positive integer cache bounds")
-    if block_size * num_blocks - 1 > torch.iinfo(torch.int32).max:
-        raise ValueError("DSpark context slot IDs exceed the NPU int32 mapping range")
-    if not layer_group_ids or any(type(gid) is not int or gid < 0 for gid in layer_group_ids):
-        raise ValueError("DSpark context requires loader-discovered draft cache group IDs")
-    start = chunk.token_offset
-    end = start + chunk.num_tokens
-    if (
-        type(start) is not int
-        or type(chunk.num_tokens) is not int
-        or not 0 <= start < end <= chunk.descriptor.prompt_tokens
-    ):
-        raise ValueError("DSpark context chunk is outside the allocated prompt")
-    required_blocks = (chunk.descriptor.prompt_tokens + block_size - 1) // block_size
-    first_block, last_block = start // block_size, (end - 1) // block_size + 1
-    selected: dict[int, Sequence[int]] = {}
-    for gid in set(layer_group_ids):
-        ids = block_ids_by_group.get(gid)
-        if ids is None or len(ids) < required_blocks:
-            raise ValueError(f"DSpark draft group {gid} does not cover the full prompt")
-        prompt_ids = ids[:required_blocks]
-        if any(type(block) is not int or not 0 <= block < num_blocks for block in prompt_ids):
-            raise ValueError(f"DSpark draft group {gid} contains an invalid physical block")
-        if len(set(prompt_ids)) != len(prompt_ids):
-            raise ValueError(f"DSpark draft group {gid} aliases distinct prompt blocks")
-        selected[gid] = prompt_ids[first_block:last_block]
-    positions = torch.arange(start, end, dtype=torch.int64, device=device)
-    logical_blocks = positions // block_size - first_block
-    mappings = {
-        gid: (
-            torch.tensor(ids, dtype=torch.int64, device=device)[logical_blocks] * block_size + positions % block_size
-        ).to(torch.int32)
-        for gid, ids in selected.items()
-    }
-    return positions, [mappings[gid] for gid in layer_group_ids]
-
-
 @dataclass
 class _ContextProgress:
     descriptor: DSparkContextDescriptor
-    received_tokens: int = 0
     initialized_tokens: int = 0
     target_kv_done: bool = False
     in_flight: bool = False
     failed: bool = False
 
 
-@dataclass
-class _QueuedContext:
-    chunk: DSparkContextChunk
-    tensor: torch.Tensor
-    release: Callable[[], None]
-
-    @property
-    def size_bytes(self) -> int:
-        return self.tensor.numel() * self.tensor.element_size()
-
-
 class DSparkContextReceiver:
-    """Queue registered staging views until synchronous main-thread KV writes.
+    """Track direct P-to-D draft-KV transfer and its join with target KV.
 
-    A successful submit transfers ownership of the tensor and release callback.
-    STALE/BACKPRESSURE leave ownership with the reader. An initialization failure
-    quarantines accepted buffers until explicit discard after device writes have
-    been synchronized; it never reports readiness or silently recomputes prompt.
+    The read thread copies already-computed draft KV directly into D's resident
+    pages. This receiver only gates admission/completion; it never stages target
+    hidden states or projects them on D.
     """
 
-    def __init__(self, *, max_pending_bytes: int, max_requests: int) -> None:
-        if type(max_pending_bytes) is not int or max_pending_bytes <= 0:
-            raise ValueError("DSpark staging byte budget must be a positive integer")
+    def __init__(self, *, max_requests: int) -> None:
         if type(max_requests) is not int or max_requests <= 0:
             raise ValueError("DSpark request capacity must be a positive integer")
-        self.max_pending_bytes = max_pending_bytes
         self.max_requests = max_requests
         self._owner_thread = threading.get_ident()
         self._lock = threading.Lock()
         self._contexts: dict[str, _ContextProgress] = {}
-        self._queue: deque[_QueuedContext] = deque()
-        self._pending_bytes = 0
+        # Keep completed generations until the request is freed so a lost ACK
+        # can be retried without copying the same pages twice.
+        self._completed: dict[str, DSparkContextDescriptor] = {}
+        self._retired: OrderedDict[tuple[str, str], DSparkContextDescriptor] = OrderedDict()
+        self._retired_capacity = max(16, max_requests * 4)
 
     def _require_owner(self) -> None:
         if threading.get_ident() != self._owner_thread:
             raise RuntimeError("DSpark context lifecycle and draft KV writes require the model worker thread")
 
-    @property
-    def pending_bytes(self) -> int:
-        with self._lock:
-            return self._pending_bytes
-
     def register_request(self, descriptor: DSparkContextDescriptor) -> None:
         self._require_owner()
         with self._lock:
-            if descriptor.request_id in self._contexts:
+            if descriptor.request_id in self._contexts or descriptor.request_id in self._completed:
                 raise ValueError("Discard the previous DSpark allocation before registering a reused request ID")
             if len(self._contexts) >= self.max_requests:
                 raise RuntimeError("DSpark context request capacity exhausted")
@@ -258,113 +278,52 @@ class DSparkContextReceiver:
             state = self._contexts.get(request_id)
             return state.descriptor if state is not None else None
 
-    def can_accept(self, chunk: DSparkContextChunk) -> DSparkContextSubmission:
-        """Check reader admission before allocating/reading a pinned chunk.
-
-        The reader is the sole submitter for one D TP rank. The model thread can
-        only drain entries (which frees capacity), so a positive result cannot
-        be invalidated by a competing submit before ``submit``.
-        """
+    def begin_direct_transfer(self, descriptor: DSparkContextDescriptor) -> tuple[DSparkContextSubmission, bool]:
+        """Reserve one whole-prompt direct KV copy; duplicate retries are idempotent."""
         with self._lock:
-            state = self._contexts.get(chunk.descriptor.request_id)
+            state = self._contexts.get(descriptor.request_id)
             if state is None:
-                # D may not have reached start_load_kv yet. Ask P to retry.
-                return DSparkContextSubmission.BACKPRESSURE
-            if state.descriptor.generation != chunk.descriptor.generation:
-                return DSparkContextSubmission.STALE
+                completed = self._completed.get(descriptor.request_id)
+                if completed is not None:
+                    if completed.generation != descriptor.generation:
+                        return DSparkContextSubmission.STALE, False
+                    if completed != descriptor:
+                        raise ValueError("DSpark KV transfer schema changed within one allocation")
+                    return DSparkContextSubmission.ACCEPTED, False
+                retired = self._retired.get((descriptor.request_id, descriptor.generation))
+                if retired is not None:
+                    if retired != descriptor:
+                        raise ValueError("Retired DSpark KV transfer schema changed")
+                    return DSparkContextSubmission.ACCEPTED, False
+                return DSparkContextSubmission.BACKPRESSURE, False
+            if state.descriptor.generation != descriptor.generation:
+                return DSparkContextSubmission.STALE, False
             if state.failed:
-                raise RuntimeError("DSpark context allocation is quarantined after an initialization failure")
-            if state.descriptor != chunk.descriptor:
-                raise ValueError("DSpark context schema/prompt length changed within one allocation")
-            if type(chunk.token_offset) is not int or chunk.token_offset != state.received_tokens:
-                raise ValueError("DSpark context chunks must cover the prompt in order without gaps or duplicates")
-            if (
-                type(chunk.num_tokens) is not int
-                or chunk.num_tokens <= 0
-                or chunk.token_offset + chunk.num_tokens > state.descriptor.prompt_tokens
-            ):
-                raise ValueError("DSpark context chunk is outside the allocated prompt")
-            size_bytes = chunk.num_tokens * state.descriptor.feature_width * BF16_BYTES
-            if size_bytes > self.max_pending_bytes:
-                raise ValueError("DSpark context chunk exceeds the whole staging budget; split it before reading")
-            if self._pending_bytes + size_bytes > self.max_pending_bytes:
-                return DSparkContextSubmission.BACKPRESSURE
-            return DSparkContextSubmission.ACCEPTED
+                raise RuntimeError("DSpark context allocation is quarantined after a transfer failure")
+            if state.descriptor != descriptor:
+                raise ValueError("DSpark KV transfer schema/prompt length changed within one allocation")
+            if state.initialized_tokens == descriptor.prompt_tokens:
+                return DSparkContextSubmission.ACCEPTED, False
+            if state.in_flight:
+                return DSparkContextSubmission.BACKPRESSURE, False
+            if state.initialized_tokens:
+                raise ValueError("Direct DSpark KV transfer cannot overlap another initialization path")
+            state.in_flight = True
+            return DSparkContextSubmission.ACCEPTED, True
 
-    def submit(
-        self, chunk: DSparkContextChunk, tensor: torch.Tensor, release: Callable[[], None]
-    ) -> DSparkContextSubmission:
-        """Called by the reader only after its MemFabric read has completed."""
-        admission = self.can_accept(chunk)
-        if admission is not DSparkContextSubmission.ACCEPTED:
-            return admission
+    def finish_direct_transfer(self, descriptor: DSparkContextDescriptor, *, success: bool) -> None:
+        """Publish transfer completion only after MemFabric reports success."""
         with self._lock:
-            state = self._contexts.get(chunk.descriptor.request_id)
-            if state is None or state.descriptor.generation != chunk.descriptor.generation:
-                return DSparkContextSubmission.STALE
-            if (
-                not isinstance(tensor, torch.Tensor)
-                or tensor.dtype != torch.bfloat16
-                or tuple(tensor.shape)
-                != (
-                    chunk.num_tokens,
-                    state.descriptor.feature_width,
-                )
-            ):
-                raise ValueError("DSpark context tensor must contain all ordered BF16 auxiliary features")
-            if not tensor.is_contiguous() or not callable(release):
-                raise ValueError("DSpark context requires contiguous staging storage and its release callback")
-            item = _QueuedContext(chunk, tensor, release)
-            if item.size_bytes > self.max_pending_bytes:
-                raise ValueError("DSpark context chunk exceeds the whole staging budget; split it before reading")
-            if self._pending_bytes + item.size_bytes > self.max_pending_bytes:
-                return DSparkContextSubmission.BACKPRESSURE
-            self._queue.append(item)
-            self._pending_bytes += item.size_bytes
-            state.received_tokens += chunk.num_tokens
-            return DSparkContextSubmission.ACCEPTED
-
-    def drain(self, initialize: Callable[[DSparkContextChunk, torch.Tensor], None]) -> int:
-        """Project context and write real draft slots, waiting for device completion.
-
-        The callback owns the model-specific projection, RoPE, block-group slot
-        mapping and device event wait. Returning before the writes finish is not
-        permitted: these buffers may be recycled immediately after return.
-        """
-        self._require_owner()
-        initialized = 0
-        while True:
-            with self._lock:
-                if not self._queue:
-                    return initialized
-                item = self._queue[0]
-                state = self._contexts[item.chunk.descriptor.request_id]
-                if state.failed:
-                    raise RuntimeError("DSpark context remains quarantined after an initialization failure")
-                if state.in_flight:
-                    raise RuntimeError("Reentrant DSpark context drain is not permitted")
-                state.in_flight = True
-            try:
-                result = initialize(item.chunk, item.tensor)
-                if result is not None:
-                    raise RuntimeError("DSpark initializer must wait synchronously for draft KV writes")
-            except BaseException:
-                with self._lock:
-                    state.in_flight = False
-                    state.failed = True
-                raise
-            with self._lock:
-                state.in_flight = False
-                state.initialized_tokens += item.chunk.num_tokens
-                self._queue.popleft()
-                self._pending_bytes -= item.size_bytes
-            try:
-                item.release()
-            except BaseException:
-                with self._lock:
-                    state.failed = True
-                raise
-            initialized += item.chunk.num_tokens
+            state = self._contexts.get(descriptor.request_id)
+            if state is None or state.descriptor.generation != descriptor.generation:
+                raise RuntimeError("DSpark allocation changed during direct KV transfer")
+            if not state.in_flight:
+                raise RuntimeError("DSpark direct KV transfer was not reserved")
+            state.in_flight = False
+            if not success:
+                state.failed = True
+                return
+            state.initialized_tokens = descriptor.prompt_tokens
 
     def mark_target_kv_done(self, request_id: str, generation: str) -> None:
         self._require_owner()
@@ -407,28 +366,47 @@ class DSparkContextReceiver:
             ):
                 raise RuntimeError("Cannot retire DSpark ingress before synchronized context and target KV readiness")
             del self._contexts[request_id]
+            self._completed[request_id] = state.descriptor
+
+    def _remember_retired(self, descriptor: DSparkContextDescriptor) -> None:
+        key = (descriptor.request_id, descriptor.generation)
+        self._retired[key] = descriptor
+        self._retired.move_to_end(key)
+        while len(self._retired) > self._retired_capacity:
+            self._retired.popitem(last=False)
+
+    def discard_request_id(self, request_id: str) -> None:
+        """Free request bookkeeping while retaining a bounded lost-ACK tombstone."""
+        self._require_owner()
+        with self._lock:
+            completed = self._completed.pop(request_id, None)
+            if completed is not None:
+                self._remember_retired(completed)
+            state = self._contexts.get(request_id)
+            if state is None:
+                return
+            if state.in_flight:
+                raise RuntimeError("Cannot recycle DSpark blocks while a direct transfer is in flight")
+            del self._contexts[request_id]
+            if state.initialized_tokens == state.descriptor.prompt_tokens:
+                self._remember_retired(state.descriptor)
 
     def discard_request(self, request_id: str, generation: str) -> None:
-        """Cancel/retire an allocation after any device writes are synchronized."""
+        """Cancel/retire an allocation after any direct read has completed."""
         self._require_owner()
-        discarded: list[_QueuedContext] = []
         with self._lock:
+            completed = self._completed.get(request_id)
+            if completed is not None and completed.generation == generation:
+                del self._completed[request_id]
+                self._remember_retired(completed)
             state = self._contexts.get(request_id)
             if state is None or state.descriptor.generation != generation:
                 return
             if state.in_flight:
-                raise RuntimeError("Cannot recycle DSpark blocks while a context initializer is running")
-            kept: deque[_QueuedContext] = deque()
-            for item in self._queue:
-                if item.chunk.descriptor == state.descriptor:
-                    discarded.append(item)
-                    self._pending_bytes -= item.size_bytes
-                else:
-                    kept.append(item)
-            self._queue = kept
+                raise RuntimeError("Cannot recycle DSpark blocks while a direct transfer is in flight")
             del self._contexts[request_id]
-        for item in discarded:
-            item.release()
+            if state.initialized_tokens == state.descriptor.prompt_tokens:
+                self._remember_retired(state.descriptor)
 
 
 def build_draft_context_slot_mappings(
@@ -460,8 +438,8 @@ def build_draft_context_slot_mappings(
         block_size = block_sizes_by_group[group_id]
         if type(block_size) is not int or block_size <= 0:
             raise ValueError("DSpark draft KV block sizes must be positive integers")
-        if len(block_ids) * block_size < chunk.descriptor.prompt_tokens:
-            raise ValueError("DSpark draft block table does not cover the full prompt")
+        if len(block_ids) * block_size < chunk.token_offset + chunk.num_tokens:
+            raise ValueError("DSpark draft block table does not cover the prefill chunk")
         if any(type(block_id) is not int or block_id < 0 for block_id in block_ids):
             raise ValueError("DSpark draft block table contains an invalid block ID")
         slots = [block_ids[position // block_size] * block_size + position % block_size for position in positions]

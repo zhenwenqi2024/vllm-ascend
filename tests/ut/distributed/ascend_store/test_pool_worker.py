@@ -28,7 +28,7 @@ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 
 # isort: split
 import torch
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import AscendStoreConnector
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -159,6 +159,66 @@ def test_cache_coordinator_uses_kv_cache_config_retention_interval(retention_int
 
 
 class TestPCPPoolWorker(unittest.TestCase):
+    def test_dspark_draft_pages_are_not_target_pool_or_reuse_slots(self):
+        target_names = [f"model.layers.{index}.attn" for index in range(4)]
+        draft_names = [f"draft.layers.{index}.attn" for index in range(2)]
+        target = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.int8)
+        draft = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.bfloat16)
+        config = SimpleNamespace(
+            num_blocks=2,
+            prefix_cache_retention_interval=0,
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=draft_names,
+                    kv_cache_spec=UniformTypeKVCacheSpecs(
+                        block_size=16, kv_cache_specs=dict.fromkeys(draft_names, draft)
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    layer_names=target_names,
+                    kv_cache_spec=UniformTypeKVCacheSpecs(
+                        block_size=16, kv_cache_specs=dict.fromkeys(target_names, target)
+                    ),
+                ),
+            ],
+            dspark_draft_layer_names=tuple(draft_names),
+        )
+        worker = make_worker(
+            self,
+            num_layers=4,
+            num_hidden_layers=4,
+            use_layerwise=True,
+            extra_config={"backend": "memcache", "layerwise_num_shared_buffers": 1},
+            kv_cache_config=config,
+        )
+        self.assertEqual(worker.cacheable_group_ids, [1])  # Original group IDs are retained.
+        self.assertEqual(worker.prefetch_layer_map, {2: 1, 3: 2})
+        self.assertTrue(
+            all(item.main.spec is target for item in worker._layerwise_reuse_layout.layer_cache_specs.values())
+        )
+        worker._transfer_threads_started = True
+        # Match the actual shared, 2 MiB-aligned kernel cache allocation.
+        alignment = 2 * 1024 * 1024
+        backing = torch.zeros(alignment + 4096, dtype=torch.uint8)
+        cursor = -backing.data_ptr() % alignment
+
+        def cache(dtype):
+            nonlocal cursor
+            byte_count = 128 * torch.empty((), dtype=dtype).element_size()
+            tensor = backing[cursor : cursor + byte_count].view(dtype).reshape(2, 16, 1, 4)
+            cursor += byte_count
+            return tensor
+
+        caches = {
+            name: (cache(spec.dtype), cache(spec.dtype))
+            for names, spec in ((draft_names, draft), (target_names, target))
+            for name in names
+        }
+        worker.register_kv_caches(caches)
+        self.assertEqual(set(worker.kv_caches), set(target_names))
+        self.assertEqual(worker.group_num_layers, {0: 0, 1: 4})
+        self.assertTrue(set(draft_names) <= caches.keys())  # Caller-owned draft caches remain intact.
+
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.threading.Event")
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreRecvingThread")
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreSendingThread")

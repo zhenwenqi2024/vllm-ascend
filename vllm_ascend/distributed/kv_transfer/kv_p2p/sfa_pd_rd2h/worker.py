@@ -31,10 +31,12 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend.attention.sfa_contract import COPY_SFA_TAIL_BLOCKS
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
-    MAX_DSPARK_CONTEXT_CHUNK_TOKENS,
-    DSparkContextChunk,
     DSparkContextDescriptor,
     DSparkContextReceiver,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_kv import (
+    DraftKVCacheMetadata,
+    build_draft_kv_metadata,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     CopySfaTailDest,
@@ -173,19 +175,26 @@ class SFAPDRD2HConsumerWorker:
         # not a per-layer barrier.
         self._terminal_ext_ids: set[str] = set()
         self._dspark_context_receiver: DSparkContextReceiver | None = None
-        self._dspark_context_initializer: Callable[[DSparkContextChunk, torch.Tensor], None] | None = None
         self._dspark_draft_blocks_by_req: dict[str, dict[int, tuple[int, ...]]] = {}
+        self.dspark_draft_layer_names: tuple[str, ...] = ()
+        self.dspark_draft_kv_metadata: dict[str, DraftKVCacheMetadata] = {}
 
-    def bind_dspark_context_receiver(
-        self,
-        receiver: DSparkContextReceiver,
-        initialize: Callable[[DSparkContextChunk, torch.Tensor], None],
-    ) -> None:
-        """Bind the opt-in main-thread draft-context gate before admitting requests."""
+    def configure_dspark_draft_layers(self, layer_names: tuple[str, ...]) -> None:
+        """Keep draft pages out of target-layer registration while exposing them to DSpark."""
+        if self._mf_read_thread is not None or self.request_map:
+            raise RuntimeError("Configure DSpark cache ownership before request admission")
+        configured = tuple(layer_names)
+        available = {name for group in self.kv_cache_config.kv_cache_groups for name in group.layer_names}
+        if not configured or len(set(configured)) != len(configured) or not set(configured) <= available:
+            raise ValueError("DSpark draft cache names must uniquely match allocated KV layers")
+        self.dspark_draft_layer_names = configured
+        self.kv_cache_config.dspark_draft_layer_names = configured
+
+    def bind_dspark_context_receiver(self, receiver: DSparkContextReceiver) -> None:
+        """Bind the direct-transfer readiness gate before admitting requests."""
         if getattr(self, "_dspark_context_receiver", None) is not None or self.request_map:
             raise RuntimeError("Bind the DSpark context receiver once, before request admission")
         self._dspark_context_receiver = receiver
-        self._dspark_context_initializer = initialize
         if self._mf_read_thread is not None:
             self._mf_read_thread.bind_dspark_context_receiver(receiver)
 
@@ -246,7 +255,6 @@ class SFAPDRD2HConsumerWorker:
                     receiver = self._dspark_context_receiver
                     if receiver is None:
                         raise RuntimeError("DSpark context arrived before its model-thread receiver was bound")
-                    receiver.register_request(descriptor)
                     group_ids = tuple(getattr(req, "dspark_draft_group_ids", ()) or ())
                     block_ids_by_group = getattr(req, "dspark_draft_block_ids_by_group", None)
                     if not group_ids or block_ids_by_group is None or set(group_ids) != set(block_ids_by_group):
@@ -254,6 +262,7 @@ class SFAPDRD2HConsumerWorker:
                     self._dspark_draft_blocks_by_req[ext_id] = {
                         group_id: tuple(block_ids_by_group[group_id]) for group_id in group_ids
                     }
+                    receiver.register_request(descriptor)
                 pool_slot = getattr(req, "pool_slot", None)
                 if pool_slot is not None:
                     self.copy_sfa_slots_by_req[req_id] = int(pool_slot)
@@ -298,9 +307,7 @@ class SFAPDRD2HConsumerWorker:
             self._terminal_ext_ids.discard(ext_id)
             receiver = getattr(self, "_dspark_context_receiver", None)
             if receiver is not None:
-                descriptor = receiver.get_descriptor(ext_id)
-                if descriptor is not None:
-                    receiver.discard_request(ext_id, descriptor.generation)
+                receiver.discard_request_id(ext_id)
         # Drop any partial contributor-completion state so a dead contributor or a
         # retried external id cannot complete a later request on stale arrivals.
         if self._mf_read_thread is not None:
@@ -330,14 +337,13 @@ class SFAPDRD2HConsumerWorker:
         if hasattr(self, "_mf_read_thread") and self._mf_read_thread is not None:
             local_done = self._mf_read_thread.get_and_clear_done()
             local_failed = self._mf_read_thread.get_and_clear_failed()
-            self._terminal_ext_ids.update(local_done | local_failed)
+        self._terminal_ext_ids.update(local_done | local_failed)
 
         local_terminal = set(self._terminal_ext_ids)
         receiver = getattr(self, "_dspark_context_receiver", None)
         if receiver is not None:
-            # get_finished also runs in the zero-token connector-only step.
-            # Do not write draft KV in the read thread or recompute target prompt.
-            receiver.drain(self._dspark_context_initializer)
+            # Target KV reads and direct P-computed draft-KV transfers are
+            # independent. A request is released only after both have joined.
             for ext_id in local_terminal:
                 descriptor = receiver.get_descriptor(ext_id)
                 if descriptor is not None:
@@ -436,6 +442,8 @@ class SFAPDRD2HConsumerWorker:
             topk_row_tokens=self._topk_row_tokens,
             topk_hot_tokens=self._topk_hot_tokens,
             block_size=self._copy_sfa_block_size,
+            dspark_draft_kv_metadata=self.dspark_draft_kv_metadata,
+            dspark_draft_blocks_by_req=self._dspark_draft_blocks_by_req,
         )
 
     def _register_memfabric_pull(
@@ -447,7 +455,12 @@ class SFAPDRD2HConsumerWorker:
         assert self.kv_cache_config is not None
         num_blocks = self.kv_cache_config.num_blocks
         main_names = list(self.offload_manager.offload_layer_names)
-        indexer_by_layer = {_layer_idx(name): name for name in kv_caches if "indexer" in name.lower()}
+        draft_names = set(self.dspark_draft_layer_names)
+        indexer_by_layer = {
+            _layer_idx(name): name for name in kv_caches if "indexer" in name.lower() and name not in draft_names
+        }
+        if draft_names:
+            self.dspark_draft_kv_metadata = build_draft_kv_metadata(self.kv_cache_config, kv_caches)
 
         # Store layer info for MembPullReadThread
         self._main_names = main_names
@@ -625,29 +638,15 @@ class SFAPDRD2HProducerWorker:
         # Layers whose PD send was already dispatched at scatter time by
         # on_kv_cache_written; save_kv_layer skips these at layer end.
         self._pd_dispatched_layers: set[int] = set()
-        transfer_extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        speculative = getattr(vllm_config, "speculative_config", None)
         self.dspark_aux_layer_ids = (
-            get_dspark_aux_layer_ids(vllm_config)
-            if transfer_extra.get("dspark_aux_hidden_state_layer_ids") is not None
-            else ()
+            get_dspark_aux_layer_ids(vllm_config) if speculative is not None and speculative.method == "dspark" else ()
         )
-        self.dspark_context_chunk_tokens = int(
-            transfer_extra.get("dspark_context_chunk_tokens", MAX_DSPARK_CONTEXT_CHUNK_TOKENS)
-        )
-        if self.dspark_aux_layer_ids and not 0 < self.dspark_context_chunk_tokens <= MAX_DSPARK_CONTEXT_CHUNK_TOKENS:
-            raise ValueError(f"dspark_context_chunk_tokens must be in [1, {MAX_DSPARK_CONTEXT_CHUNK_TOKENS}]")
-        self.dspark_context_staging: torch.Tensor | None = None
+        self.dspark_draft_layer_names: tuple[str, ...] = ()
+        self.dspark_draft_kv_metadata: dict[str, DraftKVCacheMetadata] = {}
         self._active_dspark_requests: dict[str, Any] = {}
-        self._dspark_next_offsets: dict[tuple[str, str], int] = {}
 
     def get_finished(self, finished_req_ids: set[str] | None = None) -> tuple[set[str], set[str]]:
-        if finished_req_ids:
-            completed = {get_external_request_id(req_id) for req_id in finished_req_ids}
-            self._dspark_next_offsets = {
-                key: offset
-                for key, offset in getattr(self, "_dspark_next_offsets", {}).items()
-                if key[0] not in completed
-            }
         return set(), set()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -787,8 +786,10 @@ class SFAPDRD2HProducerWorker:
                 layer2group_ids[layer_name] = group_idx
 
         num_blocks = self.kv_cache_config.num_blocks
-        main_by_layer = {_layer_idx(name): name for name in kv_caches if "indexer" not in name.lower()}
-        indexer_by_layer = {_layer_idx(name): name for name in kv_caches if "indexer" in name.lower()}
+        draft_names = set(self.dspark_draft_layer_names)
+        target_caches = {name: cache for name, cache in kv_caches.items() if name not in draft_names}
+        main_by_layer = {_layer_idx(name): name for name in target_caches if "indexer" not in name.lower()}
+        indexer_by_layer = {_layer_idx(name): name for name in target_caches if "indexer" in name.lower()}
         if not main_by_layer:
             raise RuntimeError("SFAPD producer did not find main SFA KV cache layers")
 
@@ -810,7 +811,7 @@ class SFAPDRD2HProducerWorker:
 
         for physical_idx, main_name in sorted(main_by_layer.items()):
             layer_meta = LayerMetadata([], [], [], [])
-            _append_cache_tensors(layer_meta, kv_caches[main_name], layer2group_ids[main_name])
+            _append_cache_tensors(layer_meta, target_caches[main_name], layer2group_ids[main_name])
             layer_meta.main_tensor_count = len(layer_meta.kv_caches_base_addr)
             if layer_meta.main_tensor_count != 2:
                 raise RuntimeError(
@@ -821,7 +822,7 @@ class SFAPDRD2HProducerWorker:
             if indexer_name is not None:
                 _append_cache_tensors(
                     layer_meta,
-                    kv_caches[indexer_name],
+                    target_caches[indexer_name],
                     layer2group_ids[indexer_name],
                 )
                 layer_meta.has_indexer = True
@@ -830,24 +831,17 @@ class SFAPDRD2HProducerWorker:
         self.last_layer_idx = max(main_by_layer)
         self.total_layers = self.last_layer_idx + 1
         self.stage_layer_names = [name for _, name in sorted(main_by_layer.items())]
+        if draft_names:
+            self.dspark_draft_kv_metadata = build_draft_kv_metadata(self.kv_cache_config, kv_caches)
 
         # Infer physical storage slots directly from component addresses.
         # Main and indexer storage are tracked independently: a main-only layer
         # can still share its main slot with a later layer that owns an indexer.
         self.layer_storage_slots = self._infer_layer_storage_slots(self.layer_metadata)
 
+        # Register both cache families. Target layer metadata remains separate
+        # so draft layer indices cannot collide with target SFA layer indices.
         register_regions = collect_storage_merged_register_regions(kv_caches)
-        if self.dspark_aux_layer_ids and self.pp_rank == self.pp_size - 1:
-            hidden_size = self.vllm_config.model_config.get_hidden_size()
-            feature_width = hidden_size * len(self.dspark_aux_layer_ids)
-            self.dspark_context_staging = torch.empty(
-                (self.dspark_context_chunk_tokens, feature_width),
-                dtype=torch.bfloat16,
-                device=f"npu:{torch.npu.current_device()}",
-            )
-            registered_caches = dict(kv_caches)
-            registered_caches["__dspark_context_staging__"] = self.dspark_context_staging
-            register_regions = collect_storage_merged_register_regions(registered_caches)
         validate_register_region_count(register_regions)
         global_memfabric_te.register_buffer(register_regions.ptrs, register_regions.lengths)
 
@@ -866,16 +860,50 @@ class SFAPDRD2HProducerWorker:
             self.kv_send_layer_thread.stop()
             raise RuntimeError("SFAPD P-side send thread failed during startup") from error
         logger.info(
-            "MembPull P registered kv caches: layers=%d, dspark_context_staging=%s, p_session=%s",
+            "MembPull P registered kv caches: target_layers=%d, dspark_draft_layers=%d, p_session=%s",
             len(self.layer_metadata),
-            self.dspark_context_staging is not None,
+            len(self.dspark_draft_kv_metadata),
             global_memfabric_te.unique_id,
         )
 
-    def send_dspark_context_chunk(self, request_id: str, chunk: DSparkContextChunk, tensor: torch.Tensor) -> None:
-        """Copy one target auxiliary chunk into registered HBM and pull-serve it."""
-        if self.pp_rank != self.pp_size - 1 or self.dspark_context_staging is None:
-            raise RuntimeError("Only the final Prefill PP stage owns the registered DSpark context arena")
+    def configure_dspark_draft_layers(self, layer_names: tuple[str, ...]) -> None:
+        if self.kv_send_layer_thread is not None:
+            raise RuntimeError("Configure DSpark draft layers before P cache registration")
+        configured = tuple(layer_names)
+        available = {name for group in self.kv_cache_config.kv_cache_groups for name in group.layer_names}
+        if not configured or len(set(configured)) != len(configured) or not set(configured) <= available:
+            raise ValueError("DSpark draft cache names must uniquely match allocated KV layers")
+        self.dspark_draft_layer_names = configured
+        self.kv_cache_config.dspark_draft_layer_names = configured
+
+    @staticmethod
+    def _draft_kv_metadata_to_wire(
+        metadata: dict[str, DraftKVCacheMetadata],
+    ) -> dict[str, dict[str, Any]]:
+        return {
+            name: {
+                "group_id": item.group_id,
+                "block_size": item.block_size,
+                "num_blocks": item.num_blocks,
+                "base_addrs": item.base_addrs,
+                "block_strides": item.block_strides,
+                "block_lens": item.block_lens,
+                "block_scales": item.block_scales,
+                "shapes": item.shapes,
+                "dtypes": item.dtypes,
+            }
+            for name, item in metadata.items()
+        }
+
+    def send_dspark_draft_kv(
+        self,
+        request_id: str,
+        descriptor: DSparkContextDescriptor,
+        source_blocks_by_group: dict[int, tuple[int, ...]],
+    ) -> None:
+        """Let D pull P-computed draft KV into D's own resident block table."""
+        if self.pp_rank != self.pp_size - 1 or not self.dspark_draft_kv_metadata:
+            raise RuntimeError("P-side DSpark draft KV transfer requires registered draft pages on final PP")
         if self.kv_send_layer_thread is None:
             raise RuntimeError("SFAPD P send thread is not registered")
         req_meta = self._active_dspark_requests.get(request_id)
@@ -883,51 +911,39 @@ class SFAPDRD2HProducerWorker:
             raise RuntimeError(f"No remote DSpark consumer metadata is bound for request {request_id}")
         if not req_meta.remote_host or not req_meta.remote_port:
             raise RuntimeError(f"Remote DSpark request {request_id} has no Decode endpoint")
-        descriptor = chunk.descriptor
         if descriptor.request_id != get_external_request_id(request_id):
-            raise RuntimeError("DSpark context request ID does not match SFA producer metadata")
+            raise RuntimeError("DSpark KV request ID does not match SFA producer metadata")
         if descriptor.generation != req_meta.dspark_context_generation:
-            raise RuntimeError("DSpark context allocation generation does not match Decode rendezvous")
+            raise RuntimeError("DSpark KV allocation generation does not match Decode rendezvous")
         if descriptor.aux_layer_ids != self.dspark_aux_layer_ids:
-            raise RuntimeError("DSpark context boundary schema differs between Prefill config and request")
-        if (
-            tensor.dtype != torch.bfloat16
-            or tensor.ndim != 2
-            or tensor.shape
-            != (
-                chunk.num_tokens,
-                descriptor.feature_width,
-            )
-        ):
-            raise ValueError("Prefill DSpark context source must be a BF16 [tokens, concatenated-width] tensor")
-        if not 0 < chunk.num_tokens <= self.dspark_context_chunk_tokens:
-            raise ValueError("Prefill DSpark context chunk exceeds its registered staging arena")
-        key = (descriptor.request_id, descriptor.generation)
-        expected_offset = self._dspark_next_offsets.get(key, 0)
-        if chunk.token_offset != expected_offset:
-            raise RuntimeError(
-                f"DSpark context has a prefix gap/duplicate for {descriptor.request_id}: "
-                f"expected offset {expected_offset}, got {chunk.token_offset}"
-            )
-        self.dspark_context_staging[: chunk.num_tokens].copy_(tensor)
-        ready = torch.npu.Event()
-        ready.record(torch.npu.current_stream(self.dspark_context_staging.device))
-        self.kv_send_layer_thread.send_dspark_context(
+            raise RuntimeError("DSpark target-boundary schema differs between P and D")
+        expected_groups = {item.group_id for item in self.dspark_draft_kv_metadata.values()}
+        if set(source_blocks_by_group) != expected_groups:
+            raise ValueError("P DSpark source tables must cover every draft cache group")
+        request_blocks = req_meta.local_block_ids
+        for group_id in expected_groups:
+            if group_id >= len(request_blocks):
+                raise RuntimeError(f"P request is missing DSpark draft KV group {group_id}")
+            block_size = self.kv_cache_specs[group_id].block_size
+            required = (descriptor.prompt_tokens + block_size - 1) // block_size
+            if tuple(source_blocks_by_group[group_id]) != tuple(request_blocks[group_id][:required]):
+                raise RuntimeError("P DSpark source blocks differ from scheduler-owned prompt blocks")
+        self.kv_send_layer_thread.send_dspark_draft_kv(
             host=req_meta.remote_host,
             port=req_meta.remote_port,
             remote_engine_id=req_meta.remote_engine_id,
             descriptor=descriptor,
-            token_offset=chunk.token_offset,
-            num_tokens=chunk.num_tokens,
-            peer_ptr=self.dspark_context_staging.data_ptr(),
-            nbytes=chunk.num_tokens * descriptor.feature_width * 2,
-            wait_event=ready,
+            draft_kv_metadata=self._draft_kv_metadata_to_wire(self.dspark_draft_kv_metadata),
+            source_blocks_by_group=source_blocks_by_group,
         )
-        next_offset = chunk.token_offset + chunk.num_tokens
-        if next_offset == descriptor.prompt_tokens:
-            self._dspark_next_offsets.pop(key, None)
-        else:
-            self._dspark_next_offsets[key] = next_offset
+        logger.info(
+            "DSpark P draft KV transferred: req=%s tokens=%d draft_layers=%d draft_groups=%s tp_rank=%d",
+            descriptor.request_id,
+            descriptor.prompt_tokens,
+            len(self.dspark_draft_kv_metadata),
+            tuple(sorted(source_blocks_by_group)),
+            self.tp_rank,
+        )
 
     def get_dspark_context_descriptor(self, request_id: str, prompt_tokens: int) -> DSparkContextDescriptor | None:
         req_meta = self._active_dspark_requests.get(request_id)

@@ -7,16 +7,15 @@ from unittest.mock import MagicMock
 
 import msgspec
 import pytest
-import torch
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h import send_thread as sending
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
-    DSparkContextChunk,
     DSparkContextDescriptor,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_kv import DraftKVCacheMetadata
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
-    DSPARK_CONTEXT_ACK,
-    DSPARK_CONTEXT_CHUNK,
+    DSPARK_DRAFT_KV,
+    DSPARK_DRAFT_KV_ACK,
     MF_META,
     MF_META_ACK,
     READ_DONE,
@@ -189,7 +188,7 @@ def test_old_or_duplicate_reply_cannot_complete_another_peer_read(sender):
     assert thread.storage_send_done_events[0].is_set()
 
 
-def test_context_path_renews_the_same_peer_metadata(sender):
+def test_draft_kv_path_renews_the_same_peer_metadata(sender):
     thread, first, replacement = sender
     _send(thread, _task("decode-a"))
     thread._signal_layer_done(0)
@@ -197,48 +196,49 @@ def test_context_path_renews_the_same_peer_metadata(sender):
     descriptor = DSparkContextDescriptor("request", "generation", 4, (2, 22, 38, 58, 74), 4)
     replacement.recv_multipart.side_effect = [
         [msgspec.msgpack.encode((MF_META_ACK, SFAPD_PROTOCOL_VERSION))],
-        [msgspec.msgpack.encode((DSPARK_CONTEXT_ACK, "request", "generation", 0, b"accepted"))],
+        [msgspec.msgpack.encode((DSPARK_DRAFT_KV_ACK, "request", "generation", b"accepted"))],
     ]
-    task = sending.DSparkContextSendTask(
+    task = sending.DSparkDraftKVSendTask(
         host="127.0.0.1",
         port=1234,
         descriptor=descriptor,
-        token_offset=0,
-        num_tokens=4,
-        peer_ptr=4096,
-        nbytes=160,
-        wait_event=MagicMock(),
-        completed=threading.Event(),
+        draft_kv_metadata={"draft": {"group_id": 0}},
+        source_blocks_by_group={0: (2,)},
         remote_engine_id="decode-b",
     )
-    thread._process_dspark_context_task(task, msgspec.msgpack.Encoder())
-    assert _messages(replacement) == [MF_META, DSPARK_CONTEXT_CHUNK]
-    task.wait_event.synchronize.assert_called_once()
+    thread._process_dspark_draft_kv_task(task, msgspec.msgpack.Encoder(), msgspec.msgpack.Decoder(type=tuple))
+    assert _messages(replacement) == [MF_META, DSPARK_DRAFT_KV]
 
 
-def test_context_worker_passes_process_identity(monkeypatch):
+def test_draft_kv_worker_passes_process_identity():
     worker = SFAPDRD2HProducerWorker.__new__(SFAPDRD2HProducerWorker)
     descriptor = DSparkContextDescriptor("request", "generation", 4, (2, 22, 38, 58, 74), 4)
     worker.pp_rank, worker.pp_size = 1, 2
-    worker.dspark_context_staging = MagicMock()
-    worker.dspark_context_staging.data_ptr.return_value = 4096
+    worker.tp_rank = 0
     worker.kv_send_layer_thread = MagicMock()
     worker.dspark_aux_layer_ids = descriptor.aux_layer_ids
-    worker.dspark_context_chunk_tokens = 64
-    worker._dspark_next_offsets = {}
+    worker.kv_cache_specs = [SimpleNamespace(block_size=16)]
+    worker.dspark_draft_kv_metadata = {
+        "draft": DraftKVCacheMetadata(
+            group_id=0,
+            block_size=16,
+            num_blocks=8,
+            base_addrs=(4096,),
+            block_strides=(32,),
+            block_lens=(32,),
+            block_scales=(1,),
+            shapes=((16, 2),),
+            dtypes=("torch.bfloat16",),
+        )
+    }
     worker._active_dspark_requests = {
         "request": SimpleNamespace(
             remote_host="127.0.0.1",
             remote_port=1234,
             remote_engine_id="decode-b",
             dspark_context_generation="generation",
+            local_block_ids=[[7]],
         )
     }
-    monkeypatch.setattr(torch.npu, "Event", MagicMock())
-    monkeypatch.setattr(torch.npu, "current_stream", MagicMock())
-    worker.send_dspark_context_chunk(
-        "request",
-        DSparkContextChunk(descriptor, 0, 4),
-        SimpleNamespace(dtype=torch.bfloat16, ndim=2, shape=(4, 20)),
-    )
-    assert worker.kv_send_layer_thread.send_dspark_context.call_args.kwargs["remote_engine_id"] == "decode-b"
+    worker.send_dspark_draft_kv("request", descriptor, {0: (7,)})
+    assert worker.kv_send_layer_thread.send_dspark_draft_kv.call_args.kwargs["remote_engine_id"] == "decode-b"

@@ -16,12 +16,11 @@ from vllm.logger import logger
 from vllm.utils.network_utils import make_zmq_path
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
-    MAX_DSPARK_CONTEXT_CHUNK_TOKENS,
     DSparkContextDescriptor,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
-    DSPARK_CONTEXT_ACK,
-    DSPARK_CONTEXT_CHUNK,
+    DSPARK_DRAFT_KV,
+    DSPARK_DRAFT_KV_ACK,
     MF_META,
     MF_META_ACK,
     READ_DONE,
@@ -50,17 +49,15 @@ class ProducerSendState:
 
 
 @dataclass
-class DSparkContextSendTask:
+class DSparkDraftKVSendTask:
     host: str
     port: int
     descriptor: DSparkContextDescriptor
-    token_offset: int
-    num_tokens: int
-    peer_ptr: int
-    nbytes: int
-    wait_event: Any
-    completed: threading.Event
+    draft_kv_metadata: dict[str, dict[str, Any]]
+    source_blocks_by_group: dict[int, tuple[int, ...]]
     remote_engine_id: str | None = None
+    timeout: float = 180.0
+    completed: threading.Event | None = None
     error: BaseException | None = None
 
 
@@ -87,7 +84,7 @@ class MembPullSendingThread(threading.Thread):
         self.last_layer_idx = state.last_layer_idx
         self.ready_event = ready_event
         self.send_queue: queue.Queue[SendTask] = queue.Queue()
-        self.dspark_context_queue: queue.Queue[DSparkContextSendTask] = queue.Queue()
+        self.dspark_draft_kv_queue: queue.Queue[DSparkDraftKVSendTask] = queue.Queue()
         self._persist_ctx = zmq.Context()  # type: ignore[attr-defined]
         self._dealers: dict[str, Any] = {}
         self._stopped = False
@@ -189,13 +186,14 @@ class MembPullSendingThread(threading.Thread):
                 except queue.Empty:
                     pass
                 try:
-                    context_task = self.dspark_context_queue.get_nowait()
+                    draft_kv_task = self.dspark_draft_kv_queue.get_nowait()
                     try:
-                        self._process_dspark_context_task(context_task, encoder)
+                        self._process_dspark_draft_kv_task(draft_kv_task, encoder, decoder)
                     except BaseException as error:
-                        context_task.error = error
+                        draft_kv_task.error = error
                     finally:
-                        context_task.completed.set()
+                        if draft_kv_task.completed is not None:
+                            draft_kv_task.completed.set()
                 except queue.Empty:
                     pass
                 try:
@@ -218,11 +216,12 @@ class MembPullSendingThread(threading.Thread):
                 self._signal_layer_done(layer_idx)
             while True:
                 try:
-                    context_task = self.dspark_context_queue.get_nowait()
+                    draft_kv_task = self.dspark_draft_kv_queue.get_nowait()
                 except queue.Empty:
                     break
-                context_task.error = RuntimeError("MembPull send thread stopped before DSpark context transfer")
-                context_task.completed.set()
+                draft_kv_task.error = RuntimeError("MembPull send thread stopped before DSpark draft-KV transfer")
+                if draft_kv_task.completed is not None:
+                    draft_kv_task.completed.set()
             if self._dealers:
                 try:
                     self._drain_read_replies(decoder)
@@ -240,46 +239,39 @@ class MembPullSendingThread(threading.Thread):
         if self.is_alive():
             logger.warning("MembPull send thread did not stop within %.1f seconds", timeout)
 
-    def send_dspark_context(
+    def send_dspark_draft_kv(
         self,
         *,
         host: str,
         port: int,
         descriptor: DSparkContextDescriptor,
-        token_offset: int,
-        num_tokens: int,
-        peer_ptr: int,
-        nbytes: int,
-        wait_event: Any,
+        draft_kv_metadata: dict[str, dict[str, Any]],
+        source_blocks_by_group: dict[int, tuple[int, ...]],
         remote_engine_id: str | None = None,
         timeout: float = 180.0,
     ) -> None:
-        if not 0 < num_tokens <= MAX_DSPARK_CONTEXT_CHUNK_TOKENS:
-            raise ValueError("DSpark context send exceeds the bounded chunk size")
-        task = DSparkContextSendTask(
+        task = DSparkDraftKVSendTask(
             host=host,
             port=port,
             descriptor=descriptor,
-            token_offset=token_offset,
-            num_tokens=num_tokens,
-            peer_ptr=peer_ptr,
-            nbytes=nbytes,
-            wait_event=wait_event,
-            completed=threading.Event(),
+            draft_kv_metadata=draft_kv_metadata,
+            source_blocks_by_group=source_blocks_by_group,
             remote_engine_id=remote_engine_id,
+            timeout=timeout,
+            completed=threading.Event(),
         )
-        self.dspark_context_queue.put(task)
+        self.dspark_draft_kv_queue.put(task)
         if not task.completed.wait(timeout):
-            raise TimeoutError(f"Timed out sending DSpark prompt context for {descriptor.request_id} at {token_offset}")
+            raise TimeoutError(f"Timed out sending DSpark draft KV for {descriptor.request_id}")
         if task.error is not None:
-            raise RuntimeError("MemFabric DSpark prompt-context transfer failed") from task.error
+            raise RuntimeError("MemFabric DSpark draft-KV transfer failed") from task.error
 
-    def _process_dspark_context_task(
+    def _process_dspark_draft_kv_task(
         self,
-        task: DSparkContextSendTask,
+        task: DSparkDraftKVSendTask,
         encoder: msgspec.msgpack.Encoder,
+        decoder: msgspec.msgpack.Decoder,
     ) -> None:
-        task.wait_event.synchronize()
         path = make_zmq_path("tcp", task.host, task.port)
         dealer = self._ensure_peer_dealer(path, task.remote_engine_id)
         if path not in self._mf_meta_sent_paths:
@@ -287,20 +279,17 @@ class MembPullSendingThread(threading.Thread):
         descriptor = task.descriptor
         payload = encoder.encode(
             (
-                DSPARK_CONTEXT_CHUNK,
+                DSPARK_DRAFT_KV,
                 descriptor.request_id,
                 descriptor.generation,
                 descriptor.prompt_tokens,
                 descriptor.aux_layer_ids,
                 descriptor.hidden_size,
-                task.token_offset,
-                task.num_tokens,
-                task.peer_ptr,
-                task.nbytes,
+                task.draft_kv_metadata,
+                task.source_blocks_by_group,
             )
         )
-        deadline = time.monotonic() + self.timeout
-        decoder = msgspec.msgpack.Decoder(type=tuple)
+        deadline = time.monotonic() + task.timeout
         while time.monotonic() < deadline:
             dealer.send(payload)
             if not dealer.poll(timeout=250):
@@ -319,15 +308,11 @@ class MembPullSendingThread(threading.Thread):
             if len(reply) >= 3 and reply[0] == READ_FAILED:
                 self._complete_peer_read(path, reply[1], str(reply[2]))
                 continue
-            if (
-                len(reply) != 5
-                or reply[0] != DSPARK_CONTEXT_ACK
-                or reply[1] != descriptor.request_id
-                or reply[2] != descriptor.generation
-                or int(reply[3]) != task.token_offset
-            ):
+            if len(reply) != 4 or reply[0] != DSPARK_DRAFT_KV_ACK:
                 continue
-            status = reply[4]
+            if reply[1] != descriptor.request_id or reply[2] != descriptor.generation:
+                continue
+            status = reply[3]
             if status == b"accepted":
                 return
             if status == b"backpressure":
@@ -335,12 +320,10 @@ class MembPullSendingThread(threading.Thread):
                 continue
             if status == b"stale":
                 raise RuntimeError(
-                    f"D discarded stale DSpark context allocation {descriptor.request_id}/{descriptor.generation}"
+                    f"D discarded stale DSpark draft-KV allocation {descriptor.request_id}/{descriptor.generation}"
                 )
-            raise RuntimeError(f"D rejected DSpark context transfer: {status!r}")
-        raise TimeoutError(
-            f"D did not admit DSpark prompt-context chunk for {descriptor.request_id} at {task.token_offset}"
-        )
+            raise RuntimeError(f"D rejected DSpark draft-KV transfer: {status!r}")
+        raise TimeoutError(f"D did not acknowledge DSpark draft KV for {descriptor.request_id}")
 
     def record_p_save_event(self, layer_idx: int) -> None:
         evt = torch.npu.Event()

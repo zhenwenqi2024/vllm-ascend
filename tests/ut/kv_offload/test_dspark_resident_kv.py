@@ -75,11 +75,12 @@ def _prefill_runner(
     runner.pp_handler = SimpleNamespace(configure_aux_hidden_state_relay=Mock())
     runner.use_pp = pp
     runner.is_first_pp_rank = first_rank
+    runner.is_last_pp_rank = not pp or not first_rank
     runner.max_num_tokens = 16
     runner.device = torch.device("cpu")
     runner.use_aux_hidden_state_outputs = False
     runner.intermediate_tensors = object()
-    runner.speculator = None
+    runner.speculator = SimpleNamespace() if speculative is not None and runner.is_last_pp_rank else None
     return runner
 
 
@@ -95,37 +96,57 @@ def test_no_prefill_aux_option_preserves_original_loading():
 
 
 @pytest.mark.parametrize("first_rank,pp", [(True, False), (True, True), (False, True)])
-def test_prefill_aux_capture_uses_native_relay_without_loading_draft(monkeypatch, first_rank, pp):
+def test_prefill_draft_kv_uses_parent_loaded_drafter_and_aux_states(monkeypatch, first_rank, pp):
     from vllm_ascend.worker.v2 import model_runner as module
 
     layers = [2, 22, 38, 58, 74]
-    runner = _prefill_runner(ids=layers, first_rank=first_rank, pp=pp)
+    speculative = SimpleNamespace(
+        method="dspark",
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(eagle_aux_hidden_state_layer_ids=layers)),
+    )
+    runner = _prefill_runner(speculative=speculative, first_rank=first_rank, pp=pp)
     original_buffer = runner.intermediate_tensors
-    calls = []
     monkeypatch.setattr(module, "supports_eagle3", lambda model: True)
-    monkeypatch.setattr(module, "verify_supports_aux_hidden_states_over_pp", lambda *args: calls.append("verify"))
-    monkeypatch.setattr(module, "reserve_aux_intermediate_tensor_slots", lambda model: calls.append("reserve"))
-    runner.model.set_aux_hidden_state_layers.side_effect = lambda ids: calls.append("set")
-    with patch.object(GPUModelRunner, "load_model", side_effect=lambda *args: calls.append("load")):
+
+    def parent_load(*args):
+        runner.use_aux_hidden_state_outputs = True
+
+    with patch.object(GPUModelRunner, "load_model", side_effect=parent_load) as parent:
         runner.load_model()
-    assert calls == ["load", *(["verify"] if pp else []), "set", "reserve"]
+    parent.assert_called_once_with(False)
     assert runner.pd_dspark_aux_layer_ids == tuple(layers)
-    assert runner.use_aux_hidden_state_outputs and runner.speculator is None
-    if pp:
-        runner.pp_handler.configure_aux_hidden_state_relay.assert_called_once_with(runner.model)
-    if first_rank:
-        assert runner.intermediate_tensors is original_buffer
-        runner.model.make_empty_intermediate_tensors.assert_not_called()
-    else:
-        runner.model.make_empty_intermediate_tensors.assert_called_once_with(
-            batch_size=16, dtype=torch.bfloat16, device=torch.device("cpu")
-        )
-        assert runner.intermediate_tensors is runner.model.make_empty_intermediate_tensors.return_value
+    assert runner.use_aux_hidden_state_outputs
+    assert (runner.speculator is not None) is runner.is_last_pp_rank
+    assert runner.intermediate_tensors is original_buffer
+    runner.model.set_aux_hidden_state_layers.assert_not_called()
+    runner.model.make_empty_intermediate_tensors.assert_not_called()
+    runner.pp_handler.configure_aux_hidden_state_relay.assert_not_called()
+
+
+def test_prefill_last_stage_requires_parent_loaded_drafter(monkeypatch):
+    from vllm_ascend.worker.v2 import model_runner as module
+
+    speculative = SimpleNamespace(
+        method="dspark",
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(eagle_aux_hidden_state_layer_ids=[2, 22])),
+    )
+    runner = _prefill_runner(speculative=speculative, first_rank=False, pp=True)
+    runner.speculator = None
+    monkeypatch.setattr(module, "supports_eagle3", lambda model: True)
+    with (
+        patch.object(GPUModelRunner, "load_model"),
+        pytest.raises(ValueError, match="loaded Eagle3 target and drafter"),
+    ):
+        runner.load_model()
 
 
 @pytest.mark.parametrize("ids", [[], [38, 22], [2, 2], [79], [-1], [True], "2,22,38"])
 def test_invalid_prefill_aux_boundaries_fail_before_loading(ids):
-    runner = _prefill_runner(ids=ids)
+    speculative = SimpleNamespace(
+        method="dspark",
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(eagle_aux_hidden_state_layer_ids=ids)),
+    )
+    runner = _prefill_runner(speculative=speculative)
     with patch.object(GPUModelRunner, "load_model") as parent, pytest.raises(ValueError, match="boundaries"):
         runner.load_model()
     parent.assert_not_called()
@@ -133,10 +154,11 @@ def test_invalid_prefill_aux_boundaries_fail_before_loading(ids):
 
 @pytest.mark.parametrize(
     "options",
-    [{"producer": False}, {"consumer": True}, {"speculative": object()}, {"eager": False}, {"cp": 2}, {"prefix": True}],
+    [{"eager": False}, {"cp": 2}, {"prefix": True}],
 )
 def test_prefill_aux_capture_rejects_unsupported_topologies(options):
-    runner = _prefill_runner(ids=[2, 22, 38, 58, 74], **options)
+    speculative = SimpleNamespace(method="dspark")
+    runner = _prefill_runner(speculative=speculative, **options)
     with patch.object(GPUModelRunner, "load_model") as parent, pytest.raises(ValueError):
         runner.load_model()
     parent.assert_not_called()
@@ -169,9 +191,16 @@ def test_prefill_aux_config_delegates_to_backend_before_loading():
 def test_prefill_aux_capture_rejects_target_without_aux_interface(monkeypatch):
     from vllm_ascend.worker.v2 import model_runner as module
 
-    runner = _prefill_runner(ids=[2, 22, 38, 58, 74])
+    speculative = SimpleNamespace(
+        method="dspark",
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(eagle_aux_hidden_state_layer_ids=[2, 22])),
+    )
+    runner = _prefill_runner(speculative=speculative)
     monkeypatch.setattr(module, "supports_eagle3", lambda model: False)
-    with patch.object(GPUModelRunner, "load_model"), pytest.raises(ValueError, match="interface"):
+    with (
+        patch.object(GPUModelRunner, "load_model"),
+        pytest.raises(ValueError, match="loaded Eagle3 target and drafter"),
+    ):
         runner.load_model()
     assert not runner.use_aux_hidden_state_outputs
 
@@ -239,16 +268,14 @@ def test_dspark_cannot_alias_target_kv(module_alias):
         runner._get_resident_draft_layer_names()
 
 
-@pytest.mark.parametrize("method", ["dspark", "mtp"])
-def test_remote_kv_registration_excludes_only_resident_draft(method):
-    runner = _runner(method=method)
-    caches = {"target.attn": object(), "target.indexer": object(), "draft.layers.0.attn": object()}
-    result = runner._get_kv_connector_caches(caches)
-    assert set(result) == (set(caches) - {"draft.layers.0.attn"} if method == "dspark" else set(caches))
-    assert result["target.attn"] is caches["target.attn"]
-    assert "draft.layers.0.attn" in caches
-    if method == "mtp":
-        assert result is caches
+@pytest.mark.parametrize("producer,consumer", [(False, True), (False, False)])
+def test_d_side_and_local_dspark_do_not_enable_p_prefill_generation(producer, consumer):
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import get_pd_dspark_aux_layer_ids
+
+    runner = _prefill_runner(
+        speculative=SimpleNamespace(method="dspark"), producer=producer, consumer=consumer, eager=False
+    )
+    assert get_pd_dspark_aux_layer_ids(runner.vllm_config) == ()
 
 
 def _cache_config(specs, num_blocks=3):

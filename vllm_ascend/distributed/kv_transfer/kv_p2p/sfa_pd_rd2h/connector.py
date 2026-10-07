@@ -25,7 +25,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
-    DSparkContextChunk,
     DSparkContextReceiver,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.scheduler import (
@@ -167,21 +166,30 @@ class SfaRemoteD2HConnector(KVConnectorBase_V1, SupportsHMA):
     def bind_dspark_context_receiver(
         self,
         receiver: DSparkContextReceiver,
-        initialize: Any,
     ) -> None:
         if not self.is_consumer or self.connector_worker is None:
             raise RuntimeError("DSpark prompt-context receiver can only bind on the Decode worker")
-        self.connector_worker.bind_dspark_context_receiver(receiver, initialize)
+        self.connector_worker.bind_dspark_context_receiver(receiver)
+
+    def configure_dspark_draft_layers(self, layer_names: tuple[str, ...]) -> None:
+        if self.connector_worker is None:
+            raise RuntimeError("DSpark draft caches can only be configured on a worker connector")
+        self.connector_worker.configure_dspark_draft_layers(layer_names)
 
     def get_dspark_draft_block_ids(self, request_id: str) -> dict[int, tuple[int, ...]]:
         if not self.is_consumer or self.connector_worker is None:
             raise RuntimeError("Resident DSpark block tables exist only on the Decode worker")
         return self.connector_worker.get_dspark_draft_block_ids(request_id)
 
-    def send_dspark_context_chunk(self, request_id: str, chunk: DSparkContextChunk, tensor: torch.Tensor) -> None:
+    def send_dspark_draft_kv(
+        self,
+        request_id: str,
+        descriptor: Any,
+        source_blocks_by_group: dict[int, tuple[int, ...]],
+    ) -> None:
         if not self.is_producer or self.connector_worker is None:
-            raise RuntimeError("DSpark prompt-context chunks can only be sent by the Prefill worker")
-        self.connector_worker.send_dspark_context_chunk(request_id, chunk, tensor)
+            raise RuntimeError("DSpark draft KV can only be sent by the Prefill worker")
+        self.connector_worker.send_dspark_draft_kv(request_id, descriptor, source_blocks_by_group)
 
     def get_dspark_context_descriptor(self, request_id: str, prompt_tokens: int):
         if not self.is_producer or self.connector_worker is None:

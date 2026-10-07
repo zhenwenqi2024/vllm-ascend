@@ -50,10 +50,6 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
-from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
-    reserve_aux_intermediate_tensor_slots,
-    verify_supports_aux_hidden_states_over_pp,
-)
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
@@ -72,11 +68,11 @@ from vllm_ascend.core.profiling_chunk_predictor import (
     _start_profiling_chunk_timing,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
-    MAX_DSPARK_CONTEXT_CHUNK_TOKENS,
-    DSparkContextChunk,
     DSparkContextReceiver,
     find_dspark_context_connector,
+    find_dspark_kv_connector,
     get_pd_dspark_aux_layer_ids,
+    send_dspark_prefill_kv,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
@@ -87,7 +83,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.models.deepseek_v41.cache_config import uses_a5_packed_cache
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
-from vllm_ascend.spec_decode.dspark_utils import get_dspark_aux_layer_ids
 from vllm_ascend.utils import (
     is_deepseek_v41,
     is_pd_decode_recompute_scheduler_enabled,
@@ -211,6 +206,7 @@ class NPUModelRunner(GPUModelRunner):
         # so here we just call init_speculator to reinitialize speculator.
         self.speculator: AscendEagleSpeculator | None = None
         self.pd_dspark_aux_layer_ids: tuple[int, ...] = ()
+        self._dspark_prefill_progress: dict[str, tuple[str, int]] = {}
         if self.speculative_config is not None and self.is_last_pp_rank:
             self.speculator = init_speculator(self.vllm_config, self.device)
             # Shared update_stream: main model (ModelAclGraphManager) and draft
@@ -272,29 +268,14 @@ class NPUModelRunner(GPUModelRunner):
         super().load_model(load_dummy_weights, *args, **kwargs)
         if not aux_layers:
             return
-        # Sparse offload is enabled on D only. P owns ordinary KV buffers,
-        # including when capturing auxiliary states for a sparse D consumer.
-        if not supports_eagle3(self.model):
-            raise ValueError("DSpark prefill capture requires the target model's auxiliary hidden-state interface.")
-        if self.use_pp:
-            verify_supports_aux_hidden_states_over_pp(self.model, "DSpark prefill capture")
-        self.model.set_aux_hidden_state_layers(aux_layers)
-        # Parent loading had no speculative config, so reserve the receive
-        # slots after setting the capture boundaries and replace its earlier
-        # ordinary PP receive buffer. Reuse the native boundary/relay protocol.
-        reserve_aux_intermediate_tensor_slots(self.model)
-        if self.use_pp:
-            assert self.pp_handler is not None
-            self.pp_handler.configure_aux_hidden_state_relay(self.model)
-        if not self.is_first_pp_rank:
-            self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
-                batch_size=self.max_num_tokens,
-                dtype=self.model_config.dtype,
-                device=self.device,
-            )
-        self.use_aux_hidden_state_outputs = True
+        # P must load the same DSpark speculator as D: it projects the target's
+        # prompt auxiliary states locally and writes draft KV before transfer.
+        if not supports_eagle3(self.model) or (self.is_last_pp_rank and self.speculator is None):
+            raise ValueError("P-side DSpark KV generation requires the loaded Eagle3 target and drafter.")
+        if not self.use_aux_hidden_state_outputs:
+            raise RuntimeError("DSpark target auxiliary states were not enabled by the speculative config")
         self.pd_dspark_aux_layer_ids = aux_layers
-        logger.info("Configured P-only DSpark auxiliary capture at boundaries %s", aux_layers)
+        logger.info("Configured P-side DSpark draft-KV generation at boundaries %s", aux_layers)
 
     def _restore_replicated_draft_target_states(self) -> None:
         """Restore target states consumed by a replicated PCP draft."""
@@ -393,48 +374,43 @@ class NPUModelRunner(GPUModelRunner):
             specs[name] = replace(spec, store_on_host=False)
         return specs
 
-    def _get_kv_connector_caches(self, kv_caches: dict[str, Any]) -> dict[str, Any]:
-        draft_names = self._get_resident_draft_layer_names()
-        if not draft_names:
-            return kv_caches
-        return {name: cache for name, cache in kv_caches.items() if name not in draft_names}
-
-    def _bind_dspark_context_receiver(self) -> None:
-        """Gate remote-prefill readiness on real resident draft-context KV."""
+    def _configure_dspark_kv_transfer(self, kv_cache_config: KVCacheConfig) -> None:
+        """Tell the SFA connector which loader-owned caches are DSpark draft KV."""
         transfer = self.vllm_config.kv_transfer_config
         speculative = getattr(self.vllm_config, "speculative_config", None)
         if (
-            not self.ascend_config.sparse_kv_offload_config.enabled
-            or transfer is None
-            or not transfer.is_kv_consumer
+            transfer is None
             or speculative is None
             or speculative.method != "dspark"
+            or not self.is_last_pp_rank
+            or not (transfer.is_kv_consumer or transfer.is_kv_producer)
         ):
             return
+        if self.speculator is None:
+            raise RuntimeError("DSpark KV transfer requires the loaded draft model on the final PP rank")
+        names = tuple(sorted(self.speculator.draft_attn_layer_names))
+        if not names:
+            raise RuntimeError("The loaded DSpark drafter did not expose its KV cache layer names")
+        kv_cache_config.dspark_draft_layer_names = names
+        connector = find_dspark_kv_connector(get_kv_transfer_group())
+        connector.configure_dspark_draft_layers(names)
+
+    def _bind_dspark_context_receiver(self) -> None:
+        """Gate D-side remote-prefill readiness on both target and draft KV."""
+        transfer = self.vllm_config.kv_transfer_config
+        speculative = getattr(self.vllm_config, "speculative_config", None)
         if (
-            self.speculator is None
-            or not hasattr(self.speculator, "initialize_remote_context")
+            transfer is None
+            or not transfer.is_kv_consumer
+            or not self.ascend_config.sparse_kv_offload_config.enabled
+            or speculative is None
+            or speculative.method != "dspark"
             or not self.is_last_pp_rank
         ):
-            raise RuntimeError("Sparse MLA DSpark context initialization requires the final D PP runner")
-        aux_layer_ids = get_dspark_aux_layer_ids(self.vllm_config)
-        if not aux_layer_ids:
-            raise RuntimeError("The DSpark checkpoint does not define target auxiliary boundaries")
-        feature_width = self.model_config.get_hidden_size() * len(aux_layer_ids)
-        chunk_bytes = MAX_DSPARK_CONTEXT_CHUNK_TOKENS * feature_width * 2
-        receiver = DSparkContextReceiver(
-            max_pending_bytes=chunk_bytes * self.max_num_reqs,
-            max_requests=self.max_num_reqs,
-        )
-        connector = get_kv_transfer_group()
-        if not hasattr(connector, "bind_dspark_context_receiver"):
-            raise RuntimeError("The active KV connector cannot gate DSpark remote-prefill readiness")
-
-        def initialize_remote_context(chunk, aux_features):
-            block_ids = connector.get_dspark_draft_block_ids(chunk.descriptor.request_id)
-            self.speculator.initialize_remote_context(chunk, aux_features, block_ids)
-
-        connector.bind_dspark_context_receiver(receiver, initialize_remote_context)
+            return
+        receiver = DSparkContextReceiver(max_requests=self.max_num_reqs)
+        connector = find_dspark_kv_connector(get_kv_transfer_group())
+        connector.bind_dspark_context_receiver(receiver)
         self._dspark_context_receiver = receiver
 
     def initialize_kv_cache(
@@ -445,8 +421,12 @@ class NPUModelRunner(GPUModelRunner):
         # Match V1's physical buffer plan without mutating the scheduler's
         # logical cache configuration. Allocation must honor zero-stride aliases.
         kv_cache_config = deepcopy(kv_cache_config)
+        self._configure_dspark_kv_transfer(kv_cache_config)
         resident_draft_names = self._get_resident_draft_layer_names()
-        apply_layerwise_kv_cache_plan(kv_cache_config, self.vllm_config, excluded_layer_names=resident_draft_names)
+        # P also needs persistent prompt draft KV until D acknowledges its
+        # transfer. It must never alias target layerwise scratch buffers.
+        persistent_draft_names = resident_draft_names | set(getattr(kv_cache_config, "dspark_draft_layer_names", ()))
+        apply_layerwise_kv_cache_plan(kv_cache_config, self.vllm_config, excluded_layer_names=persistent_draft_names)
         sparse_cfg = self.ascend_config.sparse_kv_offload_config
         if sparse_cfg.enabled:
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
@@ -599,7 +579,7 @@ class NPUModelRunner(GPUModelRunner):
                 if finish_execution is not None:
                     finish_execution(failed=forward_failed)
         if not dummy_run and not is_profile:
-            self._send_pd_dspark_context_chunks(scheduler_output)
+            self._send_pd_dspark_draft_kv(scheduler_output)
         self.model_state.kvpp_is_dummy_run = False
         if dummy_run and lmhead_tp_enable() and not is_profile and self.is_last_pp_rank:
             # lmhead TP: idle ranks never call sample(); join the target head
@@ -622,57 +602,30 @@ class NPUModelRunner(GPUModelRunner):
         )
         return output
 
-    def _send_pd_dspark_context_chunks(self, scheduler_output: SchedulerOutput) -> None:
-        """Forward ordered prompt auxiliary states to D after each real P step."""
+    def _send_pd_dspark_draft_kv(self, scheduler_output: SchedulerOutput) -> None:
+        """Write draft KV on P, then let D pull the exact allocated cache pages."""
         if not getattr(self, "pd_dspark_aux_layer_ids", ()) or not self.is_last_pp_rank:
             return
         connector, metadata = find_dspark_context_connector(
             get_kv_transfer_group(), scheduler_output.kv_connector_metadata
         )
         requests = getattr(metadata, "requests", {})
-        has_remote_dspark = any(getattr(req_meta, "dspark_context_generation", None) for req_meta in requests.values())
-        if not has_remote_dspark:
+        if not any(getattr(req_meta, "dspark_context_generation", None) for req_meta in requests.values()):
             return
         state = self.execute_model_state
         if state is None or state.aux_hidden_states is None:
             if scheduler_output.total_num_scheduled_tokens:
-                raise RuntimeError("P produced no auxiliary hidden states for an active remote DSpark request")
+                raise RuntimeError("P produced no target auxiliary states for an active remote DSpark request")
             return
-        if len(state.aux_hidden_states) != len(self.pd_dspark_aux_layer_ids):
-            raise RuntimeError("P produced a different number of DSpark auxiliary states than the configured schema")
-        features = torch.cat(state.aux_hidden_states, dim=-1)
-        expected_width = self.model_config.get_hidden_size() * len(self.pd_dspark_aux_layer_ids)
-        if features.ndim != 2 or features.shape[1] != expected_width or features.dtype != torch.bfloat16:
-            raise RuntimeError("P DSpark context must be a [tokens, aux_layers * hidden_size] BF16 tensor")
-        batch = state.input_batch
-        if not hasattr(connector, "get_dspark_context_descriptor"):
-            raise RuntimeError("The active P KV connector cannot send DSpark prompt context")
-        for req_idx in range(batch.num_reqs):
-            request_id = batch.req_ids[req_idx]
-            prompt_tokens = int(batch.prefill_len_np[req_idx])
-            offset = int(batch.num_computed_tokens_np[req_idx])
-            scheduled = int(batch.num_scheduled_tokens[req_idx])
-            context_tokens = min(scheduled, max(prompt_tokens - offset, 0))
-            if context_tokens == 0:
-                continue
-            descriptor = connector.get_dspark_context_descriptor(request_id, prompt_tokens)
-            if descriptor is None:
-                continue
-            if descriptor.prompt_tokens != prompt_tokens:
-                raise RuntimeError("P/D DSpark prompt lengths disagree for a remote request")
-            row_begin = int(batch.query_start_loc_np[req_idx])
-            if row_begin + context_tokens > features.shape[0]:
-                raise RuntimeError("P DSpark auxiliary rows do not cover the scheduled prompt chunk")
-            sent = 0
-            while sent < context_tokens:
-                count = min(MAX_DSPARK_CONTEXT_CHUNK_TOKENS, context_tokens - sent)
-                chunk = DSparkContextChunk(descriptor, offset + sent, count)
-                connector.send_dspark_context_chunk(
-                    request_id,
-                    chunk,
-                    features[row_begin + sent : row_begin + sent + count].contiguous(),
-                )
-                sent += count
+        send_dspark_prefill_kv(
+            self.speculator,
+            state.input_batch,
+            state.aux_hidden_states,
+            requests,
+            connector,
+            self._dspark_prefill_progress,
+            getattr(scheduler_output, "finished_req_ids", ()) or (),
+        )
 
     @torch.inference_mode()
     def profile_run(self) -> None:

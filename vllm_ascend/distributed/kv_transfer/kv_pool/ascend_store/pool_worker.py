@@ -235,7 +235,15 @@ class KVPoolWorker:
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
-        self.cacheable_group_ids = infer_cacheable_group_ids(kv_cache_groups)
+        self._dspark_draft_layer_names = set(getattr(kv_cache_config, "dspark_draft_layer_names", ()))
+        # SFA PD owns direct draft-KV transfer. AscendStore keeps only the
+        # target's layerwise pool, retaining original scheduler group IDs.
+        self.cacheable_group_ids = [
+            group_id
+            for group_id in infer_cacheable_group_ids(kv_cache_groups)
+            if kv_cache_groups is None
+            or any(name not in self._dspark_draft_layer_names for name in kv_cache_groups[group_id].layer_names)
+        ]
         cacheable_block_sizes = [self.original_block_size[i] for i in self.cacheable_group_ids]
         if (
             self.use_layerwise
@@ -515,6 +523,12 @@ class KVPoolWorker:
             self.layerwise_key_layer_offset = 0
 
         if self.kv_cache_config is not None:
+            draft_names = getattr(self, "_dspark_draft_layer_names", ())
+            target_specs = {
+                name: spec
+                for name, spec in get_layerwise_kv_cache_specs(self.kv_cache_config).items()
+                if name not in draft_names
+            }
             base_layers = getattr(
                 self.hf_config,
                 "num_hidden_layers",
@@ -524,6 +538,7 @@ class KVPoolWorker:
                 self._extract_physical_layer_index(layer_name)
                 for group_spec in self.kv_cache_config.kv_cache_groups
                 for layer_name in group_spec.layer_names
+                if layer_name not in draft_names
             }
             if physical_layers:
                 self._global_to_local_layer = {
@@ -532,7 +547,7 @@ class KVPoolWorker:
                 if getattr(self, "use_layerwise", False) or self.use_layerwise_transfer:
                     self._recurrent_layers = {
                         self._global_to_local_layer[self._extract_physical_layer_index(name)]
-                        for name, spec in get_layerwise_kv_cache_specs(self.kv_cache_config).items()
+                        for name, spec in target_specs.items()
                         if isinstance(spec, MambaSpec)
                     }
                 effective_num_layers = max(self.num_layers, len(physical_layers))
@@ -545,7 +560,7 @@ class KVPoolWorker:
                     self.num_layers = effective_num_layers
             if self.use_layerwise_transfer:
                 self._layerwise_reuse_layout = build_layerwise_reuse_layout(
-                    get_layerwise_kv_cache_specs(self.kv_cache_config),
+                    target_specs,
                     base_layers,
                     self._extra_config,
                 )
@@ -556,6 +571,8 @@ class KVPoolWorker:
                     continue
                 physical_layers = set()
                 for layer_name in group_spec.layer_names:
+                    if layer_name in draft_names:
+                        continue
                     physical_layer = self._extract_physical_layer_index(layer_name)
                     physical_layers.add(self._global_to_local_layer[physical_layer])
                 phys_to_layer_idx = {
@@ -1012,6 +1029,9 @@ class KVPoolWorker:
             registered_regions[storage_key] = (new_start, end)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        draft_names = getattr(self, "_dspark_draft_layer_names", ())
+        if draft_names:
+            kv_caches = {name: cache for name, cache in kv_caches.items() if name not in draft_names}
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache_tuple = self._as_cache_tuple(first_kv_cache_tuple)
         first_kv_cache = first_kv_cache_tuple[0]
@@ -1077,7 +1097,7 @@ class KVPoolWorker:
 
         if self.kv_cache_config is not None and self.use_hybrid:
             for group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
-                layer_names = group_spec.layer_names
+                layer_names = [name for name in group_spec.layer_names if name not in draft_names]
                 if self.use_kvpp:
                     layer_names = [name for name in layer_names if name in kv_caches]
                 self._infer_cache_group_metadata(group_id, layer_names)

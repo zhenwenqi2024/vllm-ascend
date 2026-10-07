@@ -25,10 +25,12 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         )
 
         transfer = vllm_config.kv_transfer_config
+        speculative = getattr(vllm_config, "speculative_config", None)
         self._requires_full_dspark_prompt = (
             transfer.is_kv_producer
             and not transfer.is_kv_consumer
-            and bool((transfer.kv_connector_extra_config or {}).get("dspark_aux_hidden_state_layer_ids"))
+            and speculative is not None
+            and speculative.method == "dspark"
         )
 
         self._all_support_hma = all(supports_hma(c) for c in self._connectors)
@@ -168,9 +170,9 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
-        # Target-only external KV hits do not contain DSpark auxiliary states.
+        # Target-only external KV hits do not contain persistent DSpark draft KV.
         # Disabling vLLM prefix caching alone does not disable a store child's
-        # lookup. P must compute the full prompt until auxiliary prefix caching
+        # lookup. P must compute the full prompt until draft prefix caching
         # exists; allocation/save fan-out and D's remote KV loading stay intact.
         if getattr(self, "_requires_full_dspark_prompt", False):
             return 0, False

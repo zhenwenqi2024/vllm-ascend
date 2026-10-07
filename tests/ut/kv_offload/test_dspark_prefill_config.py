@@ -17,7 +17,11 @@ def _config(
             is_kv_producer=producer,
             is_kv_consumer=consumer,
         ),
-        speculative_config=speculative,
+        speculative_config=speculative
+        or SimpleNamespace(
+            method="dspark",
+            draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(eagle_aux_hidden_state_layer_ids=ids)),
+        ),
         parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp, decode_context_parallel_size=dcp),
         model_config=SimpleNamespace(enforce_eager=eager, hf_text_config=SimpleNamespace(num_hidden_layers=78)),
         cache_config=SimpleNamespace(enable_prefix_caching=prefix),
@@ -33,16 +37,13 @@ def test_backend_returns_immutable_boundaries_without_mutating_config(ids):
 
 @pytest.mark.parametrize("ids", [[], [38, 22], [2, 2], [79], [-1], [True], [1.0], "2,22,38", {2: 22}, [[2]]])
 def test_backend_rejects_invalid_auxiliary_schema(ids):
-    with pytest.raises(ValueError, match="ordered unique target-layer boundaries"):
+    with pytest.raises(ValueError, match="boundaries"):
         get_pd_dspark_aux_layer_ids(_config(ids))
 
 
 @pytest.mark.parametrize(
     "options,message",
     [
-        ({"producer": False}, "P-only producer"),
-        ({"consumer": True}, "P-only producer"),
-        ({"speculative": object()}, "P-only producer"),
         ({"pcp": 2}, "context parallelism"),
         ({"dcp": 2}, "context parallelism"),
         ({"eager": False}, "eager prefill"),
@@ -52,6 +53,13 @@ def test_backend_rejects_invalid_auxiliary_schema(ids):
 def test_backend_preserves_capture_configuration_constraints(options, message):
     with pytest.raises(ValueError, match=message):
         get_pd_dspark_aux_layer_ids(_config(**options))
+
+
+@pytest.mark.parametrize(
+    "options", [{"producer": False}, {"consumer": True}, {"speculative": SimpleNamespace(method="mtp")}]
+)
+def test_other_roles_and_drafters_do_not_enable_p_dspark_generation(options):
+    assert get_pd_dspark_aux_layer_ids(_config(**options)) == ()
 
 
 @pytest.mark.parametrize("extra", [None, {}, {"dspark_aux_hidden_state_layer_ids": None}])

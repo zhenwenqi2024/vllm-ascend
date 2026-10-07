@@ -37,7 +37,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
     DSparkContextChunk,
-    build_draft_context_slot_mappings,
+    initialize_draft_context_chunk,
 )
 from vllm_ascend.utils import lmhead_tp_enable, lmhead_tp_max_num_logits
 from vllm_ascend.worker.dcp_utils import DCPManager
@@ -146,23 +146,43 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         self.query_cudagraph_manager.update_stream = self.update_stream
 
     @torch.inference_mode()
-    def initialize_remote_context(
+    def get_draft_context_group_layout(self) -> tuple[tuple[int, ...], tuple[int, ...], dict[int, int]]:
+        """Return the loaded draft's actual layer-to-cache-group mapping."""
+        layer_names = self.model.get_draft_kv_cache_layer_names()
+        group_ids = tuple(self.draft_kv_cache_group_ids)
+        if self._layer_group_idx is None:
+            if len(group_ids) != 1:
+                raise ValueError("DSpark requires an explicit cache-group map for multiple draft KV groups")
+            layer_group_ids = (group_ids[0],) * len(layer_names)
+        else:
+            if len(self._layer_group_idx) != len(layer_names):
+                raise ValueError("DSpark cache-group map does not match the loaded draft layers")
+            layer_group_ids = tuple(group_ids[index] for index in self._layer_group_idx)
+        if not group_ids or not layer_group_ids:
+            raise ValueError("DSpark context initialization requires loaded draft attention layers")
+        block_sizes = {
+            group_id: self.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec.block_size for group_id in group_ids
+        }
+        return group_ids, layer_group_ids, block_sizes
+
+    @torch.inference_mode()
+    def initialize_local_context(
         self,
         chunk: DSparkContextChunk,
         aux_hidden_states: torch.Tensor,
         draft_block_ids_by_group: Mapping[int, Sequence[int]],
     ) -> None:
-        """Initialize a PD prompt chunk with the draft's own projection/RoPE/KV.
+        """Write this P worker's draft KV for a chunk of prompt auxiliary states.
 
-        Run outside captured decode steps, on the model worker thread. The
-        receiver may release registered staging immediately after this returns,
-        so explicitly wait for device writes even if a projection/cache op fails.
+        The feature tensor never leaves P. Run between the target prefill and
+        MemFabric read notification, then synchronize before the draft pages
+        may be read or reused.
         """
         if self.attn_architecture != "MLA" or self.use_dcp:
-            raise ValueError("Remote DSpark prompt initialization requires resident MLA without DCP")
+            raise ValueError("P-side DSpark prompt initialization requires MLA without DCP")
         parallel = self.attn_vllm_config.parallel_config
         if parallel.prefill_context_parallel_size != 1 or parallel.decode_context_parallel_size != 1:
-            raise ValueError("Remote DSpark prompt initialization does not support context parallelism")
+            raise ValueError("P-side DSpark prompt initialization does not support context parallelism")
         expected_layers = get_eagle3_aux_layers_from_config(self.speculative_config)
         descriptor = chunk.descriptor
         if (
@@ -171,57 +191,25 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
             or descriptor.hidden_size != self.vllm_config.model_config.get_hidden_size()
             or descriptor.prompt_tokens > self.max_model_len
         ):
-            raise ValueError("Remote DSpark context does not match the loaded target/draft schema")
+            raise ValueError("P-side DSpark context does not match the loaded target/draft schema")
         if aux_hidden_states.dtype != torch.bfloat16 or tuple(aux_hidden_states.shape) != (
             chunk.num_tokens,
             descriptor.feature_width,
         ):
-            raise ValueError("Remote DSpark context must contain ordered BF16 auxiliary features")
-        layer_names = self.model.get_draft_kv_cache_layer_names()
-        if self._layer_group_idx is None:
-            if len(self.draft_kv_cache_group_ids) != 1:
-                raise ValueError("Remote DSpark initialization requires an explicit per-layer cache group map")
-            layer_group_ids = [self.draft_kv_cache_group_ids[0]] * len(layer_names)
-        else:
-            if len(self._layer_group_idx) != len(layer_names):
-                raise ValueError("Remote DSpark cache group map does not match the loaded draft layers")
-            layer_group_ids = [self.draft_kv_cache_group_ids[index] for index in self._layer_group_idx]
-        if not layer_group_ids:
-            raise ValueError("Remote DSpark initialization requires loaded draft attention layers")
-        draft_group_ids = tuple(self.draft_kv_cache_group_ids)
-        if set(draft_group_ids) != set(draft_block_ids_by_group):
-            raise ValueError("Remote DSpark block tables must cover the loaded draft KV groups exactly")
-        block_sizes_by_group = {
-            group_id: self.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec.block_size
-            for group_id in draft_group_ids
-        }
-        positions = torch.arange(
-            chunk.token_offset,
-            chunk.token_offset + chunk.num_tokens,
-            dtype=torch.long,
-            device=self.device,
-        )
-        slots = build_draft_context_slot_mappings(
-            chunk,
-            draft_group_ids=draft_group_ids,
-            draft_block_ids_by_group={
-                group_id: tuple(block_ids) for group_id, block_ids in draft_block_ids_by_group.items()
-            },
-            block_sizes_by_group=block_sizes_by_group,
-            layer_group_ids=tuple(layer_group_ids),
-            device=self.device,
-        )
-        try:
-            with set_current_vllm_config(self.attn_vllm_config):
-                context = self.model.combine_hidden_states(aux_hidden_states.to(device=self.device))
-                self.model.precompute_and_store_context_kv(context, positions, slots)
-        finally:
-            self._wait_for_remote_context_writes()
-
-    def _wait_for_remote_context_writes(self) -> None:
-        complete = torch.npu.Event()
-        complete.record(torch.npu.current_stream(self.device))
-        complete.synchronize()
+            raise ValueError("P-side DSpark context must contain ordered BF16 auxiliary features")
+        group_ids, layer_group_ids, block_sizes_by_group = self.get_draft_context_group_layout()
+        block_ids = {group_id: tuple(draft_block_ids_by_group[group_id]) for group_id in group_ids}
+        with set_current_vllm_config(self.attn_vllm_config):
+            initialize_draft_context_chunk(
+                self.model,
+                chunk,
+                aux_hidden_states.to(device=self.device),
+                draft_group_ids=group_ids,
+                draft_block_ids_by_group=block_ids,
+                block_sizes_by_group=block_sizes_by_group,
+                layer_group_ids=layer_group_ids,
+                device=self.device,
+            )
 
     def set_attn(
         self,

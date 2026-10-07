@@ -15,22 +15,23 @@ from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa
 
 
 @pytest.mark.parametrize(
-    "producer,consumer,aux,full_prompt",
+    "producer,consumer,method,full_prompt",
     [
-        (True, False, [2, 22, 38, 58, 74], True),
-        (True, False, [], False),
+        (True, False, "dspark", True),
+        (True, False, "mtp", False),
         (True, False, None, False),
-        (False, True, [2, 22, 38, 58, 74], False),
-        (True, True, [2, 22, 38, 58, 74], False),
+        (False, True, "dspark", False),
+        (True, True, "dspark", False),
     ],
 )
-def test_dspark_full_prompt_policy_is_producer_only(producer, consumer, aux, full_prompt):
+def test_dspark_full_prompt_policy_is_producer_only(producer, consumer, method, full_prompt):
     config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
             is_kv_producer=producer,
             is_kv_consumer=consumer,
-            kv_connector_extra_config={} if aux is None else {"dspark_aux_hidden_state_layer_ids": aux},
+            kv_connector_extra_config={},
         ),
+        speculative_config=SimpleNamespace(method=method) if method is not None else None,
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
     )
     with patch.object(MultiConnector, "__init__", return_value=None):
