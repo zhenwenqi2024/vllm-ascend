@@ -29,6 +29,7 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_ascend.attention.sfa_contract import COPY_SFA_TAIL_BLOCKS
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
     MAX_DSPARK_CONTEXT_CHUNK_TOKENS,
     DSparkContextChunk,
@@ -557,7 +558,7 @@ class SFAPDRD2HConsumerWorker:
         self._topk_v_bases = [int(tensor.data_ptr()) for tensor in topk_v]
         self._copy_sfa_block_size = int(manager.block_size)
         self._topk_row_tokens = int(topk_k[0].shape[1])
-        self._topk_hot_tokens = self._topk_row_tokens - 2 * self._copy_sfa_block_size
+        self._topk_hot_tokens = self._topk_row_tokens - COPY_SFA_TAIL_BLOCKS * self._copy_sfa_block_size
         if self._topk_hot_tokens <= 0:
             raise RuntimeError(
                 "fused_copy_sfa topk row is missing circular tail slots: "

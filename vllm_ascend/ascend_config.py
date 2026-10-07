@@ -28,6 +28,12 @@ from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend.attention.sfa_contract import (
+    COPY_SFA_TAIL_TOKENS,
+    LIM_MAX_HOT_TOKENS,
+    LIM_MAX_QUERY_ROWS,
+    LIM_TOPK,
+)
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
 
@@ -1684,12 +1690,6 @@ class SparseKVOffloadConfig:
     Configuration for the Sparse KV cache offloading.
     """
 
-    # Match the LIM kernel contract, independent of the draft checkpoint.
-    FUSED_COPY_SFA_TOPK: ClassVar[int] = 2048
-    FUSED_COPY_SFA_MAX_QUERY_ROWS: ClassVar[int] = 14
-    FUSED_COPY_SFA_MAX_HOT_TOKENS: ClassVar[int] = 32640
-    FUSED_COPY_SFA_HOT_ALIGNMENT: ClassVar[int] = 256
-
     enabled: bool = False
     topk_buffer_size: int = 4096
     dram_size_per_dp_GB: int = 128
@@ -1765,22 +1765,20 @@ class SparseKVOffloadConfig:
         if self.use_fused_copy_sfa:
             # Draft compatibility is checked against the loaded model/cache
             # interfaces, not an architecture or checkpoint-shape whitelist.
-            max_width = self.FUSED_COPY_SFA_MAX_QUERY_ROWS
-            max_hot_tokens = self.FUSED_COPY_SFA_MAX_HOT_TOKENS
+            max_width = LIM_MAX_QUERY_ROWS
+            max_hot_tokens = LIM_MAX_HOT_TOKENS
             width = 1 + (speculative.num_speculative_tokens if speculative else 0)
-            if self.topk != self.FUSED_COPY_SFA_TOPK or not 1 <= width <= max_width:
-                raise ValueError(
-                    f"fused_copy_sfa requires TopK={self.FUSED_COPY_SFA_TOPK} and 1–{max_width} query rows per request"
-                )
+            if self.topk != LIM_TOPK or not 1 <= width <= max_width:
+                raise ValueError(f"fused_copy_sfa requires TopK={LIM_TOPK} and 1–{max_width} query rows per request")
             if (
                 not width * self.topk <= self.topk_buffer_size <= max_hot_tokens
-                or self.topk_buffer_size % self.FUSED_COPY_SFA_HOT_ALIGNMENT
+                or self.topk_buffer_size % COPY_SFA_TAIL_TOKENS
             ):
                 raise ValueError(
-                    f"fused_copy_sfa hot budget must be {self.FUSED_COPY_SFA_HOT_ALIGNMENT}-aligned "
-                    f"in [Q_max*{self.FUSED_COPY_SFA_TOPK}, {max_hot_tokens}]: "
+                    f"fused_copy_sfa hot budget must be {COPY_SFA_TAIL_TOKENS}-aligned "
+                    f"in [Q_max*{LIM_TOPK}, {max_hot_tokens}]: "
                     "the dense short-sequence layout only lines up with the circular "
-                    "tail slots when topk_buffer_size is a multiple of 256"
+                    f"tail slots when topk_buffer_size is a multiple of {COPY_SFA_TAIL_TOKENS}"
                 )
         if self.topk_buffer_size < self.topk:
             raise ValueError(

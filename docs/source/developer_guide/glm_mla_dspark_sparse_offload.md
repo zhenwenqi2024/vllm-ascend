@@ -28,6 +28,11 @@ generic GQA DSpark checkpoints or offload the draft's context KV to the host.
   draft architecture. The eight-token draft requires nine verification rows;
   the tested hot budget is 20480. Accepting a configuration within the kernel
   limits does not establish end-to-end NPU coverage for every draft or width.
+  These bounds are shared through `vllm_ascend/attention/sfa_contract.py`;
+  source-checkout tests compare the LIM values with both kernel headers.
+  The stronger 256-token alignment comes from the serving layout's two
+  128-token circular-tail blocks, not from LIM's 128-token alignment rule.
+  Configuration, tail allocation and addressing share this layout definition.
 - Remote draft-context initialization does not support PCP or DCP. Target
   host KV and resident draft KV must use a common block size.
 

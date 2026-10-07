@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
+from vllm_ascend.attention.sfa_contract import COPY_SFA_TAIL_BLOCKS
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import copy_sfa_pool_capacity
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
@@ -134,7 +135,7 @@ def allocate_kv_offload_topk_buffer_pair(
             max_num_topk_rows = max(max_num_topk_rows, request_rows)
         else:
             max_num_topk_rows = request_rows
-        topk_buffer_size += 2 * vllm_config.cache_config.block_size
+        topk_buffer_size += COPY_SFA_TAIL_BLOCKS * vllm_config.cache_config.block_size
     topk_buffer_k_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * k_dim * torch.bfloat16.itemsize
     topk_buffer_v_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * v_dim * torch.bfloat16.itemsize
     # NOTE make sure to allocate k+v together and split them after allocate.
