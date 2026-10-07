@@ -2651,3 +2651,55 @@ def test_o_proj_capacity_covers_profile_and_decode(tp_size, decode_capacity, sch
 
     assert a2a.call_count == rs.call_count == 3
     get_capacity.assert_called_once()
+
+
+@pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize("num_tokens", [0, 1, 3, 6])
+def test_a5_fp8_o_proj_keeps_otp_collectives(tp_size, num_tokens):
+    impl = _make_impl()
+    impl.n_local_groups = tp_size
+    impl.support_fp8_attention = True
+    impl.wo_a = SimpleNamespace(
+        weight=torch.ones(1, 2, 2),
+        weight_scale=torch.zeros(1, 1, 2, dtype=torch.uint8),
+    )
+    impl.wo_b = lambda x: x
+    x = torch.arange(num_tokens * tp_size * 2, dtype=torch.float32).reshape(num_tokens, tp_size, 2)
+    output = torch.empty(num_tokens, 2)
+    capacity = 6
+    impl.vllm_config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_batched_tokens=capacity))
+    group = SimpleNamespace(world_size=tp_size, device_group=object())
+
+    def exchange(recv, send, *, group):
+        recv.copy_(send)
+
+    def quantize(x, **kwargs):
+        return x, torch.zeros((1,), dtype=torch.uint8)
+
+    def matmul(x, weight, **kwargs):
+        assert x.shape == (tp_size * capacity, 1, 2)
+        assert weight.shape == (1, 2, 2)
+        return torch.bmm(x.transpose(0, 1), weight).transpose(0, 1)
+
+    def reduce_scatter(out, partial, *, group):
+        out.copy_(partial.reshape(tp_size, capacity, 2).sum(0))
+
+    with (
+        patch("vllm_ascend.attention.dsa_v1.oproj_tp_enable", return_value=True),
+        patch("vllm_ascend.attention.dsa_v1.get_otp_group", return_value=group),
+        patch("vllm_ascend.attention.dsa_v1.get_potential_max_tokens", return_value=4),
+        patch("vllm_ascend.attention.dsa_v1.dist.all_to_all_single", side_effect=exchange) as a2a,
+        patch("vllm_ascend.attention.dsa_v1.dist.reduce_scatter_tensor", side_effect=reduce_scatter) as rs,
+        patch("vllm_ascend.attention.dsa_v1.torch_npu.npu_dynamic_mx_quant", side_effect=quantize),
+        patch("vllm_ascend.attention.dsa_v1.torch_npu.npu_transpose_quant_batchmatmul", side_effect=matmul) as mm,
+        patch("vllm_ascend.attention.dsa_v1.torch_npu.npu_transpose_batchmatmul") as bf16_mm,
+    ):
+        impl._forward_o_proj(x, output)
+        send_buf = impl._oproj_send_buf
+        impl._forward_o_proj(x, output)
+        assert impl._oproj_send_buf is send_buf
+
+    assert a2a.call_count == rs.call_count == mm.call_count == 2
+    bf16_mm.assert_not_called()
+    expected = x.sum((1, 2)).unsqueeze(1).expand(-1, 2)
+    torch.testing.assert_close(output, expected)

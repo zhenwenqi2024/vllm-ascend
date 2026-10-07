@@ -625,12 +625,15 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
         layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1)
 
         if layer.prefix.endswith("wo_a"):
+            # The layer may use OTP instead of the model's ordinary TP group.
+            # Derive the group count from the loaded output shard.
+            n_local_groups = layer.weight.shape[1] // self.o_lora_rank
             layer.weight.data = (
-                layer.weight.data.T.reshape(self.n_local_groups, self.o_lora_rank, -1).transpose(1, 2).contiguous()
+                layer.weight.data.T.reshape(n_local_groups, self.o_lora_rank, -1).transpose(1, 2).contiguous()
             )
             layer.weight_scale.data = (
                 layer.weight_scale.data.transpose(0, 1)
-                .reshape(self.n_local_groups, self.o_lora_rank, -1, 2)
+                .reshape(n_local_groups, self.o_lora_rank, -1, 2)
                 .transpose(1, 2)
                 .contiguous()
             )
