@@ -3183,6 +3183,16 @@ class MooncakeConnectorWorker:
                                     p_port_remote_list.append(p_port)
                             local_remote_block_port_mappings[d_port].append(p_port_remote_list)
 
+            # Each PP stage owns different layers of the same context shard.
+            # Preserve the shard axis and add a source for every layer stage.
+            pp_stride = prefill_tp_size * meta.remote_pcp_size
+            for d_port, mappings in local_remote_block_port_mappings.items():
+                local_remote_block_port_mappings[d_port] = [
+                    [port + pp_rank * pp_stride for port in mapping]
+                    for pp_rank in range(self._prefill_pp_size)
+                    for mapping in mappings
+                ]
+
             logger.info(
                 "p_node_cp_group_meta is:: %s. d_node_cp_group_meta is:: %s. "
                 "local_remote_block_port_mappings is:: %s. ",
@@ -3453,7 +3463,7 @@ class MooncakeConnectorWorker:
                 f"tp_num_need_pulls: {tp_num_need_pulls}, remote_handshake_port_list: {remote_handshake_port_list}"
             )
         else:
-            assert tp_num_need_pulls == len(remote_handshake_port_list[0]), (
+            assert tp_num_need_pulls * self._prefill_pp_size == len(remote_handshake_port_list[0]), (
                 f"tp_num_need_pulls: {tp_num_need_pulls}, remote_handshake_port_list: {remote_handshake_port_list}"
             )
 
@@ -3474,19 +3484,22 @@ class MooncakeConnectorWorker:
         for shard_idx, ports in enumerate(remote_handshake_port_list):
             is_final = shard_idx == num_shards - 1
             shard_pulls = []
+            pp_port_counts: dict[int, int] = {}
             for port_idx, port in enumerate(ports):
                 pulls = []
                 port_tp = (port - remote_base_port) % prefill_tp_size
                 pp_rank = (port - remote_base_port) // (prefill_tp_size * remote_pcp_size)
+                pp_port_idx = pp_port_counts.get(pp_rank, 0)
+                pp_port_counts[pp_rank] = pp_port_idx + 1
                 # Attention uses the leading ports selected for each DCP shard.
-                if port_idx < attn_num:
+                if pp_port_idx < attn_num:
                     pulls += [
                         GroupPull(
                             group_id=g,
-                            remote_tp_offset=port_idx,
+                            remote_tp_offset=pp_port_idx,
                             num_group_pulls=attn_num,
                             prefill_pp_rank=pp_rank,
-                            is_group_transfer_end=port_idx == attn_num - 1,
+                            is_group_transfer_end=pp_port_idx == attn_num - 1,
                         )
                         for g in attn_gids
                     ]
@@ -3858,9 +3871,15 @@ class MooncakeConnectorWorker:
             ) = self._get_kv_split_metadata(remote_req_id, meta)
             has_replicate_k_blocks = any(local_block_ids_replicate_k) and any(remote_block_ids_replicate_k)
             remote_transfer_ports = [port for remote_ports in remote_handshake_port_list for port in remote_ports]
-            replicate_k_transfer_port = (
-                remote_transfer_ports[0] if has_replicate_k_blocks and remote_transfer_ports else None
-            )
+            # Replication is within a PP stage, not across layer partitions.
+            # Select one existing transfer port for each stage's indexer KV.
+            replicate_k_ports_by_pp: dict[int, int] = {}
+            if has_replicate_k_blocks:
+                pp_stride = prefill_tp_size * meta.remote_pcp_size
+                for port in remote_transfer_ports:
+                    pp_rank = (port - meta.remote_port) // pp_stride
+                    replicate_k_ports_by_pp.setdefault(pp_rank, port)
+            replicate_k_transfer_ports = set(replicate_k_ports_by_pp.values())
             group_pulls_list = self._get_group_pulls_metadata(
                 remote_req_id,
                 remote_handshake_port_list,
@@ -3884,17 +3903,13 @@ class MooncakeConnectorWorker:
                         self.remote_port_send_num[meta.remote_engine_id] if meta.remote_dcp_size > 1 else None
                     )
                     local_block_ids_replicate_k_for_port = (
-                        local_block_ids_replicate_k
-                        if replicate_k_transfer_port is not None and remote_handshake_port == replicate_k_transfer_port
-                        else None
+                        local_block_ids_replicate_k if remote_handshake_port in replicate_k_transfer_ports else None
                     )
                     remote_block_ids_replicate_k_for_port = (
-                        remote_block_ids_replicate_k
-                        if replicate_k_transfer_port is not None and remote_handshake_port == replicate_k_transfer_port
-                        else None
+                        remote_block_ids_replicate_k if remote_handshake_port in replicate_k_transfer_ports else None
                     )
                     group_pulls = group_pulls_list[shard_idx][remote_tp_offset]
-                    if has_replicate_k_blocks and remote_handshake_port != replicate_k_transfer_port:
+                    if has_replicate_k_blocks and remote_handshake_port not in replicate_k_transfer_ports:
                         # The indexer is replicated, not an attention DCP shard.
                         # Other ports must not overwrite its full-cache transfer.
                         group_pulls = [
