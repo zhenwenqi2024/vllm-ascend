@@ -868,7 +868,12 @@ class _RecordingDSAMetadataBuilder(AscendDSAMetadataBuilder):
 
 
 class _RecordingDSACPMetadataBuilder(AscendDSACPMetadataBuilder):
-    __init__ = _RecordingDSAMetadataBuilder.__init__
+    def __init__(self, calls: list[dict[str, Any]], compressor_ratio: int):
+        self.calls = calls
+        self.for_cudagraph_capture = False
+        self.tq_group_block_sizes = None
+        self.compressor_ratio = compressor_ratio
+
     build = _RecordingDSAMetadataBuilder.build
 
     def build_for_cudagraph_capture(self, common_attn_metadata, **kwargs):
