@@ -2691,7 +2691,9 @@ def test_a5_fp8_o_proj_keeps_otp_collectives(tp_size, num_tokens):
         patch("vllm_ascend.attention.dsa_v1.dist.all_to_all_single", side_effect=exchange) as a2a,
         patch("vllm_ascend.attention.dsa_v1.dist.reduce_scatter_tensor", side_effect=reduce_scatter) as rs,
         patch("vllm_ascend.attention.dsa_v1.torch_npu.npu_dynamic_mx_quant", side_effect=quantize),
-        patch("vllm_ascend.attention.dsa_v1.torch_npu.npu_transpose_quant_batchmatmul", side_effect=matmul) as mm,
+        patch(
+            "vllm_ascend.attention.dsa_v1.torch_npu.npu_transpose_quant_batchmatmul", side_effect=matmul, create=True
+        ) as mm,
         patch("vllm_ascend.attention.dsa_v1.torch_npu.npu_transpose_batchmatmul") as bf16_mm,
     ):
         impl._forward_o_proj(x, output)
