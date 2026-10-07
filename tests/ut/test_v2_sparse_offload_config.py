@@ -66,7 +66,7 @@ def make_dspark_config():
 
 
 @pytest.mark.parametrize("hot_tokens", [18432, 18688, 32512])
-def test_v2_glm_mla_dspark_accepts_verified_nine_row_budget(hot_tokens):
+def test_v2_glm_mla_dspark_accepts_nine_row_kernel_budget(hot_tokens):
     config = SparseKVOffloadConfig.from_additional_config(
         make_dspark_config(),
         {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": hot_tokens},
@@ -83,22 +83,75 @@ def test_dspark_rejects_undersized_unaligned_or_kernel_overflow_budget(hot_token
         )
 
 
-@pytest.mark.parametrize("field,value", [("block_size", 7), ("sample_from_anchor", False), ("kv_lora_rank", None)])
-def test_dspark_rejects_unverified_or_gqa_checkpoint(field, value):
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("architectures", ["OtherMLADraft"]),
+        ("block_size", 7),
+        ("sample_from_anchor", False),
+        ("kv_lora_rank", 256),
+        ("qk_rope_head_dim", 32),
+    ],
+)
+def test_fused_config_does_not_whitelist_draft_checkpoint_metadata(field, value):
+    # Model/cache compatibility belongs to the loader/runner, not fused SFA config.
     config = make_dspark_config()
     setattr(config.speculative_config.draft_model_config.hf_config, field, value)
-    with pytest.raises(ValueError, match="outside V2 GLM MLA"):
+    offload = SparseKVOffloadConfig.from_additional_config(
+        config, {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": 18432}
+    )
+    assert offload.use_fused_copy_sfa
+
+
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7, 8, 9, 13])
+def test_dspark_fused_budget_uses_configured_draft_width(draft_tokens):
+    config = make_dspark_config()
+    config.speculative_config.num_speculative_tokens = draft_tokens
+    # No HF config is needed here; upstream/model validation owns block semantics.
+    del config.speculative_config.draft_model_config
+    offload = SparseKVOffloadConfig.from_additional_config(
+        config,
+        {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": (draft_tokens + 1) * 2048},
+    )
+    assert offload.use_fused_copy_sfa
+
+
+@pytest.mark.parametrize("v2", [False, True])
+@pytest.mark.parametrize("draft_tokens", [6, 7, 8, 13])
+def test_mtp_fused_config_uses_same_kernel_limits(v2, draft_tokens):
+    offload = SparseKVOffloadConfig.from_additional_config(
+        make_config(v2, draft_tokens),
+        {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": 32512},
+    )
+    assert offload.use_fused_copy_sfa
+
+
+@pytest.mark.parametrize("method", ["dspark", "mtp"])
+@pytest.mark.parametrize("draft_tokens", [-1, 14])
+def test_fused_config_rejects_query_width_outside_kernel_contract(method, draft_tokens):
+    config = make_dspark_config()
+    config.speculative_config.method = method
+    config.speculative_config.num_speculative_tokens = draft_tokens
+    with pytest.raises(ValueError, match="query rows"):
         SparseKVOffloadConfig.from_additional_config(
-            config, {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": 18432}
+            config, {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": 32512}
         )
 
 
-@pytest.mark.parametrize("v2,draft_tokens", [(False, 8), (True, 7), (True, 9)])
-def test_dspark_rejects_unverified_runner_or_width(v2, draft_tokens):
+def test_dspark_rejects_hot_budget_below_configured_width():
     config = make_dspark_config()
-    config.use_v2_model_runner = v2
-    config.speculative_config.num_speculative_tokens = draft_tokens
-    with pytest.raises(ValueError, match="outside V2 GLM MLA"):
+    config.speculative_config.num_speculative_tokens = 13
+    with pytest.raises(ValueError, match="hot budget"):
         SparseKVOffloadConfig.from_additional_config(
-            config, {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": 18432}
+            config, {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": 26624}
+        )
+
+
+@pytest.mark.parametrize("fused_op_type", ["none", "fused_copy_sfa"])
+def test_remote_dspark_requires_v2_context_initialization(fused_op_type):
+    config = make_dspark_config()
+    config.use_v2_model_runner = False
+    with pytest.raises(ValueError, match="V2 remote prompt-context initialization"):
+        SparseKVOffloadConfig.from_additional_config(
+            config, {"enabled": True, "fused_op_type": fused_op_type, "topk_buffer_size": 18432}
         )

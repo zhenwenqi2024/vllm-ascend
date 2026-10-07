@@ -9,6 +9,10 @@ generic GQA DSpark checkpoints or offload the draft's context KV to the host.
 - Use the V2 model runner. The validated draft configuration is
   `num_speculative_tokens=8`, checkpoint `block_size=8`,
   `sample_from_anchor=true`, `kv_lora_rank=512` and `qk_rope_head_dim=64`.
+  These values describe the tested checkpoint, not a fused-SFA configuration
+  whitelist. Draft block/sampling semantics belong to speculative/model
+  validation; loaded cache/backend and auxiliary-schema checks determine remote
+  context compatibility. V1 lacks this remote draft-context initialization path.
 - The Prefill producer is target-only, eager, without speculative decoding or
   prefix caching. Set `dspark_aux_hidden_state_layer_ids` in its
   `kv_connector_extra_config` to the ordered target-layer boundaries declared
@@ -17,8 +21,13 @@ generic GQA DSpark checkpoints or offload the draft's context KV to the host.
   P and D must agree on the auxiliary schema. Transfer uses the MemFabric
   SFA remote-D2H path; the final P pipeline stage owns the staging buffer.
 - Sparse offload is enabled on the Decode consumer, using `fused_copy_sfa`.
-  The eight-token draft requires nine target verification rows and a hot
-  budget validated by `SparseKVOffloadConfig`; the tested budget is 20480.
+  LIM requires TopK=2048 and supports 1 through 14 target query rows per request.
+  For `N` speculative tokens, reserve at least `(N + 1) * 2048` hot tokens;
+  the budget must be 256-aligned and no greater than the kernel limit of 32640
+  (the largest aligned budget is 32512). This contract is independent of the
+  draft architecture. The eight-token draft requires nine verification rows;
+  the tested hot budget is 20480. Accepting a configuration within the kernel
+  limits does not establish end-to-end NPU coverage for every draft or width.
 - Remote draft-context initialization does not support PCP or DCP. Target
   host KV and resident draft KV must use a common block size.
 

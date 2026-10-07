@@ -969,7 +969,7 @@ class TestSparseKVOffloadConfig(TestBase):
         )
         self.assertTrue(fused_mtp2.use_fused_copy_sfa)
 
-    def test_fused_copy_sfa_rejects_dspark(self):
+    def test_remote_dspark_requires_v2_but_does_not_restrict_mtp(self):
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=2048)),
             parallel_config=SimpleNamespace(
@@ -981,15 +981,23 @@ class TestSparseKVOffloadConfig(TestBase):
             use_v2_model_runner=False,
             speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=3),
         )
-        with self.assertRaisesRegex(ValueError, "fused_copy_sfa does not support DSpark"):
+        with self.assertRaisesRegex(ValueError, "V2 remote prompt-context initialization"):
             SparseKVOffloadConfig.from_additional_config(
                 vllm_config,
                 {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": 8192},
             )
 
-        # The restriction is specific to fused Copy-SFA; baseline offload is unchanged.
+        with self.assertRaisesRegex(ValueError, "V2 remote prompt-context initialization"):
+            SparseKVOffloadConfig.from_additional_config(vllm_config, {"enabled": True})
+        vllm_config.use_v2_model_runner = True
+        fused = SparseKVOffloadConfig.from_additional_config(
+            vllm_config,
+            {"enabled": True, "fused_op_type": "fused_copy_sfa", "topk_buffer_size": 8192},
+        )
+        self.assertTrue(fused.use_fused_copy_sfa)
         config = SparseKVOffloadConfig.from_additional_config(vllm_config, {"enabled": True})
         self.assertFalse(config.use_fused_copy_sfa)
+        vllm_config.use_v2_model_runner = False
         vllm_config.speculative_config.method = "mtp"
         config = SparseKVOffloadConfig.from_additional_config(
             vllm_config,
