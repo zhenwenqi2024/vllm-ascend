@@ -1553,6 +1553,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
     enable_pcp_o_proj_weight_sharding = False
 
+    _oproj_send_buf: torch.Tensor
     turboquant: TurboQuantLatent | None = None
 
     def __init__(
