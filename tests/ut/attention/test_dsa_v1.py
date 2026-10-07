@@ -1825,6 +1825,52 @@ def test_forward_attention_sets_compressed_kv_args(
         assert "cmp_sparse_indices" not in sparse_kwargs
 
 
+@pytest.mark.parametrize("use_fp8", [False, True])
+def test_a5_o_proj_without_otp_preserves_group_order(use_fp8):
+    impl = _make_impl()
+    impl.n_local_groups = 2
+    impl.support_fp8_attention = True
+    impl.wo_a = SimpleNamespace(
+        weight=torch.tensor([[[1.0, 0.0], [0.0, 1.0]], [[2.0, 0.0], [0.0, 3.0]]]),
+        weight_scale=torch.zeros(1, dtype=torch.uint8) if use_fp8 else None,
+    )
+    impl.wo_b = lambda x: x
+    o_proj_input = torch.arange(12, dtype=torch.float32).view(3, 2, 2)
+    output = torch.empty(3, 4)
+    expected = torch.cat((o_proj_input[:, 0], o_proj_input[:, 1] * torch.tensor([2.0, 3.0])), dim=1)
+
+    def grouped_projection(x, weight, **_kwargs):
+        return torch.bmm(x.transpose(0, 1), weight).transpose(0, 1)
+
+    with (
+        patch("vllm_ascend.attention.dsa_v1.oproj_tp_enable", return_value=False),
+        patch("vllm_ascend.attention.dsa_v1.get_otp_group") as otp_group,
+        patch("vllm_ascend.attention.dsa_v1.dist.all_to_all_single") as all_to_all,
+        patch("vllm_ascend.attention.dsa_v1.dist.reduce_scatter_tensor") as reduce_scatter,
+        patch(
+            "vllm_ascend.attention.dsa_v1.torch_npu.npu_dynamic_mx_quant",
+            side_effect=lambda x, **_kwargs: (x, torch.zeros(1, dtype=torch.uint8)),
+        ) as quant,
+        patch(
+            "vllm_ascend.attention.dsa_v1.torch_npu.npu_transpose_quant_batchmatmul",
+            side_effect=grouped_projection,
+            create=True,
+        ) as fp8_batched,
+        patch(
+            "vllm_ascend.attention.dsa_v1.torch_npu.npu_transpose_batchmatmul",
+            side_effect=grouped_projection,
+        ) as bf16_batched,
+    ):
+        impl._forward_o_proj(o_proj_input, output)
+
+    torch.testing.assert_close(output, expected)
+    assert quant.call_count == fp8_batched.call_count == int(use_fp8)
+    assert bf16_batched.call_count == int(not use_fp8)
+    otp_group.assert_not_called()
+    all_to_all.assert_not_called()
+    reduce_scatter.assert_not_called()
+
+
 def test_a5_bf16_o_proj_uses_transpose_batchmatmul():
     impl = _make_impl()
     impl.support_fp8_attention = True

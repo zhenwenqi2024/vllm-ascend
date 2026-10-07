@@ -594,11 +594,7 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
     def __init__(self, weight_block_size):
         super().__init__()
         self.block_size = weight_block_size[0]
-        vllm_config = get_current_vllm_config()
-        tp_size = vllm_config.parallel_config.tensor_parallel_size
-        hf_config = vllm_config.model_config.hf_config
-        self.n_groups = hf_config.o_groups
-        self.n_local_groups = self.n_groups // tp_size
+        hf_config = get_current_vllm_config().model_config.hf_config
         self.o_lora_rank = hf_config.o_lora_rank
 
     def get_pergroup_param(
