@@ -51,7 +51,6 @@ from vllm.v1.worker.gpu.model_runner import (
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
-    get_eagle3_aux_layers_from_config,
     reserve_aux_intermediate_tensor_slots,
     verify_supports_aux_hidden_states_over_pp,
 )
@@ -77,6 +76,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context impor
     DSparkContextChunk,
     DSparkContextReceiver,
     find_dspark_context_connector,
+    get_pd_dspark_aux_layer_ids,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
@@ -87,6 +87,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.models.deepseek_v41.cache_config import uses_a5_packed_cache
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
+from vllm_ascend.spec_decode.dspark_utils import get_dspark_aux_layer_ids
 from vllm_ascend.utils import (
     is_deepseek_v41,
     is_pd_decode_recompute_scheduler_enabled,
@@ -266,36 +267,8 @@ class NPUModelRunner(GPUModelRunner):
     def pcp_manager_cls(self) -> type[AscendPCPManager]:
         return AscendPCPManager
 
-    def _get_pd_dspark_aux_layer_ids(self) -> tuple[int, ...]:
-        """Opt-in P-only capture without constructing a speculative draft."""
-        transfer = getattr(self.vllm_config, "kv_transfer_config", None)
-        extra = getattr(transfer, "kv_connector_extra_config", None) or {}
-        layer_ids = extra.get("dspark_aux_hidden_state_layer_ids")
-        if layer_ids is None:
-            return ()
-        if transfer.is_kv_consumer or not transfer.is_kv_producer or self.vllm_config.speculative_config is not None:
-            raise ValueError("DSpark auxiliary capture requires a P-only producer without speculative decoding.")
-        parallel = self.vllm_config.parallel_config
-        if parallel.prefill_context_parallel_size * parallel.decode_context_parallel_size != 1:
-            raise ValueError("P-side DSpark auxiliary capture does not support context parallelism.")
-        if not self.model_config.enforce_eager:
-            raise ValueError("P-side DSpark auxiliary capture currently requires eager prefill.")
-        if self.vllm_config.cache_config.enable_prefix_caching:
-            raise ValueError(
-                "P-side DSpark auxiliary capture requires prefix caching disabled until auxiliary caching exists."
-            )
-        num_layers = self.model_config.hf_text_config.num_hidden_layers
-        if (
-            not isinstance(layer_ids, (list, tuple))
-            or not layer_ids
-            or any(type(index) is not int or not 0 <= index <= num_layers for index in layer_ids)
-            or list(layer_ids) != sorted(set(layer_ids))
-        ):
-            raise ValueError("DSpark auxiliary IDs must be ordered unique target-layer boundaries within the model.")
-        return tuple(layer_ids)
-
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
-        aux_layers = self._get_pd_dspark_aux_layer_ids()
+        aux_layers = get_pd_dspark_aux_layer_ids(self.vllm_config)
         super().load_model(load_dummy_weights, *args, **kwargs)
         if not aux_layers:
             return
@@ -444,7 +417,7 @@ class NPUModelRunner(GPUModelRunner):
             or not self.is_last_pp_rank
         ):
             raise RuntimeError("Sparse MLA DSpark context initialization requires the final D PP runner")
-        aux_layer_ids = tuple(get_eagle3_aux_layers_from_config(speculative) or ())
+        aux_layer_ids = get_dspark_aux_layer_ids(self.vllm_config)
         if not aux_layer_ids:
             raise RuntimeError("The DSpark checkpoint does not define target auxiliary boundaries")
         feature_width = self.model_config.get_hidden_size() * len(aux_layer_ids)

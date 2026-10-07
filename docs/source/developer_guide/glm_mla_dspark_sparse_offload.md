@@ -51,6 +51,13 @@ become ready only after target KV transfer and synchronized draft-context
 writes complete on every D TP rank. Generation IDs protect reused request
 IDs; failed transfers do not silently recompute the target prompt.
 
+`spec_decode/dspark_utils.py` resolves auxiliary capture boundaries for both
+P's explicit transfer schema and D's checkpoint, preserving the upstream
+checkpoint layer-to-boundary conversion. The DSpark context backend separately
+validates P-side capture constraints before model loading. The model runner
+consumes the validated boundaries and connects native capture/PP relay to the
+backend; it does not own the transport configuration constraints.
+
 The full MLA draft block is bidirectional. FIA receives actual initialized
 draft lengths, with zero lengths for graph padding, rather than optimistic
 target upper bounds. The current non-DCP MLA path uses a batched synchronous

@@ -13,14 +13,44 @@ from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.spec_decode.dspark_utils import get_dspark_aux_layer_ids
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 MAX_DSPARK_CONTEXT_CHUNK_TOKENS = 64
 BF16_BYTES = 2
+
+
+def get_pd_dspark_aux_layer_ids(vllm_config: VllmConfig) -> tuple[int, ...]:
+    """Resolve and validate opt-in P-side context capture before model loading.
+
+    Keep transport/schema constraints in this backend. Unconfigured runners
+    return immediately without applying DSpark-specific restrictions.
+    """
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    extra = getattr(transfer, "kv_connector_extra_config", None) or {}
+    layer_ids = extra.get("dspark_aux_hidden_state_layer_ids")
+    if layer_ids is None:
+        return ()
+    if transfer.is_kv_consumer or not transfer.is_kv_producer or vllm_config.speculative_config is not None:
+        raise ValueError("DSpark auxiliary capture requires a P-only producer without speculative decoding.")
+    parallel = vllm_config.parallel_config
+    if parallel.prefill_context_parallel_size * parallel.decode_context_parallel_size != 1:
+        raise ValueError("P-side DSpark auxiliary capture does not support context parallelism.")
+    model_config = vllm_config.model_config
+    if not model_config.enforce_eager:
+        raise ValueError("P-side DSpark auxiliary capture currently requires eager prefill.")
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise ValueError(
+            "P-side DSpark auxiliary capture requires prefix caching disabled until auxiliary caching exists."
+        )
+    return get_dspark_aux_layer_ids(vllm_config)
 
 
 def resident_mla_context_group_ids(groups: Sequence[Any]) -> tuple[int, ...]:

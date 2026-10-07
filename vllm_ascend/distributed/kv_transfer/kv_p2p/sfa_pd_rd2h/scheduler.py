@@ -25,7 +25,6 @@ from vllm.logger import logger
 from vllm.utils.math_utils import round_down
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import get_eagle3_aux_layers_from_config
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
     DSparkContextDescriptor,
@@ -43,6 +42,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots i
     copy_sfa_pool_capacity,
     copy_sfa_prefill_dest_geometry,
 )
+from vllm_ascend.spec_decode.dspark_utils import get_dspark_aux_layer_ids
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -370,7 +370,7 @@ class SFAPDRD2HScheduler:
         dspark_context_descriptor = None
         dspark_draft_block_ids_by_group = None
         if getattr(self, "_dspark_context_groups", ()):
-            aux_layer_ids = tuple(get_eagle3_aux_layers_from_config(self.vllm_config.speculative_config))
+            aux_layer_ids = get_dspark_aux_layer_ids(self.vllm_config)
             prompt_tokens = len(getattr(request, "prompt_token_ids", None) or ())
             hidden_size = self.vllm_config.model_config.get_hidden_size()
             if not aux_layer_ids or prompt_tokens <= 0:

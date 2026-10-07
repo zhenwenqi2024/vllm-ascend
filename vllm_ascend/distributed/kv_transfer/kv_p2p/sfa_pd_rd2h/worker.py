@@ -65,6 +65,7 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
     get_transfer_timeout_value,
     validate_register_region_count,
 )
+from vllm_ascend.spec_decode.dspark_utils import get_dspark_aux_layer_ids
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionMetadata
@@ -625,7 +626,11 @@ class SFAPDRD2HProducerWorker:
         # on_kv_cache_written; save_kv_layer skips these at layer end.
         self._pd_dispatched_layers: set[int] = set()
         transfer_extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
-        self.dspark_aux_layer_ids = tuple(transfer_extra.get("dspark_aux_hidden_state_layer_ids", ()))
+        self.dspark_aux_layer_ids = (
+            get_dspark_aux_layer_ids(vllm_config)
+            if transfer_extra.get("dspark_aux_hidden_state_layer_ids") is not None
+            else ()
+        )
         self.dspark_context_chunk_tokens = int(
             transfer_extra.get("dspark_context_chunk_tokens", MAX_DSPARK_CONTEXT_CHUNK_TOKENS)
         )

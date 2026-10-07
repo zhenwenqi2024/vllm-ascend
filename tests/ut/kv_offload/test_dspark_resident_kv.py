@@ -70,6 +70,7 @@ def _prefill_runner(
     runner.model_config = SimpleNamespace(
         hf_text_config=SimpleNamespace(num_hidden_layers=78), enforce_eager=eager, dtype=torch.bfloat16
     )
+    runner.vllm_config.model_config = runner.model_config
     runner.model = SimpleNamespace(set_aux_hidden_state_layers=Mock(), make_empty_intermediate_tensors=Mock())
     runner.pp_handler = SimpleNamespace(configure_aux_hidden_state_relay=Mock())
     runner.use_pp = pp
@@ -143,7 +144,26 @@ def test_prefill_aux_capture_rejects_unsupported_topologies(options):
 
 def test_no_aux_capture_preserves_local_prefix_caching():
     runner = _prefill_runner(prefix=True)
-    assert runner._get_pd_dspark_aux_layer_ids() == ()
+    with patch.object(GPUModelRunner, "load_model") as parent:
+        runner.load_model()
+    parent.assert_called_once_with(False)
+    assert not runner.use_aux_hidden_state_outputs
+
+
+def test_prefill_aux_config_delegates_to_backend_before_loading():
+    from vllm_ascend.worker.v2 import model_runner as module
+
+    runner = _prefill_runner()
+    with (
+        patch.object(
+            module, "get_pd_dspark_aux_layer_ids", side_effect=ValueError("backend rejected config")
+        ) as backend,
+        patch.object(GPUModelRunner, "load_model") as parent,
+        pytest.raises(ValueError, match="backend rejected config"),
+    ):
+        runner.load_model()
+    backend.assert_called_once_with(runner.vllm_config)
+    parent.assert_not_called()
 
 
 def test_prefill_aux_capture_rejects_target_without_aux_interface(monkeypatch):
