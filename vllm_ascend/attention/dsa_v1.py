@@ -1732,9 +1732,16 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             # Pad to a static exchange size so the all_to_all / reduce_scatter
             # shapes are identical across all ACL graph buckets — variable
             # shapes desync the HCCL communicator during graph replay.
-            # potential_max_tokens is computed once in the model runner __init__,
-            # so reading it here is a cheap global lookup.
-            exchange_num_tokens = get_potential_max_tokens()
+            # Profiling can use the scheduler's full token budget even when
+            # the decode capacity is smaller. Freeze the larger capacity when
+            # allocating the buffers, then reuse it for capture and replay.
+            if hasattr(self, "_oproj_send_buf"):
+                exchange_num_tokens = self._oproj_send_buf.shape[1]
+            else:
+                exchange_num_tokens = max(
+                    get_potential_max_tokens(),
+                    self.vllm_config.scheduler_config.max_num_batched_tokens,
+                )
             if exchange_num_tokens < num_tokens:
                 raise ValueError(
                     "oproj static exchange capacity must cover local tokens, "
