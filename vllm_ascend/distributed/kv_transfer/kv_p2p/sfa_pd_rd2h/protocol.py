@@ -10,11 +10,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
+    DSparkContextDescriptor,
+)
+
 BATCH_KV_TRANSFER_PARAMS = "batch_kv_transfer_params"
 MF_META = b"mf_meta"
 READ_READY_BATCH = b"read_ready_batch"
 READ_DONE = b"read_done"
 READ_FAILED = b"read_failed"
+DSPARK_CONTEXT_CHUNK = b"dspark_context_chunk"
+DSPARK_CONTEXT_ACK = b"dspark_context_ack"
 
 # PP-aware MF_META handshake.  A bare ACK is the legacy PP=1 response;
 # producers with PP>1 require the structured acknowledgement below.
@@ -92,6 +98,7 @@ class SfaPDProducerReqMeta:
     # ratio == 1 (equal TP) degenerates to a single contributor.
     tp_ratio: int = 1
     group_member_idx: int = 0
+    dspark_context_generation: str | None = None
 
 
 class SfaPDProducerMetadata(KVConnectorMetadata):
@@ -125,6 +132,7 @@ class SfaPDProducerMetadata(KVConnectorMetadata):
             remote_pcp_size=kv_transfer_params.get("remote_pcp_size"),
             remote_dcp_size=kv_transfer_params.get("remote_dcp_size"),
             do_virtual=kv_transfer_params.get("do_virtual", False),
+            dspark_context_generation=kv_transfer_params.get("dspark_context_generation"),
             chunk_finish=chunk_finish,
             remote_cache_tokens=remote_cache_tokens,
             local_computed_tokens=local_computed_tokens,
@@ -156,6 +164,9 @@ class SfaPDConsumerReqMeta:
     tail_block_index: int = 0
     kv_tokens: int = 0
     dense: bool = False
+    dspark_context_descriptor: DSparkContextDescriptor | None = None
+    dspark_draft_group_ids: tuple[int, ...] = ()
+    dspark_draft_block_ids_by_group: dict[int, tuple[int, ...]] | None = None
 
 
 @dataclass
@@ -183,6 +194,9 @@ class SfaPDConsumerMetadata(KVConnectorMetadata):
         tail_block_index: int = 0,
         kv_tokens: int = 0,
         dense: bool = False,
+        dspark_context_descriptor: DSparkContextDescriptor | None = None,
+        dspark_draft_group_ids: tuple[int, ...] = (),
+        dspark_draft_block_ids_by_group: dict[int, tuple[int, ...]] | None = None,
     ) -> None:
         self.requests.append(
             SfaPDConsumerReqMeta(
@@ -194,6 +208,13 @@ class SfaPDConsumerMetadata(KVConnectorMetadata):
                 tail_block_index=tail_block_index,
                 kv_tokens=kv_tokens,
                 dense=dense,
+                dspark_context_descriptor=dspark_context_descriptor,
+                dspark_draft_group_ids=tuple(dspark_draft_group_ids),
+                dspark_draft_block_ids_by_group=(
+                    {gid: tuple(block_ids) for gid, block_ids in dspark_draft_block_ids_by_group.items()}
+                    if dspark_draft_block_ids_by_group is not None
+                    else None
+                ),
             )
         )
 

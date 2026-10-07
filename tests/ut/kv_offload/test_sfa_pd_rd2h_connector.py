@@ -672,11 +672,13 @@ def test_send_thread_wires_both_cache_group_block_lists():
     thread.last_layer_idx = 0
     thread._p_save_events = {}
     thread._pending_reads_by_layer = {}
+    thread._pending_read_paths_by_layer = {}
     thread._storage_read_errors = {}
     thread.storage_send_done_events = [threading.Event(), threading.Event()]
     for event in thread.storage_send_done_events:
         event.set()
     thread._mf_meta_sent_paths = set()
+    thread._peer_engine_ids = {}
     thread._send_mf_meta = MagicMock()  # type: ignore[method-assign]
     dealer = MagicMock()
     thread._ensure_dealer = MagicMock(return_value=dealer)  # type: ignore[method-assign]
@@ -743,11 +745,13 @@ def test_send_thread_slices_each_group_at_chunk_boundaries():
     thread.last_layer_idx = 1
     thread._p_save_events = {}
     thread._pending_reads_by_layer = {}
+    thread._pending_read_paths_by_layer = {}
     thread._storage_read_errors = {}
     thread.storage_send_done_events = [threading.Event(), threading.Event()]
     for event in thread.storage_send_done_events:
         event.set()
     thread._mf_meta_sent_paths = {"tcp://127.0.0.1:1234"}
+    thread._peer_engine_ids = {}
     dealer = MagicMock()
     thread._ensure_dealer = MagicMock(return_value=dealer)  # type: ignore[method-assign]
     encoder = MagicMock()
@@ -869,6 +873,7 @@ def test_storage_slot_gate_is_shared_across_reuse_ring_boundary():
     thread.storage_send_done_events[0].set()
     thread._storage_read_errors = {}
     thread._pending_reads_by_layer = {}
+    thread._pending_read_paths_by_layer = {}
 
     thread.mark_layer_pending(5)
     storage_event = thread.get_storage_send_event(0)

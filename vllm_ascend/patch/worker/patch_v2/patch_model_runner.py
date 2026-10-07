@@ -191,7 +191,11 @@ def initialize_kv_cache(
     if is_profiling:
         self.kv_connector = upstream.NO_OP_KV_CONNECTOR
     else:
-        self.kv_connector = upstream.get_kv_connector(self.vllm_config, kv_caches_dict)
+        connector_caches = kv_caches_dict
+        get_connector_caches = getattr(self, "_get_kv_connector_caches", None)
+        if get_connector_caches is not None:
+            connector_caches = get_connector_caches(kv_caches_dict)
+        self.kv_connector = upstream.get_kv_connector(self.vllm_config, connector_caches)
 
 
 upstream.copy_kv_cache_blocks_inplace = copy_kv_cache_blocks_inplace

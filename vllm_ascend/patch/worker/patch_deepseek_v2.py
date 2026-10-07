@@ -82,6 +82,7 @@ def _deepseek_v2_mla_attention_init(
     input_size: int | None = None,
     reduce_results: bool = True,
     index_group_builder: SparseMLAIndexGroupBuilder | None = None,
+    non_causal_multi_token_decode: bool = False,
 ) -> None:
     # 这里不能使用 super().__init__()，因为当前函数定义在原类之外，
     # 最后通过赋值的方式替换 DeepseekV2MLAAttention.__init__。
@@ -280,6 +281,7 @@ def _deepseek_v2_mla_attention_init(
         quant_config,
         prefix,
         skip_topk=_skip_topk and not mtp_layer,
+        non_causal_multi_token_decode=non_causal_multi_token_decode,
     )
 
 

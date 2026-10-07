@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import copy_sfa_pool_capacity
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
 # Main BF16 cache:
@@ -122,7 +123,17 @@ def allocate_kv_offload_topk_buffer_pair(
         vllm_config.scheduler_config.max_num_seqs * decode_width,
     )
     if sparse_kv_offload_config.use_fused_copy_sfa:
-        max_num_topk_rows = max(max_num_topk_rows, 2 * (vllm_config.scheduler_config.max_num_seqs + 2))
+        # LIM merges all query selections into one request-owned hot row.
+        # Graph padding uses a second, private arena of the same capacity.
+        # Query-row metadata still needs max_num_seqs * decode_width, but
+        # multiplying the large hot K/V allocation by that width wastes HBM.
+        request_rows = 2 * copy_sfa_pool_capacity(vllm_config.scheduler_config.max_num_seqs)
+        if sparse_kv_offload_config.keep_device_kv_cache:
+            # Colocate debug permits prefill/mixed fallback, whose legacy
+            # sparse-copy path may address a resident row per query token.
+            max_num_topk_rows = max(max_num_topk_rows, request_rows)
+        else:
+            max_num_topk_rows = request_rows
         topk_buffer_size += 2 * vllm_config.cache_config.block_size
     topk_buffer_k_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * k_dim * torch.bfloat16.itemsize
     topk_buffer_v_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * v_dim * torch.bfloat16.itemsize
@@ -584,11 +595,10 @@ class SparseKVOffloadManager:
         self,
         kv_cache_config: KVCacheConfig,
     ) -> int:
-        assert len(kv_cache_config.kv_cache_groups) == 1, "Hybrid KV is not supported."
-        kv_cache_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
-        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-            kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
-        return kv_cache_spec.block_size
+        block_sizes = {group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups}
+        if len(block_sizes) != 1:
+            raise ValueError("Sparse KV offload requires one shared block size across target and draft groups.")
+        return block_sizes.pop()
 
     @staticmethod
     def _as_cache_tuple(cache_or_caches) -> tuple[torch.Tensor, ...]:
@@ -597,7 +607,15 @@ class SparseKVOffloadManager:
         return tuple(cache_or_caches)
 
     def _register_offload_layers(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        self.offload_layer_names = [layer_name for layer_name in kv_caches if "indexer" not in layer_name]
+        host_layer_names = set()
+        for group in self.kv_cache_config.kv_cache_groups:
+            for layer_name in group.layer_names:
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = spec.kv_cache_specs[layer_name]
+                if getattr(spec, "store_on_host", False):
+                    host_layer_names.add(layer_name)
+        self.offload_layer_names = [layer_name for layer_name in kv_caches if layer_name in host_layer_names]
         if not self.offload_layer_names:
             raise ValueError("Sparse KV offload did not find SFA KV cache layers.")
 

@@ -274,7 +274,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         metadata.fused_copy_sfa_enabled = (
             self.use_fused_copy_sfa
             and (num_prefills == 0 or common_attn_metadata.offload_dummy)
-            and 1 <= common_attn_metadata.max_query_len <= 7
+            and 1 <= common_attn_metadata.max_query_len <= max(7, self.copy_sfa_metadata_steps)
         )
         metadata.copy_sfa_reuse_logical_lens = None
         metadata.copy_sfa_copy_src_offsets = None

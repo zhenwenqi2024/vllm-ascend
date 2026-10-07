@@ -10,7 +10,66 @@ pytest.importorskip("vllm")
 
 from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa: E402
     AscendMultiConnector,
+    MultiConnector,
 )
+
+
+@pytest.mark.parametrize(
+    "producer,consumer,aux,full_prompt",
+    [
+        (True, False, [2, 22, 38, 58, 74], True),
+        (True, False, [], False),
+        (True, False, None, False),
+        (False, True, [2, 22, 38, 58, 74], False),
+        (True, True, [2, 22, 38, 58, 74], False),
+    ],
+)
+def test_dspark_full_prompt_policy_is_producer_only(producer, consumer, aux, full_prompt):
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            is_kv_producer=producer,
+            is_kv_consumer=consumer,
+            kv_connector_extra_config={} if aux is None else {"dspark_aux_hidden_state_layer_ids": aux},
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
+    )
+    with patch.object(MultiConnector, "__init__", return_value=None):
+        connector = AscendMultiConnector.__new__(AscendMultiConnector)
+        connector._connectors = []
+        connector.__init__(config, object(), None)
+    assert connector._requires_full_dspark_prompt is full_prompt
+
+
+@pytest.mark.parametrize("cached_prefix", [17920, 19042])
+def test_dspark_producer_does_not_skip_aux_states_on_repeated_prefix(cached_prefix):
+    connector = AscendMultiConnector.__new__(AscendMultiConnector)
+    connector._requires_full_dspark_prompt = True
+    connector._connectors = [SimpleNamespace(has_preempted_request=MagicMock(return_value=False))]
+    connector._requests_to_connector = {}
+    request = SimpleNamespace(request_id="repeated-prefix", num_tokens=19043)
+    with patch.object(MultiConnector, "get_num_new_matched_tokens", return_value=(cached_prefix, True)) as parent:
+        assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+    parent.assert_not_called()
+    connector._connectors[0].has_preempted_request.assert_not_called()
+    assert connector._requests_to_connector == {}
+
+
+def test_legacy_prefix_lookup_and_preempted_connector_priority_are_unchanged():
+    connector = AscendMultiConnector.__new__(AscendMultiConnector)
+    connector._requires_full_dspark_prompt = False
+    child = SimpleNamespace(has_preempted_request=MagicMock(return_value=False))
+    connector._connectors = [child]
+    connector._requests_to_connector = {}
+    request = SimpleNamespace(request_id="legacy")
+    with patch.object(MultiConnector, "get_num_new_matched_tokens", return_value=(17920, True)) as parent:
+        assert connector.get_num_new_matched_tokens(request, 0) == (17920, True)
+    parent.assert_called_once_with(request, 0)
+    child.has_preempted_request.return_value = True
+    child.get_num_new_matched_tokens = MagicMock(return_value=(128, False))
+    with patch.object(MultiConnector, "get_num_new_matched_tokens") as parent:
+        assert connector.get_num_new_matched_tokens(request, 0) == (128, False)
+    parent.assert_not_called()
+    assert connector._requests_to_connector == {"legacy": 0}
 
 
 @pytest.mark.parametrize("num_connectors", [0, 2])
@@ -91,6 +150,7 @@ def test_update_state_after_alloc_forwards_observer_without_chosen_connector():
     connector = AscendMultiConnector.__new__(AscendMultiConnector)
     connector._connectors = [full_blocks_observer]
     connector._requests_to_connector = {}
+    connector._requires_full_dspark_prompt = True
     request = SimpleNamespace(request_id="req-0")
     blocks = _FakeBlocks()
 

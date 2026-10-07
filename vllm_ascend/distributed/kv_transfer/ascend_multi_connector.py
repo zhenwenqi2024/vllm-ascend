@@ -24,6 +24,13 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             kv_cache_config=kv_cache_config,
         )
 
+        transfer = vllm_config.kv_transfer_config
+        self._requires_full_dspark_prompt = (
+            transfer.is_kv_producer
+            and not transfer.is_kv_consumer
+            and bool((transfer.kv_connector_extra_config or {}).get("dspark_aux_hidden_state_layer_ids"))
+        )
+
         self._all_support_hma = all(supports_hma(c) for c in self._connectors)
         assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager or self._all_support_hma, (
             "HMA should not be enabled unless all sub-connectors support it"
@@ -161,6 +168,13 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
+        # Target-only external KV hits do not contain DSpark auxiliary states.
+        # Disabling vLLM prefix caching alone does not disable a store child's
+        # lookup. P must compute the full prompt until auxiliary prefix caching
+        # exists; allocation/save fan-out and D's remote KV loading stay intact.
+        if getattr(self, "_requires_full_dspark_prompt", False):
+            return 0, False
+
         # Recompute offload may contain an unhashed partial block that other
         # prefix-cache connectors cannot restore. Give its request state
         # priority regardless of connector ordering.

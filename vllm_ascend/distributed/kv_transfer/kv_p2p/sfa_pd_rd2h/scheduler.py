@@ -13,6 +13,7 @@ P (``kv_producer``): build metadata for layer-wise READ_READY notifications.
 from __future__ import annotations
 
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -24,7 +25,12 @@ from vllm.logger import logger
 from vllm.utils.math_utils import round_down
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import get_eagle3_aux_layers_from_config
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
+    DSparkContextDescriptor,
+    resident_mla_context_group_ids,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     BATCH_KV_TRANSFER_PARAMS,
     SfaPDConsumerMetadata,
@@ -240,6 +246,8 @@ class SFAPDRD2HScheduler:
             raise ValueError("SFAPDRD2HScheduler requires KVCacheConfig")
         self.block_size = [group_spec.kv_cache_spec.block_size for group_spec in kv_cache_config.kv_cache_groups]
         self.main_group_idx, self.indexer_group_idx = infer_sfa_component_group_ids(kv_cache_config)
+        self._dspark_context_groups = self._find_dspark_context_groups()
+        self._dspark_context_requests: dict[str, tuple[DSparkContextDescriptor, dict[int, tuple[int, ...]]]] = {}
 
         self.side_channel_host = get_ip()
         # Control-plane port = kv_port + data_parallel_rank * tp_size. This MUST
@@ -292,6 +300,23 @@ class SFAPDRD2HScheduler:
         self._metaserver_lock = threading.Lock()
         self._shutdown_event = threading.Event()
 
+    def _find_dspark_context_groups(self) -> tuple[int, ...]:
+        """Find resident draft MLA groups without changing attention semantics."""
+        speculative_config = getattr(self.vllm_config, "speculative_config", None)
+        if speculative_config is None or speculative_config.method != "dspark":
+            return ()
+        group_ids = getattr(self.kv_cache_config, "dspark_context_group_ids", None)
+        if group_ids is None:
+            group_ids = resident_mla_context_group_ids(self.kv_cache_config.kv_cache_groups)
+        if not group_ids:
+            raise RuntimeError("DSpark sparse offload requires loader-created resident MLA cache groups")
+        if len(set(group_ids)) != len(group_ids) or any(
+            type(group_id) is not int or not 0 <= group_id < len(self.kv_cache_config.kv_cache_groups)
+            for group_id in group_ids
+        ):
+            raise RuntimeError("DSpark resident MLA group ownership is invalid")
+        return tuple(group_ids)
+
     # ------------------------------------------------------------------
     # D side (kv_consumer)
     # ------------------------------------------------------------------
@@ -300,6 +325,16 @@ class SFAPDRD2HScheduler:
         # (main MLA) / HBM (indexer). Async relative to engine execution.
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_prefill"):
+            if getattr(self, "_dspark_context_groups", ()):
+                contexts = self._dspark_context_requests
+                # Remote-prefill waiters do not count against RUNNING. Bound
+                # resident draft-context admission to the worker receiver,
+                # rather than the larger copy-SFA scratch-slot arena.
+                if (
+                    request.request_id not in contexts
+                    and len(contexts) >= self.vllm_config.scheduler_config.max_num_seqs
+                ):
+                    return None, False
             allocator = getattr(self, "_copy_sfa_slot_allocator", None)
             if allocator is not None and not allocator.can_bind(request.request_id):
                 # Async KV receivers are waiting, not RUNNING, so max_num_seqs
@@ -332,6 +367,28 @@ class SFAPDRD2HScheduler:
         main_block_ids = list(block_ids_by_group[self.main_group_idx])
         indexer_block_ids = list(block_ids_by_group[self.indexer_group_idx])
         self._request_trackers[request.request_id] = (main_block_ids, indexer_block_ids)
+        dspark_context_descriptor = None
+        dspark_draft_block_ids_by_group = None
+        if getattr(self, "_dspark_context_groups", ()):
+            aux_layer_ids = tuple(get_eagle3_aux_layers_from_config(self.vllm_config.speculative_config))
+            prompt_tokens = len(getattr(request, "prompt_token_ids", None) or ())
+            hidden_size = self.vllm_config.model_config.get_hidden_size()
+            if not aux_layer_ids or prompt_tokens <= 0:
+                raise RuntimeError("DSpark remote prefill requires prompt tokens and configured auxiliary boundaries")
+            dspark_context_descriptor = DSparkContextDescriptor(
+                request_id=get_external_request_id(request.request_id),
+                generation=uuid.uuid4().hex,
+                prompt_tokens=prompt_tokens,
+                aux_layer_ids=aux_layer_ids,
+                hidden_size=hidden_size,
+            )
+            dspark_draft_block_ids_by_group = {
+                group_id: tuple(block_ids_by_group[group_id]) for group_id in self._dspark_context_groups
+            }
+            self._dspark_context_requests[request.request_id] = (
+                dspark_context_descriptor,
+                dspark_draft_block_ids_by_group,
+            )
         self._reqs_need_recv.add(request.request_id)
         allocator = getattr(self, "_copy_sfa_slot_allocator", None)
         if allocator is not None:
@@ -370,6 +427,8 @@ class SFAPDRD2HScheduler:
             remote_dcp_size=self.vllm_config.parallel_config.decode_context_parallel_size,
             remote_cached_tokens=request.num_computed_tokens,
         )
+        if dspark_context_descriptor is not None:
+            kv_transfer_params["dspark_context_generation"] = dspark_context_descriptor.generation
         # Allocation is complete once the rendezvous request is submitted.
         # Keep the vLLM remote-prefill state independent of the legacy proxy's
         # HTTP result; old proxies return 500 for extra prompt-list children
@@ -397,6 +456,7 @@ class SFAPDRD2HScheduler:
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         meta = SfaPDConsumerMetadata()
+        context_requests = getattr(self, "_dspark_context_requests", {})
         for req_id in list(self._reqs_need_recv):
             tracker = self._request_trackers.get(req_id)
             if tracker is None:
@@ -404,7 +464,15 @@ class SFAPDRD2HScheduler:
             main_block_ids, indexer_block_ids = tracker
             binding = getattr(self, "_copy_sfa_bindings", {}).get(req_id)
             if binding is None:
-                meta.add_request(req_id, main_block_ids, indexer_block_ids)
+                descriptor, draft_ids = context_requests.get(req_id, (None, {}))
+                meta.add_request(
+                    req_id,
+                    main_block_ids,
+                    indexer_block_ids,
+                    dspark_context_descriptor=descriptor,
+                    dspark_draft_group_ids=self._dspark_context_groups if descriptor is not None else (),
+                    dspark_draft_block_ids_by_group=draft_ids if descriptor is not None else None,
+                )
             else:
                 pool_slot, tail_tokens, tail_block_index, kv_tokens, dense = binding
                 meta.add_request(
@@ -416,6 +484,9 @@ class SFAPDRD2HScheduler:
                     tail_block_index=tail_block_index,
                     kv_tokens=kv_tokens,
                     dense=dense,
+                    dspark_context_descriptor=context_requests.get(req_id, (None, {}))[0],
+                    dspark_draft_group_ids=(self._dspark_context_groups if req_id in context_requests else ()),
+                    dspark_draft_block_ids_by_group=context_requests.get(req_id, (None, None))[1],
                 )
         self._reqs_need_recv.clear()
         return meta
@@ -430,6 +501,7 @@ class SFAPDRD2HScheduler:
     ) -> tuple[bool, dict[str, Any] | None]:
         # vLLM owns the block lifecycle; the connector only drops its lookup.
         self._request_trackers.pop(request.request_id, None)
+        getattr(self, "_dspark_context_requests", {}).pop(request.request_id, None)
         self._reqs_need_recv.discard(request.request_id)
         copy_sfa_bindings = getattr(self, "_copy_sfa_bindings", None)
         if copy_sfa_bindings is not None:

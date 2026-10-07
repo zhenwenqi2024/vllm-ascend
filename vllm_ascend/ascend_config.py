@@ -1749,14 +1749,34 @@ class SparseKVOffloadConfig:
                 )
         self.topk = vllm_config.model_config.hf_text_config.index_topk
         if self.use_fused_copy_sfa:
-            if vllm_config.speculative_config and vllm_config.speculative_config.method == "dspark":
-                raise ValueError("fused_copy_sfa does not support DSpark speculative decoding")
-            width = 1 + (vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0)
-            if self.topk != 2048 or not 1 <= width <= 7:
-                raise ValueError("fused_copy_sfa serving requires TopK=2048 and 1–7 query rows per request")
-            if not width * self.topk <= self.topk_buffer_size <= 16256 or self.topk_buffer_size % 256:
+            speculative = vllm_config.speculative_config
+            dspark = speculative is not None and speculative.method == "dspark"
+            max_width, max_hot_tokens = 7, 16256
+            if dspark:
+                draft_hf = getattr(getattr(speculative, "draft_model_config", None), "hf_config", None)
+                if (
+                    not getattr(vllm_config, "use_v2_model_runner", False)
+                    or "Glm5DSparkForCausalLM" not in (getattr(draft_hf, "architectures", None) or ())
+                    or getattr(draft_hf, "kv_lora_rank", None) != 512
+                    or getattr(draft_hf, "qk_rope_head_dim", None) != 64
+                    or getattr(draft_hf, "block_size", None) != 8
+                    or getattr(draft_hf, "sample_from_anchor", None) is not True
+                    or speculative.num_speculative_tokens != 8
+                ):
+                    raise ValueError(
+                        "fused_copy_sfa does not support DSpark outside V2 GLM MLA block8/sample_from_anchor"
+                    )
+                # The original image's LIM, BF16 indexer and Copy-SFA operators
+                # were verified with nine target query rows, including graph
+                # replay. This is not a claim that every draft architecture or
+                # the operator's full fourteen-row limit has serving coverage.
+                max_width, max_hot_tokens = 9, 32640
+            width = 1 + (speculative.num_speculative_tokens if speculative else 0)
+            if self.topk != 2048 or not 1 <= width <= max_width:
+                raise ValueError(f"fused_copy_sfa serving requires TopK=2048 and 1–{max_width} query rows per request")
+            if not width * self.topk <= self.topk_buffer_size <= max_hot_tokens or self.topk_buffer_size % 256:
                 raise ValueError(
-                    "fused_copy_sfa hot budget must be 256-aligned in [Q_max*2048, 16128]: "
+                    f"fused_copy_sfa hot budget must be 256-aligned in [Q_max*2048, {max_hot_tokens}]: "
                     "the dense short-sequence layout only lines up with the circular "
                     "tail slots when topk_buffer_size is a multiple of 256"
                 )

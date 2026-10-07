@@ -29,6 +29,12 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
+    MAX_DSPARK_CONTEXT_CHUNK_TOKENS,
+    DSparkContextChunk,
+    DSparkContextDescriptor,
+    DSparkContextReceiver,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     CopySfaTailDest,
     LayerMetadata,
@@ -164,6 +170,29 @@ class SFAPDRD2HConsumerWorker:
         # rank has finished the same request. This is scheduler readiness state,
         # not a per-layer barrier.
         self._terminal_ext_ids: set[str] = set()
+        self._dspark_context_receiver: DSparkContextReceiver | None = None
+        self._dspark_context_initializer: Callable[[DSparkContextChunk, torch.Tensor], None] | None = None
+        self._dspark_draft_blocks_by_req: dict[str, dict[int, tuple[int, ...]]] = {}
+
+    def bind_dspark_context_receiver(
+        self,
+        receiver: DSparkContextReceiver,
+        initialize: Callable[[DSparkContextChunk, torch.Tensor], None],
+    ) -> None:
+        """Bind the opt-in main-thread draft-context gate before admitting requests."""
+        if getattr(self, "_dspark_context_receiver", None) is not None or self.request_map:
+            raise RuntimeError("Bind the DSpark context receiver once, before request admission")
+        self._dspark_context_receiver = receiver
+        self._dspark_context_initializer = initialize
+        if self._mf_read_thread is not None:
+            self._mf_read_thread.bind_dspark_context_receiver(receiver)
+
+    def get_dspark_draft_block_ids(self, request_id: str) -> dict[int, tuple[int, ...]]:
+        """Return scheduler-allocated resident draft blocks for one request."""
+        try:
+            return self._dspark_draft_blocks_by_req[request_id]
+        except KeyError as error:
+            raise RuntimeError(f"No resident DSpark blocks were registered for request {request_id}") from error
 
     # ------------------------------------------------------------------
     # Common
@@ -210,6 +239,19 @@ class SFAPDRD2HConsumerWorker:
                 indexer_ids = list(getattr(req, "indexer_block_ids", []) or [])
                 self._dest_blocks_by_req[ext_id] = (main_ids, indexer_ids)
                 self._cpu_blocks_by_req[req_id] = len(main_ids)
+                descriptor = getattr(req, "dspark_context_descriptor", None)
+                if descriptor is not None:
+                    receiver = self._dspark_context_receiver
+                    if receiver is None:
+                        raise RuntimeError("DSpark context arrived before its model-thread receiver was bound")
+                    receiver.register_request(descriptor)
+                    group_ids = tuple(getattr(req, "dspark_draft_group_ids", ()) or ())
+                    block_ids_by_group = getattr(req, "dspark_draft_block_ids_by_group", None)
+                    if not group_ids or block_ids_by_group is None or set(group_ids) != set(block_ids_by_group):
+                        raise RuntimeError("Scheduler metadata is missing exact resident DSpark block tables")
+                    self._dspark_draft_blocks_by_req[ext_id] = {
+                        group_id: tuple(block_ids_by_group[group_id]) for group_id in group_ids
+                    }
                 pool_slot = getattr(req, "pool_slot", None)
                 if pool_slot is not None:
                     self.copy_sfa_slots_by_req[req_id] = int(pool_slot)
@@ -247,10 +289,16 @@ class SFAPDRD2HConsumerWorker:
             self._cpu_blocks_by_req.pop(req_id, None)
             self.request_map.pop(ext_id, None)
             self._dest_blocks_by_req.pop(ext_id, None)
+            getattr(self, "_dspark_draft_blocks_by_req", {}).pop(ext_id, None)
             getattr(self, "copy_sfa_slots_by_req", {}).pop(req_id, None)
             getattr(self, "_copy_sfa_tail_by_req", {}).pop(ext_id, None)
             self._pending_done.discard(ext_id)
             self._terminal_ext_ids.discard(ext_id)
+            receiver = getattr(self, "_dspark_context_receiver", None)
+            if receiver is not None:
+                descriptor = receiver.get_descriptor(ext_id)
+                if descriptor is not None:
+                    receiver.discard_request(ext_id, descriptor.generation)
         # Drop any partial contributor-completion state so a dead contributor or a
         # retried external id cannot complete a later request on stale arrivals.
         if self._mf_read_thread is not None:
@@ -282,12 +330,40 @@ class SFAPDRD2HConsumerWorker:
             local_failed = self._mf_read_thread.get_and_clear_failed()
             self._terminal_ext_ids.update(local_done | local_failed)
 
-        tp_status = self._gather_tp_read_status(
-            set(self._terminal_ext_ids),
-            local_failed,
-        )
+        local_terminal = set(self._terminal_ext_ids)
+        receiver = getattr(self, "_dspark_context_receiver", None)
+        if receiver is not None:
+            # get_finished also runs in the zero-token connector-only step.
+            # Do not write draft KV in the read thread or recompute target prompt.
+            receiver.drain(self._dspark_context_initializer)
+            for ext_id in local_terminal:
+                descriptor = receiver.get_descriptor(ext_id)
+                if descriptor is not None:
+                    receiver.mark_target_kv_done(ext_id, descriptor.generation)
+            local_terminal = (local_terminal & receiver.ready_requests()) | local_failed
+        tp_status = self._gather_tp_read_status(local_terminal, local_failed)
         finished_on_all = set.intersection(*(terminal for terminal, _ in tp_status)) if tp_status else set()
         failed_on_any = set().union(*(failed for _, failed in tp_status))
+        if receiver is not None:
+            for ext_id in finished_on_all - failed_on_any:
+                descriptor = receiver.get_descriptor(ext_id)
+                if descriptor is not None:
+                    logger.info(
+                        "DSpark remote prompt ready: req=%s tokens=%d aux_layers=%s draft_groups=%s tp_rank=%d",
+                        ext_id,
+                        descriptor.prompt_tokens,
+                        descriptor.aux_layer_ids,
+                        tuple(self._dspark_draft_blocks_by_req[ext_id]),
+                        self.tp_rank,
+                    )
+                    # All TP ranks completed context writes and target reads.
+                    # Retire ingress capacity now, without dropping live draft
+                    # block tables, request_map, or duplicate-ACK bookkeeping.
+                    # Waiting for finished_req_ids lets the next load hook run
+                    # before cleanup and overflow an otherwise bounded pool.
+                    receiver.retire_ready_request(ext_id, descriptor.generation)
+        if receiver is not None and failed_on_any:
+            raise RuntimeError(f"DSpark remote prompt transfer failed; refusing local recomputation: {failed_on_any}")
         self._terminal_ext_ids.difference_update(finished_on_all)
 
         for ext_id in failed_on_any:
@@ -547,8 +623,25 @@ class SFAPDRD2HProducerWorker:
         # Layers whose PD send was already dispatched at scatter time by
         # on_kv_cache_written; save_kv_layer skips these at layer end.
         self._pd_dispatched_layers: set[int] = set()
+        transfer_extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        self.dspark_aux_layer_ids = tuple(transfer_extra.get("dspark_aux_hidden_state_layer_ids", ()))
+        self.dspark_context_chunk_tokens = int(
+            transfer_extra.get("dspark_context_chunk_tokens", MAX_DSPARK_CONTEXT_CHUNK_TOKENS)
+        )
+        if self.dspark_aux_layer_ids and not 0 < self.dspark_context_chunk_tokens <= MAX_DSPARK_CONTEXT_CHUNK_TOKENS:
+            raise ValueError(f"dspark_context_chunk_tokens must be in [1, {MAX_DSPARK_CONTEXT_CHUNK_TOKENS}]")
+        self.dspark_context_staging: torch.Tensor | None = None
+        self._active_dspark_requests: dict[str, Any] = {}
+        self._dspark_next_offsets: dict[tuple[str, str], int] = {}
 
-    def get_finished(self) -> tuple[set[str], set[str]]:
+    def get_finished(self, finished_req_ids: set[str] | None = None) -> tuple[set[str], set[str]]:
+        if finished_req_ids:
+            completed = {get_external_request_id(req_id) for req_id in finished_req_ids}
+            self._dspark_next_offsets = {
+                key: offset
+                for key, offset in getattr(self, "_dspark_next_offsets", {}).items()
+                if key[0] not in completed
+            }
         return set(), set()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -581,7 +674,10 @@ class SFAPDRD2HProducerWorker:
         if self._backend == BACKEND_MEMFABRIC:
             self.current_layer = 0
             self._pd_dispatched_layers = set()
+            self._active_dspark_requests = {}
             for req_id, req_meta in getattr(metadata, "requests", {}).items():
+                if getattr(req_meta, "dspark_context_generation", None):
+                    self._active_dspark_requests[req_id] = req_meta
                 if req_meta.remote_port is None:
                     continue
                 remote_tp_size = req_meta.remote_tp_size
@@ -616,6 +712,9 @@ class SFAPDRD2HProducerWorker:
                     req_meta.local_computed_tokens,
                     req_meta.local_transed_tokens,
                 )
+            # An unrelated/empty scheduling step must not reset a partially
+            # sent prompt. Retire offsets with request completion, not with
+            # the set of requests scheduled in this particular step.
             return
         raise RuntimeError("SfaRemoteD2HConnector P side supports memfabric pull only.")
 
@@ -732,6 +831,17 @@ class SFAPDRD2HProducerWorker:
         self.layer_storage_slots = self._infer_layer_storage_slots(self.layer_metadata)
 
         register_regions = collect_storage_merged_register_regions(kv_caches)
+        if self.dspark_aux_layer_ids and self.pp_rank == self.pp_size - 1:
+            hidden_size = self.vllm_config.model_config.get_hidden_size()
+            feature_width = hidden_size * len(self.dspark_aux_layer_ids)
+            self.dspark_context_staging = torch.empty(
+                (self.dspark_context_chunk_tokens, feature_width),
+                dtype=torch.bfloat16,
+                device=f"npu:{torch.npu.current_device()}",
+            )
+            registered_caches = dict(kv_caches)
+            registered_caches["__dspark_context_staging__"] = self.dspark_context_staging
+            register_regions = collect_storage_merged_register_regions(registered_caches)
         validate_register_region_count(register_regions)
         global_memfabric_te.register_buffer(register_regions.ptrs, register_regions.lengths)
 
@@ -750,9 +860,81 @@ class SFAPDRD2HProducerWorker:
             self.kv_send_layer_thread.stop()
             raise RuntimeError("SFAPD P-side send thread failed during startup") from error
         logger.info(
-            "MembPull P registered kv caches: layers=%d, p_session=%s",
+            "MembPull P registered kv caches: layers=%d, dspark_context_staging=%s, p_session=%s",
             len(self.layer_metadata),
+            self.dspark_context_staging is not None,
             global_memfabric_te.unique_id,
+        )
+
+    def send_dspark_context_chunk(self, request_id: str, chunk: DSparkContextChunk, tensor: torch.Tensor) -> None:
+        """Copy one target auxiliary chunk into registered HBM and pull-serve it."""
+        if self.pp_rank != self.pp_size - 1 or self.dspark_context_staging is None:
+            raise RuntimeError("Only the final Prefill PP stage owns the registered DSpark context arena")
+        if self.kv_send_layer_thread is None:
+            raise RuntimeError("SFAPD P send thread is not registered")
+        req_meta = self._active_dspark_requests.get(request_id)
+        if req_meta is None:
+            raise RuntimeError(f"No remote DSpark consumer metadata is bound for request {request_id}")
+        if not req_meta.remote_host or not req_meta.remote_port:
+            raise RuntimeError(f"Remote DSpark request {request_id} has no Decode endpoint")
+        descriptor = chunk.descriptor
+        if descriptor.request_id != get_external_request_id(request_id):
+            raise RuntimeError("DSpark context request ID does not match SFA producer metadata")
+        if descriptor.generation != req_meta.dspark_context_generation:
+            raise RuntimeError("DSpark context allocation generation does not match Decode rendezvous")
+        if descriptor.aux_layer_ids != self.dspark_aux_layer_ids:
+            raise RuntimeError("DSpark context boundary schema differs between Prefill config and request")
+        if (
+            tensor.dtype != torch.bfloat16
+            or tensor.ndim != 2
+            or tensor.shape
+            != (
+                chunk.num_tokens,
+                descriptor.feature_width,
+            )
+        ):
+            raise ValueError("Prefill DSpark context source must be a BF16 [tokens, concatenated-width] tensor")
+        if not 0 < chunk.num_tokens <= self.dspark_context_chunk_tokens:
+            raise ValueError("Prefill DSpark context chunk exceeds its registered staging arena")
+        key = (descriptor.request_id, descriptor.generation)
+        expected_offset = self._dspark_next_offsets.get(key, 0)
+        if chunk.token_offset != expected_offset:
+            raise RuntimeError(
+                f"DSpark context has a prefix gap/duplicate for {descriptor.request_id}: "
+                f"expected offset {expected_offset}, got {chunk.token_offset}"
+            )
+        self.dspark_context_staging[: chunk.num_tokens].copy_(tensor)
+        ready = torch.npu.Event()
+        ready.record(torch.npu.current_stream(self.dspark_context_staging.device))
+        self.kv_send_layer_thread.send_dspark_context(
+            host=req_meta.remote_host,
+            port=req_meta.remote_port,
+            remote_engine_id=req_meta.remote_engine_id,
+            descriptor=descriptor,
+            token_offset=chunk.token_offset,
+            num_tokens=chunk.num_tokens,
+            peer_ptr=self.dspark_context_staging.data_ptr(),
+            nbytes=chunk.num_tokens * descriptor.feature_width * 2,
+            wait_event=ready,
+        )
+        next_offset = chunk.token_offset + chunk.num_tokens
+        if next_offset == descriptor.prompt_tokens:
+            self._dspark_next_offsets.pop(key, None)
+        else:
+            self._dspark_next_offsets[key] = next_offset
+
+    def get_dspark_context_descriptor(self, request_id: str, prompt_tokens: int) -> DSparkContextDescriptor | None:
+        req_meta = self._active_dspark_requests.get(request_id)
+        if req_meta is None or not req_meta.dspark_context_generation:
+            return None
+        if not self.dspark_aux_layer_ids:
+            raise RuntimeError("Prefill DSpark auxiliary boundaries were not configured")
+        return DSparkContextDescriptor(
+            request_id=get_external_request_id(request_id),
+            generation=req_meta.dspark_context_generation,
+            prompt_tokens=prompt_tokens,
+            aux_layer_ids=self.dspark_aux_layer_ids,
+            hidden_size=self.vllm_config.model_config.get_hidden_size(),
         )
 
     def _has_memfabric_pull_target(
