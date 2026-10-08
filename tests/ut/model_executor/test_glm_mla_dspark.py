@@ -9,11 +9,31 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from torch import nn
+from vllm import ModelRegistry
+from vllm.model_executor.model_loader.utils import get_model_cls
 from vllm.transformers_utils.configs.speculators import SpeculatorsConfig
 
-from vllm_ascend.models.qwen3_dspark import Glm5DSparkForCausalLM, Glm5DSparkMLAAttention, Glm5DSparkModel
+from vllm_ascend.models import register_model
+from vllm_ascend.models.glm5_dspark import Glm5DSparkForCausalLM, Glm5DSparkMLAAttention, Glm5DSparkModel
 from vllm_ascend.patch.platform import patch_speculative_config
 from vllm_ascend.patch.worker import patch_deepseek_v2
+
+
+def test_registered_glm_draft_uses_glm_module(monkeypatch):
+    monkeypatch.setattr(ModelRegistry, "models", ModelRegistry.models.copy())
+    register_model()
+    config = SimpleNamespace(
+        model="/test/Glm5DSparkForCausalLM",
+        convert_type="none",
+        runner_type="generate",
+        trust_remote_code=False,
+        model_impl="vllm",
+        hf_config=SimpleNamespace(architectures=["Glm5DSparkForCausalLM"]),
+        registry=ModelRegistry,
+        _get_transformers_backend_cls=lambda: "TransformersForCausalLM",
+    )
+    assert get_model_cls(config) is Glm5DSparkForCausalLM
+    assert Glm5DSparkForCausalLM.__module__ == "vllm_ascend.models.glm5_dspark"
 
 
 @pytest.mark.parametrize("sliding_window_non_causal", [False, True])
@@ -135,7 +155,7 @@ def test_weight_loader_keeps_mla_checkpoint_names():
     )
     weights = [(name, torch.ones(2)) for name in ("t2d", "norm.weight", "context_proj.weight", "lm_head.weight")]
     loader = MagicMock()
-    with patch("vllm_ascend.models.qwen3_dspark.AutoWeightsLoader", return_value=loader):
+    with patch("vllm_ascend.models.glm5_dspark.AutoWeightsLoader", return_value=loader):
         Glm5DSparkForCausalLM.load_weights(model, weights)
     names = [name for name, _ in loader.load_weights.call_args.args[0]]
     assert names == ["model.final_norm.weight", "model.context_proj.weight", "lm_head.weight"]
