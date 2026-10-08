@@ -28,12 +28,6 @@ from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
-from vllm_ascend.attention.sfa_contract import (
-    COPY_SFA_TAIL_TOKENS,
-    LIM_MAX_HOT_TOKENS,
-    LIM_MAX_QUERY_ROWS,
-    LIM_TOPK,
-)
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
 
@@ -1762,24 +1756,6 @@ class SparseKVOffloadConfig:
         ):
             # Only V2 initializes the resident draft KV from remote prompt context.
             raise ValueError("Sparse KV offload with DSpark requires V2 remote prompt-context initialization")
-        if self.use_fused_copy_sfa:
-            # Draft compatibility is checked against the loaded model/cache
-            # interfaces, not an architecture or checkpoint-shape whitelist.
-            max_width = LIM_MAX_QUERY_ROWS
-            max_hot_tokens = LIM_MAX_HOT_TOKENS
-            width = 1 + (speculative.num_speculative_tokens if speculative else 0)
-            if self.topk != LIM_TOPK or not 1 <= width <= max_width:
-                raise ValueError(f"fused_copy_sfa requires TopK={LIM_TOPK} and 1–{max_width} query rows per request")
-            if (
-                not width * self.topk <= self.topk_buffer_size <= max_hot_tokens
-                or self.topk_buffer_size % COPY_SFA_TAIL_TOKENS
-            ):
-                raise ValueError(
-                    f"fused_copy_sfa hot budget must be {COPY_SFA_TAIL_TOKENS}-aligned "
-                    f"in [Q_max*{LIM_TOPK}, {max_hot_tokens}]: "
-                    "the dense short-sequence layout only lines up with the circular "
-                    f"tail slots when topk_buffer_size is a multiple of {COPY_SFA_TAIL_TOKENS}"
-                )
         if self.topk_buffer_size < self.topk:
             raise ValueError(
                 "sparse_kv_offload_config.topk_buffer_size must be >= topk, "

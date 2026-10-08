@@ -321,9 +321,10 @@ The fused path has these additional requirements:
 
 - The model must use `index_topk=2048` and a cache block size of `128`.
 - Let `Q_max = 1 + num_speculative_tokens`, or `1` without speculative decoding.
-  `Q_max` must be between `1` and `7`.
+  `Q_max` must be between `1` and `14`.
 - `topk_buffer_size` must be a multiple of `256`, at least `Q_max * 2048`,
-  and at most `16128`. The runtime allocates two additional tail blocks;
+  and at most `32512` (the largest aligned value within LIM's `32640` limit).
+  The runtime allocates two additional tail blocks;
   do not add them to this setting.
 - Keep `use_fused_overlap=false`; it cannot be combined with `fused_copy_sfa`.
 - Use BF16 for the main KV cache. Sparse SFA C8 is not supported.
@@ -338,6 +339,7 @@ The fused path has these additional requirements:
 | MTP2 | 3 | 6144 |
 | MTP3 | 4 | 8192 |
 | MTP5 | 6 | 12288 |
+| DSpark8 | 9 | 18432 |
 
 For example, the following A3 Decode command uses GLM-5.2 W4A8 with DP2 TP8,
 MTP3, and `FULL_DECODE_ONLY` target graphs. Replace the model path and size
@@ -389,6 +391,36 @@ pool. With DP2, the example reserves `2 * 128 = 256` GiB of host KV memory.
 Model Runner V2 uses the same sparse-offload configuration, including MTP and
 `fused_copy_sfa`: set `VLLM_USE_V2_MODEL_RUNNER=1`. For an eager V2 launch,
 replace the graph compilation option with a top-level `--enforce-eager`.
+
+### DSpark with Sparse Decode Offload
+
+GLM MLA DSpark requires Model Runner V2 on both Prefill and Decode. Configure
+the same draft checkpoint and speculative-token count on both nodes, for example:
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /path/to/target \
+    --speculative-config '{"method":"dspark","model":"/path/to/GLM-MLA-draft","num_speculative_tokens":8}' \
+    ...
+```
+
+Keep Prefill eager and disable prefix caching on both nodes. Auxiliary capture
+layers are resolved from the draft checkpoint; no separate layer-ID setting is
+needed. Prefill projects the target's prompt features locally and writes its
+own draft KV. The SFA producer connector transfers those pages alongside target
+KV, and Decode waits for both transfers before decoding. Hidden features are
+not sent to Decode for prompt-KV reconstruction.
+
+Enable sparse offload only on Decode, with the consumer connector and
+`fused_copy_sfa` configuration above. For draft8, set `topk_buffer_size` to at
+least `18432`; `20480` is an example with extra hot-cache capacity. These are
+kernel/layout bounds, not a draft-checkpoint whitelist or a guarantee that every
+width has been validated end to end. Both nodes must use the same cache block
+size. Remote DSpark draft-KV transfer does not support PCP or DCP.
+
+Only the target's main KV is offloaded to the host. The loaded draft supplies
+its cache-layer ownership, and its full context KV stays in device memory.
+Account for this context-dependent HBM cost when sizing long-context serving;
+target offload alone does not establish 1M-context DSpark support.
 
 ## 4. Start the P/D Proxy
 

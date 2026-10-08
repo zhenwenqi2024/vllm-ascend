@@ -27,7 +27,7 @@ from typing import Any, NamedTuple, TypeVar, cast
 import numpy as np
 import torch
 import torch_npu
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
@@ -37,18 +37,12 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.utils import CpuGpuBuffer
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.indexer import (
     INDEXER_K_CACHE_SLOT,
     INDEXER_SCALE_CACHE_SLOT,
-)
-from vllm_ascend.attention.sfa_contract import (
-    COPY_SFA_TAIL_BLOCKS,
-    COPY_SFA_TAIL_TOKENS,
-    LIM_CACHE_BLOCK_SIZE,
-    LIM_TOPK,
 )
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
@@ -68,6 +62,37 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     get_sparse_kv_offload_manager,
 )
 from vllm_ascend.utils import enable_dsa_cp
+
+# LIM bounds mirror both BF16 and quantized kernel constants headers;
+# source-checkout tests enforce parity, independently of the draft checkpoint.
+LIM_TOPK = 2048
+LIM_MAX_QUERY_ROWS = 14
+LIM_MAX_HOT_TOKENS = 32640
+LIM_CACHE_BLOCK_SIZE = 128
+
+# Copy-SFA's two-block circular tail requires stronger alignment than LIM.
+COPY_SFA_TAIL_BLOCKS = 2
+COPY_SFA_TAIL_TOKENS = COPY_SFA_TAIL_BLOCKS * LIM_CACHE_BLOCK_SIZE
+
+
+def _validate_fused_copy_sfa_config(vllm_config: VllmConfig, cfg: SparseKVOffloadConfig) -> None:
+    """Check kernel and circular-tail bounds before allocating fused buffers."""
+    if not cfg.use_fused_copy_sfa:
+        return
+    speculative = vllm_config.speculative_config
+    width = 1 + (speculative.num_speculative_tokens if speculative else 0)
+    if cfg.topk != LIM_TOPK or not 1 <= width <= LIM_MAX_QUERY_ROWS:
+        raise ValueError(f"fused_copy_sfa requires TopK={LIM_TOPK} and 1–{LIM_MAX_QUERY_ROWS} query rows per request")
+    if (
+        not width * cfg.topk <= cfg.topk_buffer_size <= LIM_MAX_HOT_TOKENS
+        or cfg.topk_buffer_size % COPY_SFA_TAIL_TOKENS
+    ):
+        raise ValueError(
+            f"fused_copy_sfa hot budget must be {COPY_SFA_TAIL_TOKENS}-aligned "
+            f"in [Q_max*{LIM_TOPK}, {LIM_MAX_HOT_TOKENS}]: "
+            "the dense short-sequence layout only lines up with the circular "
+            f"tail slots when topk_buffer_size is a multiple of {COPY_SFA_TAIL_TOKENS}"
+        )
 
 
 @dataclass
@@ -171,6 +196,8 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         metadata_cls: type[AscendSFAOffloadMetadata] | None = None,
         supports_dcp_with_varlen: bool = False,
     ):
+        cfg = get_ascend_config().sparse_kv_offload_config
+        _validate_fused_copy_sfa_config(vllm_config, cfg)
         super().__init__(
             kv_cache_spec,
             layer_names,
@@ -179,7 +206,6 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             metadata_cls if metadata_cls is not None else AscendSFAOffloadMetadata,
             supports_dcp_with_varlen,
         )
-        cfg = get_ascend_config().sparse_kv_offload_config
         self.use_fused_copy_sfa = cfg.use_fused_copy_sfa
         if self.use_fused_copy_sfa:
             self._init_copy_sfa_metadata_buffers(vllm_config, device)
@@ -208,6 +234,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         self.copy_sfa_parts = torch.arange(COPY_SFA_TAIL_BLOCKS, dtype=torch.int64, device=device)
         # CPU-owned layout uses persistent pinned storage. Each target/draft
         # step has distinct storage: later metadata builds precede execution.
+        # CpuGpuBuffer keeps fixed device addresses for ACL graph replay.
         host_fields = {
             "query_ends": (requests, torch.int32),
             "widths": (requests, torch.int32),
@@ -485,6 +512,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         kv_sharing_target_layer_name: str | None,
         **kwargs,
     ):
+        offload_cfg = get_ascend_config().sparse_kv_offload_config
+        if offload_cfg.use_fused_copy_sfa:
+            _validate_fused_copy_sfa_config(get_current_vllm_config(), offload_cfg)
         super().__init__(
             num_heads,
             head_size,
@@ -508,7 +538,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             )
         self._current_layer_name: str | None = None
         self.block_size = self.vllm_config.cache_config.block_size
-        offload_cfg = get_ascend_config().sparse_kv_offload_config
         self.use_fused_overlap = offload_cfg.use_fused_overlap
         self.use_fused_copy_sfa = offload_cfg.use_fused_copy_sfa
         self.lim_indexer_owner = self

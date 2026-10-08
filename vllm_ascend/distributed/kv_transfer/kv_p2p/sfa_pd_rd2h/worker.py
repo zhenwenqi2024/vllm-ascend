@@ -29,7 +29,6 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-from vllm_ascend.attention.sfa_contract import COPY_SFA_TAIL_BLOCKS
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
     DSparkContextDescriptor,
     DSparkContextReceiver,
@@ -564,6 +563,9 @@ class SFAPDRD2HConsumerWorker:
             self._topk_row_tokens = 0
             self._topk_hot_tokens = 0
             return
+        # The shared manager is also imported by the attention backend.
+        from vllm_ascend.attention.sfa_kv_offload import COPY_SFA_TAIL_BLOCKS
+
         topk_k = manager.topk_buffers_k
         topk_v = manager.topk_buffers_v
         if not topk_k or not topk_v:

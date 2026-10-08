@@ -31,7 +31,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
-from vllm_ascend.attention.sfa_contract import COPY_SFA_TAIL_BLOCKS
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import copy_sfa_pool_capacity
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
@@ -124,6 +123,9 @@ def allocate_kv_offload_topk_buffer_pair(
         vllm_config.scheduler_config.max_num_seqs * decode_width,
     )
     if sparse_kv_offload_config.use_fused_copy_sfa:
+        # The backend imports this manager; defer its layout constant import.
+        from vllm_ascend.attention.sfa_kv_offload import COPY_SFA_TAIL_BLOCKS
+
         # LIM merges all query selections into one request-owned hot row.
         # Graph padding uses a second, private arena of the same capacity.
         # Query-row metadata still needs max_num_seqs * decode_width, but
