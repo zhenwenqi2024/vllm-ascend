@@ -480,8 +480,13 @@ def _prefix_prefill_case(offset=4, prompt_tokens=12):
         get_dspark_context_descriptor=Mock(return_value=descriptor),
         send_dspark_draft_kv=Mock(side_effect=lambda *args: calls.append(("send", args))),
     )
+
+    def restore_prefix(*args):
+        calls.append(("restore", args))
+        return offset
+
     provider = SimpleNamespace(
-        restore_dspark_prefix=Mock(side_effect=lambda *args: calls.append(("restore", args)) or offset),
+        restore_dspark_prefix=Mock(side_effect=restore_prefix),
         save_dspark_prefix=Mock(side_effect=lambda *args: calls.append(("save", args))),
     )
     aux = [torch.full((suffix_tokens, 4), index, dtype=torch.bfloat16) for index in range(5)]
@@ -501,7 +506,7 @@ def _prefix_prefill_case(offset=4, prompt_tokens=12):
 def test_prefix_restore_precedes_suffix_projection_and_complete_draft_transfer(offset):
     descriptor, speculator, connector, provider, aux, batch, requests, calls = _prefix_prefill_case(offset)
     metadata = object()
-    progress = {}
+    progress: dict[str, tuple[str, int]] = {}
 
     send_dspark_prefill_kv(
         speculator,
@@ -530,7 +535,7 @@ def test_prefix_restore_precedes_suffix_projection_and_complete_draft_transfer(o
 def test_prefix_is_restored_once_across_chunked_suffix_prefill():
     descriptor, speculator, connector, provider, aux, batch, requests, calls = _prefix_prefill_case()
     metadata = object()
-    progress = {}
+    progress: dict[str, tuple[str, int]] = {}
     batch.num_scheduled_tokens = [4]
     batch.query_start_loc_np = [0, 4]
     send_dspark_prefill_kv(

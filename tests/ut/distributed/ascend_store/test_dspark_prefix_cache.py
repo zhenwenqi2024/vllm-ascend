@@ -37,7 +37,7 @@ class _ByteBackend:
         self.calls = []
         self.lease_error = False
         self.on_lease = None
-        self.store = self
+        self.store: _ByteBackend | SimpleNamespace = self
 
     def ensure_initialized(self):
         return None

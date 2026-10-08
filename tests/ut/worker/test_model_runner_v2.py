@@ -59,7 +59,7 @@ def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, prof
     runner = _make_runner(need_timing=False)
     scheduler_output = SimpleNamespace()
     active = set()
-    events = []
+    events: list[str | tuple[str, bool]] = []
 
     @contextmanager
     def scope(name):
