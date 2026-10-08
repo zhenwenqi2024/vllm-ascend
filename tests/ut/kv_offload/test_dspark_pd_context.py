@@ -449,7 +449,7 @@ def test_runner_writes_draft_kv_on_p_then_sends_only_page_metadata(monkeypatch, 
     if split_prefill:
         batch.num_scheduled_tokens = [64]
         request_meta.local_block_ids = [list(range(16))]
-        runner._send_pd_dspark_draft_kv(SimpleNamespace(kv_connector_metadata=metadata, finished_req_ids=set()))
+        runner._maybe_send_draft_kv(SimpleNamespace(kv_connector_metadata=metadata, finished_req_ids=set()))
         pd.send_dspark_draft_kv.assert_not_called()
         assert runner._dspark_prefill_progress == {"request": (descriptor.generation, 64)}
         batch.num_computed_tokens_np = [64]
@@ -457,7 +457,7 @@ def test_runner_writes_draft_kv_on_p_then_sends_only_page_metadata(monkeypatch, 
         batch.query_start_loc_np = [66, 75]
         request_meta.local_block_ids = [list(range(20))]
 
-    runner._send_pd_dspark_draft_kv(SimpleNamespace(kv_connector_metadata=metadata, finished_req_ids=set()))
+    runner._maybe_send_draft_kv(SimpleNamespace(kv_connector_metadata=metadata, finished_req_ids=set()))
 
     calls = runner.speculator.initialize_local_context.call_args_list
     assert [(call.args[0].token_offset, call.args[0].num_tokens) for call in calls] == [(0, 64), (64, 7)]

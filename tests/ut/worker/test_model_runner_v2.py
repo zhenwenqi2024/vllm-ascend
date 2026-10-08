@@ -44,11 +44,22 @@ def _make_runner(need_timing: bool = True):
     return runner
 
 
-@pytest.mark.parametrize("dummy", [False, True])
-@pytest.mark.parametrize("fail", [False, True])
-def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, fail):
+@pytest.mark.parametrize(
+    ("dummy", "profile", "fail"),
+    [
+        (False, False, False),
+        (False, False, True),
+        (True, False, False),
+        (True, False, True),
+        (False, True, False),
+        (False, True, True),
+    ],
+)
+def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, profile, fail):
     runner = _make_runner(need_timing=False)
+    scheduler_output = SimpleNamespace()
     active = set()
+    events = []
 
     @contextmanager
     def scope(name):
@@ -62,10 +73,20 @@ def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, fail
     monkeypatch.setattr(module + "has_kv_transfer_group", lambda: False)
     monkeypatch.setattr(module + "should_skip_allreduce_across_dp_group", lambda _config: True)
     monkeypatch.setattr(module + "skip_dp_coordination", lambda: scope("dp_skip"))
+    runner.model_state.finish_execution.side_effect = lambda *, failed: events.append(("finish", failed))
+
+    def send_draft_kv(_output):
+        assert active == set()
+        events.append("draft")
+
+    draft_sender = Mock(side_effect=send_draft_kv)
+    monkeypatch.setattr(runner, "_maybe_send_draft_kv", draft_sender)
 
     def forward(_self, _output, **kwargs):
         assert active == {"dp_skip"}
         assert kwargs["dummy_run"] is dummy
+        assert kwargs["is_profile"] is profile
+        events.append("forward")
         if fail:
             raise ValueError("forward failed")
         return "output"
@@ -73,11 +94,19 @@ def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, fail
     monkeypatch.setattr(GPUModelRunner, "execute_model", forward)
     if fail:
         with pytest.raises(ValueError, match="forward failed"):
-            runner.execute_model(SimpleNamespace(), dummy_run=dummy)
+            runner.execute_model(scheduler_output, dummy_run=dummy, is_profile=profile)
     else:
-        assert runner.execute_model(SimpleNamespace(), dummy_run=dummy) == "output"
+        assert runner.execute_model(scheduler_output, dummy_run=dummy, is_profile=profile) == "output"
     assert active == set()
     runner.model_state.finish_execution.assert_called_once_with(failed=fail)
+
+    expected = ["forward", ("finish", fail)]
+    if not (fail or dummy or profile):
+        expected.append("draft")
+        draft_sender.assert_called_once_with(scheduler_output)
+    else:
+        draft_sender.assert_not_called()
+    assert events == expected
 
 
 def _make_batch_state(computed: list[int], scheduled: list[int], prefill_lens: list[int]) -> BatchReqState:

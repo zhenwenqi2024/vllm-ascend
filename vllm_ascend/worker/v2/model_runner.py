@@ -528,7 +528,7 @@ class NPUModelRunner(GPUModelRunner):
                 if finish_execution is not None:
                     finish_execution(failed=forward_failed)
         if not dummy_run and not is_profile:
-            self._send_pd_dspark_draft_kv(scheduler_output)
+            self._maybe_send_draft_kv(scheduler_output)
         self.model_state.kvpp_is_dummy_run = False
         if dummy_run and lmhead_tp_enable() and not is_profile and self.is_last_pp_rank:
             # lmhead TP: idle ranks never call sample(); join the target head
@@ -551,7 +551,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         return output
 
-    def _send_pd_dspark_draft_kv(self, scheduler_output: SchedulerOutput) -> None:
+    def _maybe_send_draft_kv(self, scheduler_output: SchedulerOutput) -> None:
         """Write draft KV on P, then let D pull the exact allocated cache pages."""
         if not getattr(self, "pd_dspark_aux_layer_ids", ()) or not self.is_last_pp_rank:
             return
