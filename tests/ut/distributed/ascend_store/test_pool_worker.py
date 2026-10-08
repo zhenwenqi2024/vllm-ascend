@@ -1644,6 +1644,95 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             block_ids_by_group_np=[np.asarray(block_ids, dtype=np.int64) for block_ids in block_ids_by_group],
         )
 
+    def _make_dspark_gva_worker(self, mixed):
+        worker = self._make_gva_worker(num_groups=3)
+        target_names = ["model.layers.0.attn", "model.layers.1.attn"]
+        draft_names = ["draft.layers.2.attn", "draft.layers.3.attn"]
+        spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.bfloat16)
+        worker.hf_config = SimpleNamespace(num_hidden_layers=2)
+        worker.original_block_size = [16, 16, 16]
+        worker.kv_cache_config = SimpleNamespace(
+            num_blocks=16,
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=[target_names[0]] + ([draft_names[0]] if mixed else []), kv_cache_spec=spec
+                ),
+                KVCacheGroupSpec(layer_names=draft_names[1:] if mixed else draft_names, kv_cache_spec=spec),
+                KVCacheGroupSpec(layer_names=[target_names[1]], kv_cache_spec=spec),
+            ],
+            dspark_draft_layer_names=tuple(draft_names),
+        )
+        return worker
+
+    def test_paired_dspark_target_group_filter_preserves_mixed_groups_and_cacheability(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import DSparkPrefixKeys
+
+        for mixed in (False, True):
+            for cacheable in ([0, 1, 2], [0, 1]):
+                with self.subTest(mixed=mixed, cacheable=cacheable):
+                    worker = self._make_dspark_gva_worker(mixed)
+                    worker.cacheable_group_ids = cacheable.copy()
+                    original_groups = worker.kv_cache_config.kv_cache_groups
+
+                    worker.configure_dspark_prefix_cache(DSparkPrefixKeys("checkpoint", pp_size=1, tp_size=1))
+
+                    self.assertEqual(worker.cacheable_group_ids, [group for group in cacheable if group != 1])
+                    self.assertIs(worker.kv_cache_config.kv_cache_groups, original_groups)
+                    self.assertEqual(worker.num_kv_cache_groups, 3)
+                    self.assertEqual(worker.original_block_size, [16, 16, 16])
+                    self.assertEqual(worker.grouped_block_size, [16, 16, 16])
+                    self.assertEqual(worker.num_layers, 2)
+                    self.assertTrue(
+                        all(
+                            group != 1
+                            for groups in worker.physical_layer_to_group_layers.values()
+                            for group, _ in groups
+                        )
+                    )
+
+    def test_paired_dspark_gva_save_load_skips_only_draft_group_without_remapping_blocks(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import DSparkPrefixKeys
+
+        for mixed in (False, True):
+            for paired in (False, True):
+                with self.subTest(mixed=mixed, paired=paired):
+                    worker = self._make_dspark_gva_worker(mixed)
+                    if paired:
+                        worker.configure_dspark_prefix_cache(DSparkPrefixKeys("checkpoint", pp_size=1, tp_size=1))
+                    expected_groups = [0, 2] if paired else [0, 1, 2]
+                    expected_keys = [f"llama-7b@{group}@h0@0" for group in expected_groups]
+                    worker.m_store.batch_alloc.side_effect = lambda keys, sizes, ttl: [101] * len(keys)
+                    info = SimpleNamespace(size=lambda: 64, gva_list=lambda: [201])
+                    worker.m_store.batch_get_key_info.side_effect = lambda keys, info=info, **kwargs: [info] * len(keys)
+                    worker.m_store.batch_add_lease.side_effect = lambda keys, ttl: [0] * len(keys)
+
+                    save = self._make_gva_request(num_groups=3, can_save=True)
+                    worker._alloc_gvas_for_save([save])
+                    self.assertEqual(save.save_keys, expected_keys)
+                    self.assertEqual(
+                        [key for call in worker.m_store.batch_alloc.call_args_list for key in call.args[0]],
+                        expected_keys,
+                    )
+                    self.assertEqual([blocks.tolist() for blocks in save.block_ids_by_group_np], [[7], [8], [9]])
+                    self.assertEqual(
+                        [gvas.tolist() for gvas in save.block_gvas_by_group_np],
+                        [[101], [0] if paired else [101], [101]],
+                    )
+
+                    load = self._make_gva_request(num_groups=3, load_spec=LoadSpec(0, 16, True))
+                    worker._prepare_load_gvas([load])
+                    self.assertEqual(load.load_keys, expected_keys)
+                    self.assertEqual(
+                        [key for call in worker.m_store.batch_add_lease.call_args_list for key in call.args[0]],
+                        expected_keys,
+                    )
+                    self.assertEqual([blocks.tolist() for blocks in load.block_ids_by_group_np], [[7], [8], [9]])
+                    self.assertEqual(
+                        [gvas.tolist() for gvas in load.load_block_gvas_by_group_np],
+                        [[201], [] if paired else [201], [201]],
+                    )
+                    self.assertEqual(load.partial_load_gva_per_group, [0, 0, 0])
+
     def test_set_external_slot_release_waiter_gated_on_layerwise_transfer(self):
         waiter = MagicMock()
 

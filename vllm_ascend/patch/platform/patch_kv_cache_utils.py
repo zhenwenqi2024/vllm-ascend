@@ -639,6 +639,21 @@ def _ascend_get_kv_cache_config_from_groups(
         # Preserve the worker-derived ownership through that deepcopy. Remove
         # this bridge once upstream KVCacheConfig carries per-layer ownership.
         kv_cache_config.dspark_context_group_ids = resident_mla_context_group_ids(kv_cache_config.kv_cache_groups)
+        draft_only_group_ids = []
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            group_spec = group.kv_cache_spec
+            specs = (
+                tuple(group_spec.kv_cache_specs.values())
+                if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                else (group_spec,)
+            )
+            # Keep mixed target/draft groups in the ordinary target lookup.
+            # Empty PP-local layer names still carry the global group spec.
+            if specs and all(
+                isinstance(spec, MLAAttentionSpec) and spec.non_causal_multi_token_decode for spec in specs
+            ):
+                draft_only_group_ids.append(group_id)
+        kv_cache_config.dspark_draft_only_group_ids = tuple(draft_only_group_ids)
     return kv_cache_config
 
 

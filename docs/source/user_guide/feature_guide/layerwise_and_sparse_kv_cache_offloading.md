@@ -403,12 +403,22 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /path/to/target \
     ...
 ```
 
-Keep Prefill eager and disable prefix caching on both nodes. Auxiliary capture
+Keep Prefill eager and disable local vLLM prefix caching on both nodes. Auxiliary capture
 layers are resolved from the draft checkpoint; no separate layer-ID setting is
 needed. Prefill projects the target's prompt features locally and writes its
 own draft KV. The SFA producer connector transfers those pages alongside target
 KV, and Decode waits for both transfers before decoding. Hidden features are
 not sent to Decode for prompt-KV reconstruction.
+
+The Prefill Memcache layerwise store can reuse external prefixes independently
+of the local prefix-caching switch. It saves draft KV under checkpoint-specific
+companion keys, without placing the live draft pages in target scratch buffers.
+A prefix is usable only when every target stage and every final-stage draft TP
+rank has saved it. Prefill restores draft pages into the new request's NPU block
+table, projects only the remaining prompt features, then transfers the completed
+target and draft KV to Decode. The final Eagle recomputation block is retained
+even on a complete store hit. Missing draft companions make the prefix a miss;
+load failures after lookup fail closed rather than using uninitialized draft KV.
 
 Enable sparse offload only on Decode, with the consumer connector and
 `fused_copy_sfa` configuration above. For draft8, set `topk_buffer_size` to at
@@ -419,9 +429,10 @@ size. Remote DSpark draft-KV transfer does not support PCP or DCP.
 
 Only the target's main KV is offloaded to the host. The loaded draft supplies
 its cache-layer ownership, and its full context KV stays in device memory.
-Layerwise Prefill Offload excludes draft pages from its shared scratch pool
-only when target-layer buffer reuse is active. Without buffer reuse, AscendStore
-retains its original target-and-draft pool registration and addressing.
+Layerwise Prefill Offload excludes draft pages from its shared scratch pool.
+The paired prefix-store path also keeps draft save/load separate from target
+layer hooks, including when target buffers are not reused. Other store paths
+retain their original registration and addressing.
 Account for this context-dependent HBM cost when sizing long-context serving;
 target offload alone does not establish 1M-context DSpark support.
 

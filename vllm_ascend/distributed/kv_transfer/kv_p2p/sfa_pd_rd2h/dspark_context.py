@@ -67,7 +67,7 @@ def get_pd_dspark_aux_layer_ids(vllm_config: VllmConfig) -> tuple[int, ...]:
         raise ValueError("P-side DSpark draft KV generation currently requires eager prefill.")
     if vllm_config.cache_config.enable_prefix_caching:
         raise ValueError(
-            "P-side DSpark draft KV generation requires prefix caching disabled until draft-cache reuse exists."
+            "P-side DSpark requires local prefix caching disabled; paired AscendStore prefix reuse is separate."
         )
     layer_ids = get_dspark_aux_layer_ids(vllm_config)
     if not layer_ids:
@@ -132,6 +132,25 @@ def find_dspark_kv_connector(connector: Any) -> Any:
     if len(matches) != 1:
         raise RuntimeError("DSpark KV transfer requires exactly one SFA PD connector")
     return matches[0]
+
+
+def find_dspark_prefix_connector(connector: Any, metadata: Any) -> tuple[Any, Any] | None:
+    """Pair the optional external draft-prefix store with this step's metadata."""
+    pending = [(connector, metadata)]
+    matches = []
+    while pending:
+        current, current_meta = pending.pop()
+        children = getattr(current, "_connectors", ())
+        if children:
+            child_metadata = getattr(current_meta, "metadata", ())
+            if len(children) != len(child_metadata):
+                raise RuntimeError("DSpark MultiConnector children and metadata are not aligned")
+            pending.extend(zip(children, child_metadata))
+        elif getattr(current, "dspark_prefix_cache_enabled", False):
+            matches.append((current, current_meta))
+    if len(matches) > 1:
+        raise RuntimeError("DSpark prefix reuse requires exactly one paired target/draft store")
+    return matches[0] if matches else None
 
 
 def configure_dspark_kv_transfer(
@@ -208,6 +227,9 @@ def send_dspark_prefill_kv(
     connector: Any,
     progress: dict[str, tuple[str, int]],
     finished_req_ids: Sequence[str],
+    *,
+    prefix_connector: Any = None,
+    prefix_metadata: Any = None,
 ) -> None:
     """Project each P prefill chunk locally, then transfer completed draft pages.
 
@@ -238,15 +260,6 @@ def send_dspark_prefill_kv(
             raise RuntimeError("P produced a different number of DSpark auxiliary states than the configured schema")
         if features.ndim != 2 or features.shape[1] != descriptor.feature_width or features.dtype != torch.bfloat16:
             raise RuntimeError("P DSpark context must be a [tokens, aux_layers * hidden_size] BF16 tensor")
-        previous = progress.get(request_id)
-        expected_offset = 0 if previous is None else previous[1]
-        if previous is not None and previous[0] != descriptor.generation:
-            raise RuntimeError("P DSpark allocation generation changed during prompt prefill")
-        if offset != expected_offset:
-            raise RuntimeError(
-                f"P DSpark prefill chunks are not contiguous for {request_id}: "
-                f"expected offset {expected_offset}, received {offset}"
-            )
         row_begin = int(batch.query_start_loc_np[req_idx])
         if row_begin + scheduled > features.shape[0]:
             raise RuntimeError("P DSpark auxiliary rows do not cover the scheduled prompt chunk")
@@ -262,6 +275,19 @@ def send_dspark_prefill_kv(
             source_blocks_by_group[group_id] = tuple(local_block_ids[group_id][:needed])
             if len(source_blocks_by_group[group_id]) != needed:
                 raise RuntimeError(f"P DSpark draft KV group {group_id} does not cover the prefill chunk")
+        previous = progress.get(request_id)
+        expected_offset = 0 if previous is None else previous[1]
+        if previous is None and offset and prefix_connector is not None:
+            expected_offset = prefix_connector.restore_dspark_prefix(
+                prefix_metadata, request_id, offset, source_blocks_by_group
+            )
+        if previous is not None and previous[0] != descriptor.generation:
+            raise RuntimeError("P DSpark allocation generation changed during prompt prefill")
+        if offset != expected_offset:
+            raise RuntimeError(
+                f"P DSpark prefill chunks are not contiguous for {request_id}: "
+                f"expected offset {expected_offset}, received {offset}"
+            )
         for sent in range(0, context_tokens, MAX_DSPARK_CONTEXT_CHUNK_TOKENS):
             count = min(MAX_DSPARK_CONTEXT_CHUNK_TOKENS, context_tokens - sent)
             speculator.initialize_local_context(
@@ -270,6 +296,8 @@ def send_dspark_prefill_kv(
                 source_blocks_by_group,
             )
         next_offset = offset + context_tokens
+        if prefix_connector is not None:
+            prefix_connector.save_dspark_prefix(prefix_metadata, request_id, next_offset, source_blocks_by_group)
         progress[request_id] = (descriptor.generation, next_offset)
         if next_offset == prompt_tokens:
             connector.send_dspark_draft_kv(request_id, descriptor, source_blocks_by_group)

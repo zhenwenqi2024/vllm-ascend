@@ -69,6 +69,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context impor
     bind_dspark_context_receiver,
     configure_dspark_kv_transfer,
     find_dspark_context_connector,
+    find_dspark_prefix_connector,
     get_pd_dspark_aux_layer_ids,
     send_dspark_prefill_kv,
 )
@@ -565,6 +566,7 @@ class NPUModelRunner(GPUModelRunner):
             if scheduler_output.total_num_scheduled_tokens:
                 raise RuntimeError("P produced no target auxiliary states for an active remote DSpark request")
             return
+        prefix_store = find_dspark_prefix_connector(get_kv_transfer_group(), scheduler_output.kv_connector_metadata)
         send_dspark_prefill_kv(
             self.speculator,
             state.input_batch,
@@ -573,6 +575,8 @@ class NPUModelRunner(GPUModelRunner):
             connector,
             self._dspark_prefill_progress,
             getattr(scheduler_output, "finished_req_ids", ()) or (),
+            prefix_connector=prefix_store[0] if prefix_store is not None else None,
+            prefix_metadata=prefix_store[1] if prefix_store is not None else None,
         )
 
     @torch.inference_mode()

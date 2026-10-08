@@ -57,6 +57,101 @@ def test_dspark_producer_does_not_skip_aux_states_on_repeated_prefix(cached_pref
     assert connector._requests_to_connector == {}
 
 
+def _dspark_producer_config():
+    return SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MultiConnector",
+            is_kv_producer=True,
+            is_kv_consumer=False,
+            kv_connector_extra_config={"connectors": [{"kv_connector": "SfaRemoteD2HConnector"}]},
+        ),
+        speculative_config=SimpleNamespace(method="dspark"),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
+    )
+
+
+def test_dspark_complete_prefix_provider_enables_only_its_lookup():
+    config = _dspark_producer_config()
+    target_only = SimpleNamespace(
+        configure_dspark_prefix_cache=MagicMock(return_value=False),
+        get_num_new_matched_tokens=MagicMock(return_value=(1024, True)),
+        has_preempted_request=MagicMock(return_value=True),
+    )
+    joint_store = SimpleNamespace(
+        configure_dspark_prefix_cache=MagicMock(return_value=True),
+        get_num_new_matched_tokens=MagicMock(return_value=(128, False)),
+    )
+    with patch.object(MultiConnector, "__init__", return_value=None):
+        connector = AscendMultiConnector.__new__(AscendMultiConnector)
+        connector._connectors = [target_only, joint_store]
+        connector._requests_to_connector = {}
+        connector.__init__(config, object(), None)
+
+    assert connector._requires_full_dspark_prompt is False
+    assert connector._dspark_prefix_provider_index == 1
+    request = SimpleNamespace(request_id="paired-prefix")
+    with patch.object(MultiConnector, "get_num_new_matched_tokens") as parent:
+        assert connector.get_num_new_matched_tokens(request, 0) == (128, False)
+    joint_store.get_num_new_matched_tokens.assert_called_once_with(request, 0)
+    target_only.get_num_new_matched_tokens.assert_not_called()
+    target_only.has_preempted_request.assert_not_called()
+    parent.assert_not_called()
+    assert connector._requests_to_connector == {request.request_id: 1}
+
+
+@pytest.mark.parametrize("hit", [(0, False), (None, False)])
+def test_dspark_missing_joint_prefix_does_not_fall_back_to_target_only_hit(hit):
+    target_only = SimpleNamespace(get_num_new_matched_tokens=MagicMock(return_value=(1024, True)))
+    joint_store = SimpleNamespace(get_num_new_matched_tokens=MagicMock(return_value=hit))
+    connector = AscendMultiConnector.__new__(AscendMultiConnector)
+    connector._requires_full_dspark_prompt = False
+    connector._dspark_prefix_provider_index = 1
+    connector._connectors = [target_only, joint_store]
+    connector._requests_to_connector = {}
+    request = SimpleNamespace(request_id="incomplete-prefix")
+    with patch.object(MultiConnector, "get_num_new_matched_tokens") as parent:
+        assert connector.get_num_new_matched_tokens(request, 0) == hit
+    target_only.get_num_new_matched_tokens.assert_not_called()
+    parent.assert_not_called()
+    assert connector._requests_to_connector == {}
+
+
+def test_nested_dspark_prefix_provider_keeps_exact_metadata_route():
+    config = _dspark_producer_config()
+    store = SimpleNamespace(
+        configure_dspark_prefix_cache=MagicMock(return_value=True),
+        get_num_new_matched_tokens=MagicMock(return_value=(128, False)),
+    )
+    nested = AscendMultiConnector.__new__(AscendMultiConnector)
+    nested._connectors = [SimpleNamespace(), store]
+    nested._requests_to_connector = {}
+    nested._requires_full_dspark_prompt = True
+    connector = AscendMultiConnector.__new__(AscendMultiConnector)
+    connector._connectors = [nested, SimpleNamespace()]
+    connector._requests_to_connector = {}
+    connector._requires_full_dspark_prompt = True
+
+    assert connector.configure_dspark_prefix_cache(config)
+    assert connector._dspark_prefix_provider_index == 0
+    assert nested._dspark_prefix_provider_index == 1
+    # Configuration is recursive and lookup stays with the matching child;
+    # normal MultiConnector metadata nesting need not be flattened.
+    connector._requires_full_dspark_prompt = nested._requires_full_dspark_prompt = False
+    request = SimpleNamespace(request_id="nested-prefix")
+    assert connector.get_num_new_matched_tokens(request, 0) == (128, False)
+    assert connector._requests_to_connector == {request.request_id: 0}
+    assert nested._requests_to_connector == {request.request_id: 1}
+
+
+def test_dspark_prefix_provider_must_be_unique():
+    connector = AscendMultiConnector.__new__(AscendMultiConnector)
+    connector._connectors = [
+        SimpleNamespace(configure_dspark_prefix_cache=MagicMock(return_value=True)) for _ in range(2)
+    ]
+    with pytest.raises(ValueError, match="exactly one"):
+        connector.configure_dspark_prefix_cache(_dspark_producer_config())
+
+
 def test_legacy_prefix_lookup_and_preempted_connector_priority_are_unchanged():
     connector = AscendMultiConnector.__new__(AscendMultiConnector)
     connector._requires_full_dspark_prompt = False

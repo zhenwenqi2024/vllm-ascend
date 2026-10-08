@@ -20,7 +20,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context impor
     configure_dspark_kv_transfer,
     find_dspark_context_connector,
     find_dspark_kv_connector,
+    find_dspark_prefix_connector,
     resident_mla_context_group_ids,
+    send_dspark_prefill_kv,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_kv import (
     DraftKVCacheMetadata,
@@ -130,6 +132,23 @@ def test_multiconnector_routes_context_to_its_exact_child_metadata(nested):
         wrapper = SimpleNamespace(_connectors=[wrapper])
         metadata = SimpleNamespace(metadata=(metadata,))
     assert find_dspark_context_connector(wrapper, metadata) == (pd, pd_meta)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_prefix_store_metadata_route_is_independent_of_sfa_child_order(nested):
+    store = SimpleNamespace(dspark_prefix_cache_enabled=True)
+    store_metadata = object()
+    wrapper = SimpleNamespace(_connectors=[store, SimpleNamespace()])
+    metadata = SimpleNamespace(metadata=(store_metadata, object()))
+    if nested:
+        wrapper = SimpleNamespace(_connectors=[SimpleNamespace(), wrapper])
+        metadata = SimpleNamespace(metadata=(object(), metadata))
+    assert find_dspark_prefix_connector(wrapper, metadata) == (store, store_metadata)
+
+
+def test_unconfigured_prefix_provider_has_no_metadata_route():
+    wrapper = SimpleNamespace(_connectors=[SimpleNamespace(dspark_prefix_cache_enabled=False)])
+    assert find_dspark_prefix_connector(wrapper, SimpleNamespace(metadata=(object(),))) is None
 
 
 def test_kv_connector_lookup_finds_unique_sfa_child():
@@ -447,6 +466,159 @@ def test_runner_writes_draft_kv_on_p_then_sends_only_page_metadata(monkeypatch, 
     torch.testing.assert_close(calls[1].args[1], features[66:73])
     pd.send_dspark_draft_kv.assert_called_once_with("request", descriptor, {0: tuple(range(18))})
     assert runner._dspark_prefill_progress == {}
+
+
+def _prefix_prefill_case(offset=4, prompt_tokens=12):
+    descriptor = _descriptor(prompt_tokens=prompt_tokens)
+    suffix_tokens = prompt_tokens - offset
+    calls = []
+    speculator = SimpleNamespace(
+        get_draft_context_group_layout=Mock(return_value=((0,), (0,), {0: 4})),
+        initialize_local_context=Mock(side_effect=lambda *args: calls.append(("project", args))),
+    )
+    connector = SimpleNamespace(
+        get_dspark_context_descriptor=Mock(return_value=descriptor),
+        send_dspark_draft_kv=Mock(side_effect=lambda *args: calls.append(("send", args))),
+    )
+    provider = SimpleNamespace(
+        restore_dspark_prefix=Mock(side_effect=lambda *args: calls.append(("restore", args)) or offset),
+        save_dspark_prefix=Mock(side_effect=lambda *args: calls.append(("save", args))),
+    )
+    aux = [torch.full((suffix_tokens, 4), index, dtype=torch.bfloat16) for index in range(5)]
+    batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=[descriptor.request_id],
+        prefill_len_np=[prompt_tokens],
+        num_computed_tokens_np=[offset],
+        num_scheduled_tokens=[suffix_tokens],
+        query_start_loc_np=[0, suffix_tokens],
+    )
+    requests = {descriptor.request_id: SimpleNamespace(local_block_ids=[[3, 4, 5]])}
+    return descriptor, speculator, connector, provider, aux, batch, requests, calls
+
+
+@pytest.mark.parametrize("offset", [4, 8])
+def test_prefix_restore_precedes_suffix_projection_and_complete_draft_transfer(offset):
+    descriptor, speculator, connector, provider, aux, batch, requests, calls = _prefix_prefill_case(offset)
+    metadata = object()
+    progress = {}
+
+    send_dspark_prefill_kv(
+        speculator,
+        batch,
+        aux,
+        requests,
+        connector,
+        progress,
+        (),
+        prefix_connector=provider,
+        prefix_metadata=metadata,
+    )
+
+    assert [name for name, _ in calls] == ["restore", "project", "save", "send"]
+    blocks = {0: (3, 4, 5)}
+    provider.restore_dspark_prefix.assert_called_once_with(metadata, descriptor.request_id, offset, blocks)
+    chunk, features, source_blocks = speculator.initialize_local_context.call_args.args
+    assert (chunk.token_offset, chunk.num_tokens) == (offset, descriptor.prompt_tokens - offset)
+    assert source_blocks == blocks
+    torch.testing.assert_close(features, torch.cat(aux, dim=-1))
+    provider.save_dspark_prefix.assert_called_once_with(metadata, descriptor.request_id, 12, blocks)
+    connector.send_dspark_draft_kv.assert_called_once_with(descriptor.request_id, descriptor, blocks)
+    assert progress == {}
+
+
+def test_prefix_is_restored_once_across_chunked_suffix_prefill():
+    descriptor, speculator, connector, provider, aux, batch, requests, calls = _prefix_prefill_case()
+    metadata = object()
+    progress = {}
+    batch.num_scheduled_tokens = [4]
+    batch.query_start_loc_np = [0, 4]
+    send_dspark_prefill_kv(
+        speculator,
+        batch,
+        [features[:4] for features in aux],
+        requests,
+        connector,
+        progress,
+        (),
+        prefix_connector=provider,
+        prefix_metadata=metadata,
+    )
+    assert progress == {descriptor.request_id: (descriptor.generation, 8)}
+    connector.send_dspark_draft_kv.assert_not_called()
+
+    batch.num_computed_tokens_np = [8]
+    send_dspark_prefill_kv(
+        speculator,
+        batch,
+        [features[4:] for features in aux],
+        requests,
+        connector,
+        progress,
+        (),
+        prefix_connector=provider,
+        prefix_metadata=metadata,
+    )
+    assert [name for name, _ in calls] == ["restore", "project", "save", "project", "save", "send"]
+    provider.restore_dspark_prefix.assert_called_once()
+    assert [
+        (call.args[0].token_offset, call.args[0].num_tokens)
+        for call in speculator.initialize_local_context.call_args_list
+    ] == [
+        (4, 4),
+        (8, 4),
+    ]
+    assert [call.args[2] for call in provider.save_dspark_prefix.call_args_list] == [8, 12]
+    assert progress == {}
+
+
+@pytest.mark.parametrize("restored_tokens", [0, 3])
+def test_incomplete_draft_prefix_proof_stops_before_projection(restored_tokens):
+    _, speculator, connector, provider, aux, batch, requests, _ = _prefix_prefill_case()
+    provider.restore_dspark_prefix.side_effect = None
+    provider.restore_dspark_prefix.return_value = restored_tokens
+    with pytest.raises(RuntimeError, match="chunks are not contiguous"):
+        send_dspark_prefill_kv(
+            speculator,
+            batch,
+            aux,
+            requests,
+            connector,
+            {},
+            (),
+            prefix_connector=provider,
+            prefix_metadata=object(),
+        )
+    speculator.initialize_local_context.assert_not_called()
+    provider.save_dspark_prefix.assert_not_called()
+    connector.send_dspark_draft_kv.assert_not_called()
+
+
+def test_target_only_prefix_cannot_skip_missing_draft_context():
+    _, speculator, connector, _, aux, batch, requests, _ = _prefix_prefill_case()
+    with pytest.raises(RuntimeError, match="prefix|contiguous"):
+        send_dspark_prefill_kv(speculator, batch, aux, requests, connector, {}, ())
+    speculator.initialize_local_context.assert_not_called()
+    connector.send_dspark_draft_kv.assert_not_called()
+
+
+def test_failed_prefix_save_does_not_publish_pd_draft_transfer():
+    _, speculator, connector, provider, aux, batch, requests, _ = _prefix_prefill_case()
+    provider.save_dspark_prefix.side_effect = RuntimeError("draft prefix save failed")
+    with pytest.raises(RuntimeError, match="save failed"):
+        send_dspark_prefill_kv(
+            speculator,
+            batch,
+            aux,
+            requests,
+            connector,
+            {},
+            (),
+            prefix_connector=provider,
+            prefix_metadata=object(),
+        )
+    speculator.initialize_local_context.assert_called_once()
+    connector.send_dspark_draft_kv.assert_not_called()
 
 
 def test_context_slots_allow_incremental_p_prefill_allocation():

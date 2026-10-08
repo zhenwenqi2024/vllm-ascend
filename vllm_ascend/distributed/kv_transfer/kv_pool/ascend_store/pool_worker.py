@@ -48,6 +48,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.session_tr
     LayerwiseSessionTracker,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import (
+    DSparkPrefixCache,
+    DSparkPrefixKeys,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
     KVCacheStoreBatch,
     KVCacheStoreKeyLayerRecvingThread,
@@ -161,6 +165,8 @@ class KVPoolWorker:
         self._init_backend(parallel_config, extra_config, memcache_dp_init_barrier)
         self._init_kv_events(vllm_config)
         self._init_state_vars()
+        self._dspark_prefix_keys: DSparkPrefixKeys | None = None
+        self.dspark_prefix_cache: DSparkPrefixCache | None = None
         self._init_layerwise_config()
         self._kv_stats = AscendStoreKVConnectorStats()
         self._kv_stats_lock = threading.Lock()
@@ -532,7 +538,11 @@ class KVPoolWorker:
                     base_layers,
                     self._extra_config,
                 )
-                if draft_names and not self._layerwise_reuse_layout.has_layer_reuse:
+                if (
+                    draft_names
+                    and not self._layerwise_reuse_layout.has_layer_reuse
+                    and getattr(self, "_dspark_prefix_keys", None) is None
+                ):
                     # Without scratch reuse, retain the original target+draft
                     # pool for prefix storage and load/save addressing.
                     self._dspark_draft_layer_names = draft_names = set()
@@ -1024,8 +1034,46 @@ class KVPoolWorker:
             assert new_start >= storage_key, "invalid kv cache tensor, raw tensor ptr must be align to 2MB"
             registered_regions[storage_key] = (new_start, end)
 
+    def configure_dspark_prefix_cache(self, keys: DSparkPrefixKeys) -> None:
+        self._dspark_prefix_keys = keys
+        self._dspark_draft_layer_names = set(getattr(self.kv_cache_config, "dspark_draft_layer_names", ()))
+        assert self.kv_cache_config is not None
+        # Companion objects own draft-only groups; retain original group IDs
+        # and the existing cacheability policy for the ordinary target pool.
+        self.cacheable_group_ids = [
+            group_id
+            for group_id in self.cacheable_group_ids
+            if any(
+                name not in self._dspark_draft_layer_names
+                for name in self.kv_cache_config.kv_cache_groups[group_id].layer_names
+            )
+        ]
+        # A non-reuse initial plan may have included draft physical layers.
+        # Reset the target hook extent before rebuilding its separate view.
+        self.num_layers = len(
+            {
+                self._extract_physical_layer_index(name)
+                for group in self.kv_cache_config.kv_cache_groups
+                for name in group.layer_names
+                if name not in self._dspark_draft_layer_names
+            }
+        )
+        self._init_layerwise_config()
+
+    def _copy_dspark_prefix(self, gvas: Any, addrs: Any, sizes: Any, direction: int) -> int:
+        assert isinstance(self.kv_recv_thread, KVTransferThread)
+        return self.kv_recv_thread._batch_copy_with_limits(
+            gvas,
+            addrs,
+            sizes,
+            direction,
+            self.layerwise_max_transfer_blocks,
+            self.layerwise_max_transfer_bytes,
+        )
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         draft_names = getattr(self, "_dspark_draft_layer_names", ())
+        draft_caches = {name: cache for name, cache in kv_caches.items() if name in draft_names}
         if draft_names:
             kv_caches = {name: cache for name, cache in kv_caches.items() if name not in draft_names}
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
@@ -1035,6 +1083,24 @@ class KVPoolWorker:
         self.num_blocks = (
             self.kv_cache_config.num_blocks if self.kv_cache_config is not None else first_kv_cache.shape[0]
         )
+        prefix_keys: DSparkPrefixKeys | None = getattr(self, "_dspark_prefix_keys", None)
+        if prefix_keys is not None and self.pp_rank == self.pp_size - 1:
+            self.dspark_prefix_cache = DSparkPrefixCache(
+                prefix_keys,
+                self.m_store,
+                self.tp_rank,
+                self.block_size,
+                self.hash_block_size,
+                self._copy_dspark_prefix,
+            )
+            assert self.kv_cache_config is not None
+            layer_group_ids = {
+                name: group_id
+                for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                for name in group.layer_names
+                if name in draft_names
+            }
+            self.dspark_prefix_cache.register(draft_caches, layer_group_ids, self.original_block_size, self.num_blocks)
         logger.info("num_blocks: %s", self.num_blocks)
         self.block_len = []
         self.block_stride = []
@@ -1071,7 +1137,10 @@ class KVPoolWorker:
         self.kv_caches_base_addr = []
 
         registered_regions: dict[int, tuple[int, int]] = {}
-        for cache_or_caches in kv_caches.values():
+        registration_caches = (
+            {**kv_caches, **draft_caches} if getattr(self, "dspark_prefix_cache", None) is not None else kv_caches
+        )
+        for cache_or_caches in registration_caches.values():
             for cache in self._as_cache_tuple(cache_or_caches):
                 base_addr = cache.data_ptr()
                 _, _, region_len, _ = self._get_cache_block_metadata(cache)
