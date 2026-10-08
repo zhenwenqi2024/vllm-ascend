@@ -87,7 +87,7 @@ def test_d_checkpoint_without_p_option_does_not_enable_prefill_capture():
 @pytest.mark.parametrize("sfa", [False, True])
 def test_backend_opt_in_follows_exact_connector_in_nested_multi(nested, sfa):
     config = _config()
-    child = {"kv_connector": "SfaRemoteD2HConnector" if sfa else "MooncakeConnector"}
+    child: dict[str, object] = {"kv_connector": "SfaRemoteD2HConnector" if sfa else "MooncakeConnector"}
     if nested:
         child = {"kv_connector": "MultiConnector", "kv_connector_extra_config": {"connectors": [child]}}
     config.kv_transfer_config.kv_connector = "MultiConnector"
