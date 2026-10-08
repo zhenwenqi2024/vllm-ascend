@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 MAX_DSPARK_CONTEXT_CHUNK_TOKENS = 64
 
 
-def uses_dspark_kv_transfer(vllm_config: VllmConfig) -> bool:
+def uses_sfa_dspark_kv_transfer(vllm_config: VllmConfig) -> bool:
     """Opt into this backend's draft-KV protocol, including MultiConnector.
 
     P deliberately disables sparse offload, so connector selection, not the
@@ -54,7 +54,7 @@ def get_pd_dspark_aux_layer_ids(vllm_config: VllmConfig) -> tuple[int, ...]:
     before transferring those pages to D. This is intentionally different from
     a target-only feature-capture path.
     """
-    if not uses_dspark_kv_transfer(vllm_config):
+    if not uses_sfa_dspark_kv_transfer(vllm_config):
         return ()
     transfer = vllm_config.kv_transfer_config
     if transfer.is_kv_consumer or not transfer.is_kv_producer:
@@ -138,7 +138,7 @@ def configure_dspark_kv_transfer(
     vllm_config: VllmConfig, speculator: Any, kv_cache_config: Any, *, is_last_pp_rank: bool
 ) -> None:
     """Register loaded draft ownership only for this backend's PD protocol."""
-    if not is_last_pp_rank or not uses_dspark_kv_transfer(vllm_config):
+    if not is_last_pp_rank or not uses_sfa_dspark_kv_transfer(vllm_config):
         return
     if speculator is None:
         raise RuntimeError("DSpark KV transfer requires the loaded draft model on the final PP rank")
@@ -154,7 +154,7 @@ def bind_dspark_context_receiver(
     vllm_config: VllmConfig, *, sparse_offload_enabled: bool, is_last_pp_rank: bool, max_requests: int
 ) -> None:
     """Bind D readiness after cache allocation; the connector owns its receiver."""
-    if not sparse_offload_enabled or not is_last_pp_rank or not uses_dspark_kv_transfer(vllm_config):
+    if not sparse_offload_enabled or not is_last_pp_rank or not uses_sfa_dspark_kv_transfer(vllm_config):
         return
     if not vllm_config.kv_transfer_config.is_kv_consumer:
         return

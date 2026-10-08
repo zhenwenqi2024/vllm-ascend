@@ -159,9 +159,9 @@ def test_cache_coordinator_uses_kv_cache_config_retention_interval(retention_int
 
 
 class TestPCPPoolWorker(unittest.TestCase):
-    def test_dspark_draft_pages_are_not_target_pool_or_reuse_slots(self):
+    def test_dspark_draft_pool_exclusion_requires_layerwise_reuse(self):
         target_names = [f"model.layers.{index}.attn" for index in range(4)]
-        draft_names = [f"draft.layers.{index}.attn" for index in range(2)]
+        draft_names = [f"draft.layers.{index}.attn" for index in range(4, 6)]
         target = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.int8)
         draft = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.bfloat16)
         config = SimpleNamespace(
@@ -169,34 +169,15 @@ class TestPCPPoolWorker(unittest.TestCase):
             prefix_cache_retention_interval=0,
             kv_cache_groups=[
                 KVCacheGroupSpec(
-                    layer_names=draft_names,
+                    layer_names=target_names + draft_names,
                     kv_cache_spec=UniformTypeKVCacheSpecs(
-                        block_size=16, kv_cache_specs=dict.fromkeys(draft_names, draft)
-                    ),
-                ),
-                KVCacheGroupSpec(
-                    layer_names=target_names,
-                    kv_cache_spec=UniformTypeKVCacheSpecs(
-                        block_size=16, kv_cache_specs=dict.fromkeys(target_names, target)
+                        block_size=16,
+                        kv_cache_specs=dict.fromkeys(target_names, target) | dict.fromkeys(draft_names, draft),
                     ),
                 ),
             ],
             dspark_draft_layer_names=tuple(draft_names),
         )
-        worker = make_worker(
-            self,
-            num_layers=4,
-            num_hidden_layers=4,
-            use_layerwise=True,
-            extra_config={"backend": "memcache", "layerwise_num_shared_buffers": 1},
-            kv_cache_config=config,
-        )
-        self.assertEqual(worker.cacheable_group_ids, [1])  # Original group IDs are retained.
-        self.assertEqual(worker.prefetch_layer_map, {2: 1, 3: 2})
-        self.assertTrue(
-            all(item.main.spec is target for item in worker._layerwise_reuse_layout.layer_cache_specs.values())
-        )
-        worker._transfer_threads_started = True
         # Match the actual shared, 2 MiB-aligned kernel cache allocation.
         alignment = 2 * 1024 * 1024
         backing = torch.zeros(alignment + 4096, dtype=torch.uint8)
@@ -214,10 +195,57 @@ class TestPCPPoolWorker(unittest.TestCase):
             for names, spec in ((draft_names, draft), (target_names, target))
             for name in names
         }
-        worker.register_kv_caches(caches)
-        self.assertEqual(set(worker.kv_caches), set(target_names))
-        self.assertEqual(worker.group_num_layers, {0: 0, 1: 4})
-        self.assertTrue(set(draft_names) <= caches.keys())  # Caller-owned draft caches remain intact.
+        cases = [
+            (True, {"backend": "memcache", "layerwise_num_shared_buffers": 1}, True),
+            (True, {"backend": "memcache"}, False),
+            (True, {"backend": "memcache", "layerwise_num_shared_buffers": 6}, False),
+            (True, {"backend": "memcache", "layerwise_independent_layers": "all"}, False),
+            (True, {"backend": "mooncake"}, False),
+            (False, {"backend": "memcache", "layerwise_num_shared_buffers": 1}, False),
+        ]
+        for use_layerwise, extra_config, reuse in cases:
+            with self.subTest(use_layerwise=use_layerwise, extra_config=extra_config):
+                worker = make_worker(
+                    self,
+                    num_layers=4,
+                    num_hidden_layers=4,
+                    use_layerwise=use_layerwise,
+                    extra_config=extra_config,
+                    kv_cache_config=config,
+                )
+                self.assertEqual(worker.cacheable_group_ids, [0])
+                self.assertEqual(worker.layerwise_offload, reuse)
+                self.assertEqual(worker.prefetch_layer_map, {2: 1, 3: 2} if reuse else {})
+                if reuse:
+                    self.assertEqual(set(worker._layerwise_reuse_layout.layer_cache_specs), set(range(4)))
+                    self.assertTrue(
+                        all(
+                            item.main.spec is target
+                            for item in worker._layerwise_reuse_layout.layer_cache_specs.values()
+                        )
+                    )
+                worker._transfer_threads_started = True
+                worker.register_kv_caches(caches)
+                self.assertEqual(set(worker.kv_caches), set(target_names) if reuse else set(caches))
+                self.assertEqual(worker.group_num_layers, {0: 4 if reuse else 6})
+                self.assertTrue(set(draft_names) <= caches.keys())  # Caller-owned caches remain intact.
+
+        # Adding same-spec draft layers must not turn a non-reused target
+        # layout into scratch reuse: allocation keeps those draft pages private.
+        config.kv_cache_groups = [
+            KVCacheGroupSpec(layer_names=target_names + draft_names, kv_cache_spec=target),
+        ]
+        worker = make_worker(
+            self,
+            num_layers=4,
+            num_hidden_layers=4,
+            use_layerwise=True,
+            extra_config={"backend": "memcache", "layerwise_num_shared_buffers": 3},
+            kv_cache_config=config,
+        )
+        self.assertFalse(worker.layerwise_offload)
+        self.assertEqual(worker._dspark_draft_layer_names, set())
+        self.assertEqual(worker.num_layers, 6)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.threading.Event")
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreRecvingThread")

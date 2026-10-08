@@ -8,7 +8,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.v1.worker import mamba_utils
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import uses_dspark_kv_transfer
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import uses_sfa_dspark_kv_transfer
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -28,7 +28,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
 
         transfer = vllm_config.kv_transfer_config
         self._requires_full_dspark_prompt = (
-            uses_dspark_kv_transfer(vllm_config) and transfer.is_kv_producer and not transfer.is_kv_consumer
+            uses_sfa_dspark_kv_transfer(vllm_config) and transfer.is_kv_producer and not transfer.is_kv_consumer
         )
 
         self._all_support_hma = all(supports_hma(c) for c in self._connectors)

@@ -419,6 +419,9 @@ size. Remote DSpark draft-KV transfer does not support PCP or DCP.
 
 Only the target's main KV is offloaded to the host. The loaded draft supplies
 its cache-layer ownership, and its full context KV stays in device memory.
+Layerwise Prefill Offload excludes draft pages from its shared scratch pool
+only when target-layer buffer reuse is active. Without buffer reuse, AscendStore
+retains its original target-and-draft pool registration and addressing.
 Account for this context-dependent HBM cost when sizing long-context serving;
 target offload alone does not establish 1M-context DSpark support.
 

@@ -7,7 +7,7 @@ import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
     get_pd_dspark_aux_layer_ids,
-    uses_dspark_kv_transfer,
+    uses_sfa_dspark_kv_transfer,
 )
 
 
@@ -94,7 +94,7 @@ def test_backend_opt_in_follows_exact_connector_in_nested_multi(nested, sfa):
     config.kv_transfer_config.kv_connector_extra_config = {
         "connectors": [{"kv_connector": "AscendStoreConnector"}, child]
     }
-    assert uses_dspark_kv_transfer(config) is sfa
+    assert uses_sfa_dspark_kv_transfer(config) is sfa
     assert get_pd_dspark_aux_layer_ids(config) == ((2, 22, 38, 58, 74) if sfa else ())
 
 
@@ -102,5 +102,5 @@ def test_backend_opt_in_follows_exact_connector_in_nested_multi(nested, sfa):
 def test_other_pd_backends_do_not_apply_sfa_prefill_constraints(connector):
     config = _config(eager=False, prefix=True, pcp=2)
     config.kv_transfer_config.kv_connector = connector
-    assert not uses_dspark_kv_transfer(config)
+    assert not uses_sfa_dspark_kv_transfer(config)
     assert get_pd_dspark_aux_layer_ids(config) == ()

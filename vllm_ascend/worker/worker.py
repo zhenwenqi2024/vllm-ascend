@@ -84,7 +84,7 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
-from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import uses_dspark_kv_transfer
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import uses_sfa_dspark_kv_transfer
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     build_layerwise_cache_layout,
     build_layerwise_reuse_layout,
@@ -1108,9 +1108,10 @@ class NPUWorker(WorkerBase):
         extra_config = get_layerwise_reuse_config(self.vllm_config.kv_transfer_config)
         if extra_config is not None:
             speculator = getattr(self.model_runner, "speculator", None)
+            speculative = self.vllm_config.speculative_config
             draft_names = (
                 set(speculator.draft_attn_layer_names)
-                if uses_dspark_kv_transfer(self.vllm_config) and speculator is not None
+                if speculative is not None and speculative.method == "dspark" and speculator is not None
                 else set()
             )
             self._gva_layerwise_memory_info = self._get_layerwise_kv_cache_memory_info(
@@ -1173,7 +1174,16 @@ class NPUWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
         speculator = getattr(self.model_runner, "speculator", None)
-        if uses_dspark_kv_transfer(self.vllm_config) and speculator is not None:
+        speculative = self.vllm_config.speculative_config
+        if (
+            speculative is not None
+            and speculative.method == "dspark"
+            and speculator is not None
+            and (
+                uses_sfa_dspark_kv_transfer(self.vllm_config)
+                or get_layerwise_reuse_config(self.vllm_config.kv_transfer_config) is not None
+            )
+        ):
             # Connector construction must see loader-owned draft caches before
             # planning target layerwise scratch buffers or pool transfers.
             kv_cache_config.dspark_draft_layer_names = tuple(sorted(speculator.draft_attn_layer_names))

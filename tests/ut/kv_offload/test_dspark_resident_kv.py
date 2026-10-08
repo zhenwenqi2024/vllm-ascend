@@ -185,14 +185,20 @@ def test_other_pd_backend_preserves_original_dspark_loading():
     assert runner.pd_dspark_aux_layer_ids == ()
 
 
-@pytest.mark.parametrize("connector", [None, "MooncakeConnector", "SfaRemoteD2HConnector"])
+@pytest.mark.parametrize("connector", [None, "MooncakeConnector", "SfaRemoteD2HConnector", "AscendStoreConnector"])
 @pytest.mark.parametrize("method", ["dspark", "mtp", "eagle3"])
-def test_worker_registers_draft_ownership_before_sfa_connector_construction_only(connector, method):
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_worker_registers_draft_ownership_before_sfa_or_layerwise_connector_construction(connector, method, layerwise):
     from vllm_ascend.worker import worker as module
 
     worker = module.NPUWorker.__new__(module.NPUWorker)
     transfer = (
-        SimpleNamespace(kv_connector=connector, kv_connector_extra_config={}, is_kv_producer=True, is_kv_consumer=False)
+        SimpleNamespace(
+            kv_connector=connector,
+            kv_connector_extra_config={"backend": "memcache", "use_layerwise": layerwise},
+            is_kv_producer=True,
+            is_kv_consumer=False,
+        )
         if connector is not None
         else None
     )
@@ -206,7 +212,9 @@ def test_worker_registers_draft_ownership_before_sfa_connector_construction_only
     )
     worker.use_v2_model_runner = True
     cache_config = SimpleNamespace(has_mamba_layers=False, needs_kv_cache_zeroing=False)
-    enabled = method == "dspark" and connector == "SfaRemoteD2HConnector"
+    enabled = method == "dspark" and (
+        connector == "SfaRemoteD2HConnector" or connector == "AscendStoreConnector" and layerwise
+    )
 
     def check_registration(config, cache):
         assert config is worker.vllm_config
@@ -221,7 +229,7 @@ def test_worker_registers_draft_ownership_before_sfa_connector_construction_only
 
 @pytest.mark.parametrize("pd_connector", ["SfaRemoteD2HConnector", "MooncakeConnector"])
 @pytest.mark.parametrize("method", ["dspark", "mtp", "eagle3"])
-def test_worker_excludes_persistent_draft_from_layerwise_budget_only_for_sfa_pd(pd_connector, method):
+def test_worker_excludes_persistent_draft_from_layerwise_budget_for_any_dspark_connector(pd_connector, method):
     from vllm_ascend.worker import worker as module
 
     worker = module.NPUWorker.__new__(module.NPUWorker)
@@ -250,7 +258,7 @@ def test_worker_excludes_persistent_draft_from_layerwise_budget_only_for_sfa_pd(
         ),
     ):
         assert worker.get_kv_cache_spec() is specs
-    excluded = {"draft.attn"} if method == "dspark" and pd_connector == "SfaRemoteD2HConnector" else set()
+    excluded = {"draft.attn"} if method == "dspark" else set()
     worker._get_layerwise_kv_cache_memory_info.assert_called_once_with(specs, {}, excluded_layer_names=excluded)
 
 

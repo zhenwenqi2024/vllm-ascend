@@ -235,15 +235,10 @@ class KVPoolWorker:
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
-        self._dspark_draft_layer_names = set(getattr(kv_cache_config, "dspark_draft_layer_names", ()))
-        # SFA PD owns direct draft-KV transfer. AscendStore keeps only the
-        # target's layerwise pool, retaining original scheduler group IDs.
-        self.cacheable_group_ids = [
-            group_id
-            for group_id in infer_cacheable_group_ids(kv_cache_groups)
-            if kv_cache_groups is None
-            or any(name not in self._dspark_draft_layer_names for name in kv_cache_groups[group_id].layer_names)
-        ]
+        self._dspark_draft_layer_names = (
+            set(getattr(kv_cache_config, "dspark_draft_layer_names", ())) if self.use_layerwise_transfer else set()
+        )
+        self.cacheable_group_ids = infer_cacheable_group_ids(kv_cache_groups)
         cacheable_block_sizes = [self.original_block_size[i] for i in self.cacheable_group_ids]
         if (
             self.use_layerwise
@@ -524,16 +519,24 @@ class KVPoolWorker:
 
         if self.kv_cache_config is not None:
             draft_names = getattr(self, "_dspark_draft_layer_names", ())
-            target_specs = {
-                name: spec
-                for name, spec in get_layerwise_kv_cache_specs(self.kv_cache_config).items()
-                if name not in draft_names
-            }
+            layer_specs = get_layerwise_kv_cache_specs(self.kv_cache_config)
+            target_specs = {name: spec for name, spec in layer_specs.items() if name not in draft_names}
             base_layers = getattr(
                 self.hf_config,
                 "num_hidden_layers",
                 self.num_layers,
             )
+            if self.use_layerwise_transfer:
+                self._layerwise_reuse_layout = build_layerwise_reuse_layout(
+                    target_specs,
+                    base_layers,
+                    self._extra_config,
+                )
+                if draft_names and not self._layerwise_reuse_layout.has_layer_reuse:
+                    # Without scratch reuse, retain the original target+draft
+                    # pool for prefix storage and load/save addressing.
+                    self._dspark_draft_layer_names = draft_names = set()
+                    target_specs = layer_specs
             physical_layers = {
                 self._extract_physical_layer_index(layer_name)
                 for group_spec in self.kv_cache_config.kv_cache_groups
@@ -558,13 +561,6 @@ class KVPoolWorker:
                         effective_num_layers,
                     )
                     self.num_layers = effective_num_layers
-            if self.use_layerwise_transfer:
-                self._layerwise_reuse_layout = build_layerwise_reuse_layout(
-                    target_specs,
-                    base_layers,
-                    self._extra_config,
-                )
-
         if self.kv_cache_config is not None and self.num_kv_cache_groups > 1:
             for group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
                 if group_id not in self.cacheable_group_ids:
