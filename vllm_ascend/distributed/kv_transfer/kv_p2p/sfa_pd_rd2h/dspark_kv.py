@@ -5,10 +5,68 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any
+
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.kv_cache_interface import KVCacheSpec
 
 MAX_DRAFT_KV_READ_DESCRIPTORS = 1024
+
+
+def get_resident_dspark_layer_names(
+    vllm_config: VllmConfig,
+    speculator: Any,
+    *,
+    sparse_offload_enabled: bool,
+    is_last_pp_rank: bool,
+    shared_kv_cache_layers: Mapping[str, str] | None = None,
+) -> set[str]:
+    """Resolve and validate draft residency without inspecting inactive paths."""
+    speculative = getattr(vllm_config, "speculative_config", None)
+    if not sparse_offload_enabled or not is_last_pp_rank or speculative is None or speculative.method != "dspark":
+        return set()
+    names = getattr(speculator, "draft_attn_layer_names", None)
+    if not names:
+        raise ValueError("Sparse KV offload requires DSpark cache ownership from the loaded draft model.")
+    forward_context = vllm_config.compilation_config.static_forward_context
+    shared_kv_cache_layers = shared_kv_cache_layers or {}
+    for name in names:
+        source = shared_kv_cache_layers.get(name) or getattr(
+            forward_context.get(name), "kv_sharing_target_layer_name", None
+        )
+        if source is not None and source not in names:
+            raise ValueError("Resident DSpark draft layers cannot share target-model KV caches.")
+    return set(names)
+
+
+def apply_dspark_resident_kv_specs(
+    specs: dict[str, KVCacheSpec],
+    vllm_config: VllmConfig,
+    speculator: Any,
+    *,
+    sparse_offload_enabled: bool,
+    is_last_pp_rank: bool,
+    shared_kv_cache_layers: Mapping[str, str] | None = None,
+) -> dict[str, KVCacheSpec]:
+    """Keep draft MLA pages in HBM without changing attention semantics."""
+    names = get_resident_dspark_layer_names(
+        vllm_config,
+        speculator,
+        sparse_offload_enabled=sparse_offload_enabled,
+        is_last_pp_rank=is_last_pp_rank,
+        shared_kv_cache_layers=shared_kv_cache_layers,
+    )
+    for name in names & specs.keys():
+        spec = specs[name]
+        if not isinstance(spec, AscendMLAAttentionSpec):
+            raise ValueError("Sparse KV offload currently requires an MLA DSpark draft checkpoint.")
+        # Preserve dtype, non-causal attention and CP layout; change placement only.
+        specs[name] = replace(spec, store_on_host=False)
+    return specs
 
 
 @dataclass(frozen=True)

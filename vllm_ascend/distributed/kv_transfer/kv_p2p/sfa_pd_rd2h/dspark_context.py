@@ -11,6 +11,7 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.distributed.kv_transfer import get_kv_transfer_group
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.spec_decode.dspark_utils import get_dspark_aux_layer_ids
@@ -21,6 +22,31 @@ if TYPE_CHECKING:
 MAX_DSPARK_CONTEXT_CHUNK_TOKENS = 64
 
 
+def uses_dspark_kv_transfer(vllm_config: VllmConfig) -> bool:
+    """Opt into this backend's draft-KV protocol, including MultiConnector.
+
+    P deliberately disables sparse offload, so connector selection, not the
+    local offload flag, identifies participants in the P-to-D protocol.
+    """
+    speculative = getattr(vllm_config, "speculative_config", None)
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    if speculative is None or speculative.method != "dspark" or transfer is None:
+        return False
+    if not (transfer.is_kv_producer or transfer.is_kv_consumer):
+        return False
+    pending = [(transfer.kv_connector, transfer.kv_connector_extra_config or {})]
+    while pending:
+        name, extra = pending.pop()
+        if name == "SfaRemoteD2HConnector":
+            return True
+        if name == "MultiConnector":
+            pending.extend(
+                (child.get("kv_connector"), child.get("kv_connector_extra_config") or {})
+                for child in extra.get("connectors", ())
+            )
+    return False
+
+
 def get_pd_dspark_aux_layer_ids(vllm_config: VllmConfig) -> tuple[int, ...]:
     """Resolve P-side DSpark context boundaries before model loading.
 
@@ -28,11 +54,10 @@ def get_pd_dspark_aux_layer_ids(vllm_config: VllmConfig) -> tuple[int, ...]:
     before transferring those pages to D. This is intentionally different from
     a target-only feature-capture path.
     """
-    transfer = getattr(vllm_config, "kv_transfer_config", None)
-    speculative = getattr(vllm_config, "speculative_config", None)
-    if speculative is None or getattr(speculative, "method", None) != "dspark":
+    if not uses_dspark_kv_transfer(vllm_config):
         return ()
-    if transfer is None or transfer.is_kv_consumer or not transfer.is_kv_producer:
+    transfer = vllm_config.kv_transfer_config
+    if transfer.is_kv_consumer or not transfer.is_kv_producer:
         return ()
     parallel = vllm_config.parallel_config
     if parallel.prefill_context_parallel_size * parallel.decode_context_parallel_size != 1:
@@ -107,6 +132,35 @@ def find_dspark_kv_connector(connector: Any) -> Any:
     if len(matches) != 1:
         raise RuntimeError("DSpark KV transfer requires exactly one SFA PD connector")
     return matches[0]
+
+
+def configure_dspark_kv_transfer(
+    vllm_config: VllmConfig, speculator: Any, kv_cache_config: Any, *, is_last_pp_rank: bool
+) -> None:
+    """Register loaded draft ownership only for this backend's PD protocol."""
+    if not is_last_pp_rank or not uses_dspark_kv_transfer(vllm_config):
+        return
+    if speculator is None:
+        raise RuntimeError("DSpark KV transfer requires the loaded draft model on the final PP rank")
+    names = tuple(sorted(speculator.draft_attn_layer_names))
+    if not names:
+        raise RuntimeError("The loaded DSpark drafter did not expose its KV cache layer names")
+    connector = find_dspark_kv_connector(get_kv_transfer_group())
+    kv_cache_config.dspark_draft_layer_names = names
+    connector.configure_dspark_draft_layers(names)
+
+
+def bind_dspark_context_receiver(
+    vllm_config: VllmConfig, *, sparse_offload_enabled: bool, is_last_pp_rank: bool, max_requests: int
+) -> None:
+    """Bind D readiness after cache allocation; the connector owns its receiver."""
+    if not sparse_offload_enabled or not is_last_pp_rank or not uses_dspark_kv_transfer(vllm_config):
+        return
+    if not vllm_config.kv_transfer_config.is_kv_consumer:
+        return
+    receiver = DSparkContextReceiver(max_requests=max_requests)
+    connector = find_dspark_kv_connector(get_kv_transfer_group())
+    connector.bind_dspark_context_receiver(receiver)
 
 
 @dataclass(frozen=True)

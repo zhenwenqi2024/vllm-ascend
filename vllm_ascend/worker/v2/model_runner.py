@@ -19,7 +19,6 @@
 
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -29,7 +28,6 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.logger import logger
-from vllm.model_executor.models.interfaces import supports_eagle3
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d as async_copy_to_gpu
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -62,17 +60,21 @@ from vllm_ascend.ascend_forward_context import (
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, is_circular_kv_cache_spec
+from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
-    DSparkContextReceiver,
+    bind_dspark_context_receiver,
+    configure_dspark_kv_transfer,
     find_dspark_context_connector,
-    find_dspark_kv_connector,
     get_pd_dspark_aux_layer_ids,
     send_dspark_prefill_kv,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_kv import (
+    apply_dspark_resident_kv_specs,
+    get_resident_dspark_layer_names,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
@@ -266,16 +268,7 @@ class NPUModelRunner(GPUModelRunner):
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         aux_layers = get_pd_dspark_aux_layer_ids(self.vllm_config)
         super().load_model(load_dummy_weights, *args, **kwargs)
-        if not aux_layers:
-            return
-        # P must load the same DSpark speculator as D: it projects the target's
-        # prompt auxiliary states locally and writes draft KV before transfer.
-        if not supports_eagle3(self.model) or (self.is_last_pp_rank and self.speculator is None):
-            raise ValueError("P-side DSpark KV generation requires the loaded Eagle3 target and drafter.")
-        if not self.use_aux_hidden_state_outputs:
-            raise RuntimeError("DSpark target auxiliary states were not enabled by the speculative config")
         self.pd_dspark_aux_layer_ids = aux_layers
-        logger.info("Configured P-side DSpark draft-KV generation at boundaries %s", aux_layers)
 
     def _restore_replicated_draft_target_states(self) -> None:
         """Restore target states consumed by a replicated PCP draft."""
@@ -345,73 +338,15 @@ class NPUModelRunner(GPUModelRunner):
             self.pp_handler.broadcast_drafts()
         return output
 
-    def _get_resident_draft_layer_names(self) -> set[str]:
-        """Use loader-discovered DSpark ownership, never target layer indices."""
-        spec = getattr(self.vllm_config, "speculative_config", None)
-        if not self.ascend_config.sparse_kv_offload_config.enabled or spec is None or spec.method != "dspark":
-            return set()
-        if not self.is_last_pp_rank:
-            return set()
-        names = getattr(self.speculator, "draft_attn_layer_names", None)
-        if not names:
-            raise ValueError("Sparse KV offload requires DSpark cache ownership from the loaded draft model.")
-        context = self.compilation_config.static_forward_context
-        shared = getattr(self, "shared_kv_cache_layers", {})
-        for name in names:
-            source = shared.get(name) or getattr(context.get(name), "kv_sharing_target_layer_name", None)
-            if source is not None and source not in names:
-                raise ValueError("Resident DSpark draft layers cannot share target-model KV caches.")
-        return set(names)
-
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        specs = super().get_kv_cache_spec()
-        for name in self._get_resident_draft_layer_names() & specs.keys():
-            spec = specs[name]
-            if not isinstance(spec, AscendMLAAttentionSpec):
-                raise ValueError("Sparse KV offload currently requires an MLA DSpark draft checkpoint.")
-            # Keep the draft's dtype, non-causal flag and CP layout. Only the
-            # target uses the host pool; draft pages count against HBM capacity.
-            specs[name] = replace(spec, store_on_host=False)
-        return specs
-
-    def _configure_dspark_kv_transfer(self, kv_cache_config: KVCacheConfig) -> None:
-        """Tell the SFA connector which loader-owned caches are DSpark draft KV."""
-        transfer = self.vllm_config.kv_transfer_config
-        speculative = getattr(self.vllm_config, "speculative_config", None)
-        if (
-            transfer is None
-            or speculative is None
-            or speculative.method != "dspark"
-            or not self.is_last_pp_rank
-            or not (transfer.is_kv_consumer or transfer.is_kv_producer)
-        ):
-            return
-        if self.speculator is None:
-            raise RuntimeError("DSpark KV transfer requires the loaded draft model on the final PP rank")
-        names = tuple(sorted(self.speculator.draft_attn_layer_names))
-        if not names:
-            raise RuntimeError("The loaded DSpark drafter did not expose its KV cache layer names")
-        kv_cache_config.dspark_draft_layer_names = names
-        connector = find_dspark_kv_connector(get_kv_transfer_group())
-        connector.configure_dspark_draft_layers(names)
-
-    def _bind_dspark_context_receiver(self) -> None:
-        """Gate D-side remote-prefill readiness on both target and draft KV."""
-        transfer = self.vllm_config.kv_transfer_config
-        speculative = getattr(self.vllm_config, "speculative_config", None)
-        if (
-            transfer is None
-            or not transfer.is_kv_consumer
-            or not self.ascend_config.sparse_kv_offload_config.enabled
-            or speculative is None
-            or speculative.method != "dspark"
-            or not self.is_last_pp_rank
-        ):
-            return
-        receiver = DSparkContextReceiver(max_requests=self.max_num_reqs)
-        connector = find_dspark_kv_connector(get_kv_transfer_group())
-        connector.bind_dspark_context_receiver(receiver)
-        self._dspark_context_receiver = receiver
+        return apply_dspark_resident_kv_specs(
+            super().get_kv_cache_spec(),
+            self.vllm_config,
+            self.speculator,
+            sparse_offload_enabled=self.ascend_config.sparse_kv_offload_config.enabled,
+            is_last_pp_rank=self.is_last_pp_rank,
+            shared_kv_cache_layers=getattr(self, "shared_kv_cache_layers", None),
+        )
 
     def initialize_kv_cache(
         self,
@@ -421,13 +356,21 @@ class NPUModelRunner(GPUModelRunner):
         # Match V1's physical buffer plan without mutating the scheduler's
         # logical cache configuration. Allocation must honor zero-stride aliases.
         kv_cache_config = deepcopy(kv_cache_config)
-        self._configure_dspark_kv_transfer(kv_cache_config)
-        resident_draft_names = self._get_resident_draft_layer_names()
+        sparse_cfg = self.ascend_config.sparse_kv_offload_config
+        configure_dspark_kv_transfer(
+            self.vllm_config, self.speculator, kv_cache_config, is_last_pp_rank=self.is_last_pp_rank
+        )
+        resident_draft_names = get_resident_dspark_layer_names(
+            self.vllm_config,
+            self.speculator,
+            sparse_offload_enabled=sparse_cfg.enabled,
+            is_last_pp_rank=self.is_last_pp_rank,
+            shared_kv_cache_layers=getattr(self, "shared_kv_cache_layers", None),
+        )
         # P also needs persistent prompt draft KV until D acknowledges its
         # transfer. It must never alias target layerwise scratch buffers.
         persistent_draft_names = resident_draft_names | set(getattr(kv_cache_config, "dspark_draft_layer_names", ()))
         apply_layerwise_kv_cache_plan(kv_cache_config, self.vllm_config, excluded_layer_names=persistent_draft_names)
-        sparse_cfg = self.ascend_config.sparse_kv_offload_config
         if sparse_cfg.enabled:
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
                 self.vllm_config, kv_cache_config, sparse_cfg
@@ -450,7 +393,12 @@ class NPUModelRunner(GPUModelRunner):
                 self.model_state.pcp_manager = self.pcp_manager
                 if self.speculator is not None:
                     self.speculator.pcp_manager = self.pcp_manager
-        self._bind_dspark_context_receiver()
+        bind_dspark_context_receiver(
+            self.vllm_config,
+            sparse_offload_enabled=sparse_cfg.enabled,
+            is_last_pp_rank=self.is_last_pp_rank,
+            max_requests=self.max_num_reqs,
+        )
         if sparse_cfg.enabled and self.speculator is not None:
             # Resident MLA DSpark has no host-pool LRU or LIM tail state.
             self.model_state._offload_draft_attn_groups = (

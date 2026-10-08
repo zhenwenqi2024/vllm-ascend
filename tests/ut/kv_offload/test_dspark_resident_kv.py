@@ -41,6 +41,7 @@ def _runner(*, method="dspark", sparse=True, last_rank=True, names=None):
     runner.is_last_pp_rank = last_rank
     runner.speculator = SimpleNamespace(draft_attn_layer_names={"draft.layers.0.attn"} if names is None else names)
     runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.vllm_config.compilation_config = runner.compilation_config
     runner.shared_kv_cache_layers = {}
     return runner
 
@@ -56,12 +57,13 @@ def _prefill_runner(
     eager=True,
     cp=1,
     prefix=False,
+    connector="SfaRemoteD2HConnector",
 ):
     runner = NPUModelRunner.__new__(NPUModelRunner)
     extra = {} if ids is None else {"dspark_aux_hidden_state_layer_ids": ids}
     runner.vllm_config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
-            kv_connector_extra_config=extra, is_kv_producer=producer, is_kv_consumer=consumer
+            kv_connector=connector, kv_connector_extra_config=extra, is_kv_producer=producer, is_kv_consumer=consumer
         ),
         speculative_config=speculative,
         cache_config=SimpleNamespace(enable_prefix_caching=prefix),
@@ -79,26 +81,28 @@ def _prefill_runner(
     runner.max_num_tokens = 16
     runner.device = torch.device("cpu")
     runner.use_aux_hidden_state_outputs = False
+    runner.pd_dspark_aux_layer_ids = ()
     runner.intermediate_tensors = object()
     runner.speculator = SimpleNamespace() if speculative is not None and runner.is_last_pp_rank else None
     return runner
 
 
-def test_no_prefill_aux_option_preserves_original_loading():
-    runner = _prefill_runner()
+@pytest.mark.parametrize("method", [None, "mtp", "eagle3"])
+def test_no_prefill_aux_option_preserves_original_loading(method):
+    speculative = SimpleNamespace(method=method) if method is not None else None
+    runner = _prefill_runner(speculative=speculative)
     original_buffer = runner.intermediate_tensors
     with patch.object(GPUModelRunner, "load_model") as parent:
         runner.load_model(True)
     parent.assert_called_once_with(True)
+    assert runner.pd_dspark_aux_layer_ids == ()
     assert runner.intermediate_tensors is original_buffer
     assert not runner.use_aux_hidden_state_outputs
     runner.model.set_aux_hidden_state_layers.assert_not_called()
 
 
 @pytest.mark.parametrize("first_rank,pp", [(True, False), (True, True), (False, True)])
-def test_prefill_draft_kv_uses_parent_loaded_drafter_and_aux_states(monkeypatch, first_rank, pp):
-    from vllm_ascend.worker.v2 import model_runner as module
-
+def test_prefill_draft_kv_uses_parent_loaded_drafter_and_aux_states(first_rank, pp):
     layers = [2, 22, 38, 58, 74]
     speculative = SimpleNamespace(
         method="dspark",
@@ -106,9 +110,9 @@ def test_prefill_draft_kv_uses_parent_loaded_drafter_and_aux_states(monkeypatch,
     )
     runner = _prefill_runner(speculative=speculative, first_rank=first_rank, pp=pp)
     original_buffer = runner.intermediate_tensors
-    monkeypatch.setattr(module, "supports_eagle3", lambda model: True)
 
     def parent_load(*args):
+        assert runner.pd_dspark_aux_layer_ids == ()
         runner.use_aux_hidden_state_outputs = True
 
     with patch.object(GPUModelRunner, "load_model", side_effect=parent_load) as parent:
@@ -123,21 +127,20 @@ def test_prefill_draft_kv_uses_parent_loaded_drafter_and_aux_states(monkeypatch,
     runner.pp_handler.configure_aux_hidden_state_relay.assert_not_called()
 
 
-def test_prefill_last_stage_requires_parent_loaded_drafter(monkeypatch):
-    from vllm_ascend.worker.v2 import model_runner as module
-
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+def test_prefill_load_preserves_parent_validation_errors(error_type):
     speculative = SimpleNamespace(
         method="dspark",
         draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(eagle_aux_hidden_state_layer_ids=[2, 22])),
     )
     runner = _prefill_runner(speculative=speculative, first_rank=False, pp=True)
-    runner.speculator = None
-    monkeypatch.setattr(module, "supports_eagle3", lambda model: True)
     with (
-        patch.object(GPUModelRunner, "load_model"),
-        pytest.raises(ValueError, match="loaded Eagle3 target and drafter"),
+        patch.object(GPUModelRunner, "load_model", side_effect=error_type("parent validation failed")) as parent,
+        pytest.raises(error_type, match="parent validation failed"),
     ):
         runner.load_model()
+    parent.assert_called_once_with(False)
+    assert runner.pd_dspark_aux_layer_ids == ()
 
 
 @pytest.mark.parametrize("ids", [[], [38, 22], [2, 2], [79], [-1], [True], "2,22,38"])
@@ -172,6 +175,85 @@ def test_no_aux_capture_preserves_local_prefix_caching():
     assert not runner.use_aux_hidden_state_outputs
 
 
+def test_other_pd_backend_preserves_original_dspark_loading():
+    runner = _prefill_runner(
+        connector="MooncakeConnector", speculative=SimpleNamespace(method="dspark"), eager=False, cp=2, prefix=True
+    )
+    with patch.object(GPUModelRunner, "load_model") as parent:
+        runner.load_model()
+    parent.assert_called_once_with(False)
+    assert runner.pd_dspark_aux_layer_ids == ()
+
+
+@pytest.mark.parametrize("connector", [None, "MooncakeConnector", "SfaRemoteD2HConnector"])
+@pytest.mark.parametrize("method", ["dspark", "mtp", "eagle3"])
+def test_worker_registers_draft_ownership_before_sfa_connector_construction_only(connector, method):
+    from vllm_ascend.worker import worker as module
+
+    worker = module.NPUWorker.__new__(module.NPUWorker)
+    transfer = (
+        SimpleNamespace(kv_connector=connector, kv_connector_extra_config={}, is_kv_producer=True, is_kv_consumer=False)
+        if connector is not None
+        else None
+    )
+    worker.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method=method),
+        kv_transfer_config=transfer,
+        model_config=SimpleNamespace(enable_sleep_mode=False),
+    )
+    worker.model_runner = SimpleNamespace(
+        speculator=SimpleNamespace(draft_attn_layer_names={"draft.attn"}), initialize_kv_cache=Mock()
+    )
+    worker.use_v2_model_runner = True
+    cache_config = SimpleNamespace(has_mamba_layers=False, needs_kv_cache_zeroing=False)
+    enabled = method == "dspark" and connector == "SfaRemoteD2HConnector"
+
+    def check_registration(config, cache):
+        assert config is worker.vllm_config
+        assert getattr(cache, "dspark_draft_layer_names", ()) == (("draft.attn",) if enabled else ())
+
+    with patch.object(module, "ensure_kv_transfer_initialized", side_effect=check_registration) as initialize:
+        worker.initialize_from_config(cache_config)
+    initialize.assert_called_once_with(worker.vllm_config, cache_config)
+    worker.model_runner.initialize_kv_cache.assert_called_once()
+    assert hasattr(cache_config, "dspark_draft_layer_names") is enabled
+
+
+@pytest.mark.parametrize("pd_connector", ["SfaRemoteD2HConnector", "MooncakeConnector"])
+@pytest.mark.parametrize("method", ["dspark", "mtp", "eagle3"])
+def test_worker_excludes_persistent_draft_from_layerwise_budget_only_for_sfa_pd(pd_connector, method):
+    from vllm_ascend.worker import worker as module
+
+    worker = module.NPUWorker.__new__(module.NPUWorker)
+    worker.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method=method),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MultiConnector",
+            kv_connector_extra_config={"connectors": [{"kv_connector": pd_connector}]},
+            is_kv_producer=True,
+            is_kv_consumer=False,
+        ),
+    )
+    specs = {"target.attn": _mla_spec(), "draft.attn": _mla_spec()}
+    worker.model_runner = SimpleNamespace(
+        speculator=SimpleNamespace(draft_attn_layer_names={"draft.attn"}),
+        get_kv_cache_spec=Mock(return_value=specs),
+    )
+    worker._get_layerwise_kv_cache_memory_info = Mock(return_value=(1, 1, 1.0))
+    with (
+        patch.object(module, "get_layerwise_reuse_config", return_value={}),
+        patch.object(module.KVPPConfig, "from_vllm_config", return_value=SimpleNamespace(size=1)),
+        patch.object(
+            module,
+            "get_ascend_config",
+            return_value=SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(enabled=False)),
+        ),
+    ):
+        assert worker.get_kv_cache_spec() is specs
+    excluded = {"draft.attn"} if method == "dspark" and pd_connector == "SfaRemoteD2HConnector" else set()
+    worker._get_layerwise_kv_cache_memory_info.assert_called_once_with(specs, {}, excluded_layer_names=excluded)
+
+
 def test_prefill_aux_config_delegates_to_backend_before_loading():
     from vllm_ascend.worker.v2 import model_runner as module
 
@@ -186,23 +268,6 @@ def test_prefill_aux_config_delegates_to_backend_before_loading():
         runner.load_model()
     backend.assert_called_once_with(runner.vllm_config)
     parent.assert_not_called()
-
-
-def test_prefill_aux_capture_rejects_target_without_aux_interface(monkeypatch):
-    from vllm_ascend.worker.v2 import model_runner as module
-
-    speculative = SimpleNamespace(
-        method="dspark",
-        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(eagle_aux_hidden_state_layer_ids=[2, 22])),
-    )
-    runner = _prefill_runner(speculative=speculative)
-    monkeypatch.setattr(module, "supports_eagle3", lambda model: False)
-    with (
-        patch.object(GPUModelRunner, "load_model"),
-        pytest.raises(ValueError, match="loaded Eagle3 target and drafter"),
-    ):
-        runner.load_model()
-    assert not runner.use_aux_hidden_state_outputs
 
 
 @pytest.mark.parametrize("method", ["dspark", "mtp"])
@@ -221,9 +286,12 @@ def test_draft_placement_changes_only_dspark_sparse(method, sparse):
     assert draft.store_on_host  # No mutation of upstream specs.
 
 
-def test_dspark_ownership_is_exact_even_with_target_like_names():
+@pytest.mark.parametrize("has_shared_layers", [False, True])
+def test_dspark_ownership_is_exact_even_with_target_like_names(has_shared_layers):
     names = {"model.layers.3.attn", "head.cache"}
     runner = _runner(names=names)
+    if not has_shared_layers:
+        del runner.shared_kv_cache_layers
     specs = {name: _mla_spec() for name in [*sorted(names), "draft.layers.0.attn"]}
     with patch.object(GPUModelRunner, "get_kv_cache_spec", return_value=specs.copy()):
         result = runner.get_kv_cache_spec()
@@ -234,15 +302,21 @@ def test_dspark_ownership_is_exact_even_with_target_like_names():
 def test_dspark_non_last_pp_rank_has_no_resident_draft():
     runner = _runner(last_rank=False, names=set())
     runner.speculator = None
-    assert runner._get_resident_draft_layer_names() == set()
+    specs = {"target.attn": _mla_spec()}
+    with patch.object(GPUModelRunner, "get_kv_cache_spec", return_value=specs):
+        assert runner.get_kv_cache_spec() is specs
+    assert specs["target.attn"].store_on_host
 
 
 @pytest.mark.parametrize("names", [None, set()])
 def test_dspark_missing_loaded_ownership_fails_closed(names):
     runner = _runner()
     runner.speculator = SimpleNamespace(draft_attn_layer_names=names)
-    with pytest.raises(ValueError, match="loaded draft model"):
-        runner._get_resident_draft_layer_names()
+    with (
+        patch.object(GPUModelRunner, "get_kv_cache_spec", return_value={}),
+        pytest.raises(ValueError, match="loaded draft model"),
+    ):
+        runner.get_kv_cache_spec()
 
 
 def test_dspark_rejects_gqa_checkpoint_cache():
@@ -264,8 +338,11 @@ def test_dspark_cannot_alias_target_kv(module_alias):
         }
     else:
         runner.shared_kv_cache_layers = {"draft.layers.0.attn": "target.attn"}
-    with pytest.raises(ValueError, match="share target-model"):
-        runner._get_resident_draft_layer_names()
+    with (
+        patch.object(GPUModelRunner, "get_kv_cache_spec", return_value={}),
+        pytest.raises(ValueError, match="share target-model"),
+    ):
+        runner.get_kv_cache_spec()
 
 
 @pytest.mark.parametrize("producer,consumer", [(False, True), (False, False)])

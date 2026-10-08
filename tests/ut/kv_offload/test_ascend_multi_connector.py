@@ -24,12 +24,14 @@ from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa
         (True, True, "dspark", False),
     ],
 )
-def test_dspark_full_prompt_policy_is_producer_only(producer, consumer, method, full_prompt):
+@pytest.mark.parametrize("pd_connector", ["SfaRemoteD2HConnector", "MooncakeConnector"])
+def test_dspark_full_prompt_policy_is_sfa_producer_only(producer, consumer, method, full_prompt, pd_connector):
     config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
+            kv_connector="MultiConnector",
             is_kv_producer=producer,
             is_kv_consumer=consumer,
-            kv_connector_extra_config={},
+            kv_connector_extra_config={"connectors": [{"kv_connector": pd_connector}]},
         ),
         speculative_config=SimpleNamespace(method=method) if method is not None else None,
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
@@ -38,7 +40,7 @@ def test_dspark_full_prompt_policy_is_producer_only(producer, consumer, method, 
         connector = AscendMultiConnector.__new__(AscendMultiConnector)
         connector._connectors = []
         connector.__init__(config, object(), None)
-    assert connector._requires_full_dspark_prompt is full_prompt
+    assert connector._requires_full_dspark_prompt is (full_prompt and pd_connector == "SfaRemoteD2HConnector")
 
 
 @pytest.mark.parametrize("cached_prefix", [17920, 19042])

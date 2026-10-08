@@ -4,7 +4,7 @@
 import threading
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import msgspec
 import pytest
@@ -16,6 +16,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context impor
     DSparkContextDescriptor,
     DSparkContextReceiver,
     DSparkContextSubmission,
+    bind_dspark_context_receiver,
+    configure_dspark_kv_transfer,
     find_dspark_context_connector,
     find_dspark_kv_connector,
     resident_mla_context_group_ids,
@@ -134,6 +136,117 @@ def test_kv_connector_lookup_finds_unique_sfa_child():
     pd = SimpleNamespace(configure_dspark_draft_layers=Mock(), send_dspark_draft_kv=Mock())
     wrapper = SimpleNamespace(_connectors=[SimpleNamespace(_connectors=[pd])])
     assert find_dspark_kv_connector(wrapper) is pd
+
+
+def _transfer_config(connector="SfaRemoteD2HConnector", method="dspark", *, producer=True):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(method=method) if method is not None else None,
+        kv_transfer_config=SimpleNamespace(
+            kv_connector=connector,
+            kv_connector_extra_config={},
+            is_kv_producer=producer,
+            is_kv_consumer=not producer,
+        ),
+    )
+
+
+@pytest.mark.parametrize("producer", [False, True])
+def test_backend_registers_loader_owned_draft_names_on_both_pd_roles(producer):
+    config = _transfer_config(producer=producer)
+    draft = SimpleNamespace(draft_attn_layer_names={"draft.z", "draft.a"})
+    cache_config = SimpleNamespace()
+    pd = SimpleNamespace(configure_dspark_draft_layers=Mock(), send_dspark_draft_kv=Mock())
+    wrapper = SimpleNamespace(_connectors=[SimpleNamespace(), pd])
+    with patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context.get_kv_transfer_group",
+        return_value=wrapper,
+    ):
+        configure_dspark_kv_transfer(config, draft, cache_config, is_last_pp_rank=True)
+    assert cache_config.dspark_draft_layer_names == ("draft.a", "draft.z")
+    pd.configure_dspark_draft_layers.assert_called_once_with(("draft.a", "draft.z"))
+
+
+@pytest.mark.parametrize(
+    "connector,method,last_rank",
+    [
+        ("MooncakeConnector", "dspark", True),
+        ("AscendStoreConnector", "dspark", True),
+        ("SfaRemoteD2HConnector", "mtp", True),
+        ("SfaRemoteD2HConnector", None, True),
+        ("SfaRemoteD2HConnector", "dspark", False),
+        ("MultiConnector", "dspark", True),
+    ],
+)
+def test_backend_opt_out_neither_inspects_draft_nor_mutates_cache(connector, method, last_rank):
+    config = _transfer_config(connector, method)
+    cache_config = SimpleNamespace()
+    with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context.get_kv_transfer_group") as group:
+        configure_dspark_kv_transfer(config, None, cache_config, is_last_pp_rank=last_rank)
+    group.assert_not_called()
+    assert not hasattr(cache_config, "dspark_draft_layer_names")
+
+
+@pytest.mark.parametrize("draft", [None, SimpleNamespace(draft_attn_layer_names=set())])
+def test_selected_backend_still_rejects_missing_loaded_draft(draft):
+    with pytest.raises(RuntimeError, match="draft"):
+        configure_dspark_kv_transfer(_transfer_config(), draft, SimpleNamespace(), is_last_pp_rank=True)
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_selected_backend_still_requires_exactly_one_runtime_connector(count):
+    draft = SimpleNamespace(draft_attn_layer_names={"draft.attn"})
+    children = [
+        SimpleNamespace(configure_dspark_draft_layers=Mock(), send_dspark_draft_kv=Mock()) for _ in range(count)
+    ]
+    with (
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context.get_kv_transfer_group",
+            return_value=SimpleNamespace(_connectors=children),
+        ),
+        pytest.raises(RuntimeError, match="exactly one SFA"),
+    ):
+        configure_dspark_kv_transfer(_transfer_config(), draft, SimpleNamespace(), is_last_pp_rank=True)
+    for child in children:
+        child.configure_dspark_draft_layers.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "connector,method,producer,sparse,last_rank",
+    [
+        ("SfaRemoteD2HConnector", "dspark", False, True, True),
+        ("SfaRemoteD2HConnector", "dspark", True, True, True),
+        ("SfaRemoteD2HConnector", "dspark", False, False, True),
+        ("SfaRemoteD2HConnector", "dspark", False, True, False),
+        ("SfaRemoteD2HConnector", "mtp", False, True, True),
+        ("SfaRemoteD2HConnector", None, False, True, True),
+        ("MooncakeConnector", "dspark", False, True, True),
+        (None, "dspark", False, True, True),
+    ],
+)
+def test_backend_receiver_binds_only_sparse_dspark_sfa_consumer(connector, method, producer, sparse, last_rank):
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h import dspark_context as module
+
+    config = _transfer_config(connector, method, producer=producer)
+    if connector is None:
+        config.kv_transfer_config = None
+    pd = SimpleNamespace(
+        configure_dspark_draft_layers=Mock(), send_dspark_draft_kv=Mock(), bind_dspark_context_receiver=Mock()
+    )
+    receiver = object()
+    with (
+        patch.object(module, "get_kv_transfer_group", return_value=pd) as group,
+        patch.object(module, "DSparkContextReceiver", return_value=receiver) as factory,
+    ):
+        bind_dspark_context_receiver(config, sparse_offload_enabled=sparse, is_last_pp_rank=last_rank, max_requests=4)
+    enabled = connector == "SfaRemoteD2HConnector" and method == "dspark" and not producer and sparse and last_rank
+    if enabled:
+        group.assert_called_once_with()
+        factory.assert_called_once_with(max_requests=4)
+        pd.bind_dspark_context_receiver.assert_called_once_with(receiver)
+    else:
+        group.assert_not_called()
+        factory.assert_not_called()
+        pd.bind_dspark_context_receiver.assert_not_called()
 
 
 def test_context_receiver_joins_target_and_draft_kv_and_keeps_lost_ack_tombstone():
@@ -359,16 +472,20 @@ def test_p_runner_excludes_persistent_draft_from_target_scratch_plan(monkeypatch
     from vllm_ascend.worker.v2 import model_runner as module
 
     runner = module.NPUModelRunner.__new__(module.NPUModelRunner)
-    runner.vllm_config = SimpleNamespace()
-    runner._configure_dspark_kv_transfer = Mock()
-    runner._get_resident_draft_layer_names = Mock(return_value=set())  # P has no sparse offload.
+    runner.vllm_config = _transfer_config()
+    runner.ascend_config = SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(enabled=False))
+    runner.is_last_pp_rank = True
+    runner.speculator = SimpleNamespace(draft_attn_layer_names={"draft.layers.0.attn"})
     original = SimpleNamespace(dspark_draft_layer_names=("draft.layers.0.attn",))
+    register = Mock()
+    monkeypatch.setattr(module, "configure_dspark_kv_transfer", register)
 
     class PlanReached(Exception):
         pass
 
     def check_plan(config, runtime, *, excluded_layer_names):
         assert config is not original and runtime is runner.vllm_config
+        register.assert_called_once_with(runtime, runner.speculator, config, is_last_pp_rank=True)
         assert excluded_layer_names == {"draft.layers.0.attn"}
         raise PlanReached
 
