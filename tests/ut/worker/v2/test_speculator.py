@@ -257,6 +257,7 @@ def test_prefill_filters_target_only_metadata():
 def test_build_uniform_attn_metadata_sets_decode_only():
     """Test uniform attention metadata is marked decode-only."""
     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+    speculator._offload_draft_req_ids = []
     metadata = SimpleNamespace(attn_state=None)
     speculator.arange_np = np.arange(3, dtype=np.int32)
     speculator.input_batch = SimpleNamespace(is_prefilling_np=np.array([False, False]))
@@ -298,6 +299,7 @@ def test_build_uniform_attn_metadata_sets_decode_only():
 def test_build_attn_metadata_sets_decode_only():
     """Test attention metadata is marked decode-only."""
     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+    speculator._offload_draft_req_ids = []
     metadata = SimpleNamespace(attn_state=None)
     speculator.input_batch = SimpleNamespace(is_prefilling_np=np.array([False, False]))
     speculator.input_buffers = SimpleNamespace(positions=torch.tensor([0, 1]))
