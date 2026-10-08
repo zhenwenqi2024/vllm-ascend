@@ -36,6 +36,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     READ_READY_BATCH,
     SFAPD_PROTOCOL_VERSION,
     CopySfaTailDest,
+    DSparkDraftKVStatus,
 )
 
 READ_THREAD_POLL_TIMEOUT_MS = 100
@@ -359,7 +360,7 @@ class MembPullReadThread(threading.Thread):
         receiver = self._state.dspark_context_receiver
         descriptor = None
         reserved = False
-        status = b"failed"
+        status = DSparkDraftKVStatus.FAILED
         try:
             if len(msg) != 8:
                 raise ValueError(f"DSpark draft-KV message must contain 7 fields, got {len(msg) - 1}")
@@ -389,17 +390,17 @@ class MembPullReadThread(threading.Thread):
             if pp_rank != pp_size - 1:
                 raise RuntimeError("DSpark draft KV must come from the final Prefill PP stage")
             if receiver is None:
-                status = b"backpressure"
+                status = DSparkDraftKVStatus.BACKPRESSURE
             else:
                 admission, reserved = receiver.begin_direct_transfer(descriptor)
                 if admission is DSparkContextSubmission.BACKPRESSURE:
-                    status = b"backpressure"
+                    status = DSparkDraftKVStatus.BACKPRESSURE
                 elif admission is DSparkContextSubmission.STALE:
-                    status = b"stale"
+                    status = DSparkDraftKVStatus.STALE
                 elif not reserved:
                     # A previous acknowledgement may have been lost; the full
                     # copy already completed, so the retry is safe to accept.
-                    status = b"accepted"
+                    status = DSparkDraftKVStatus.ACCEPTED
                 else:
                     remote = self._decode_draft_kv_metadata(remote_metadata)
                     local = self._state.dspark_draft_kv_metadata
@@ -435,9 +436,9 @@ class MembPullReadThread(threading.Thread):
                             raise RuntimeError(f"MemFabric DSpark draft KV read failed, ret={ret}")
                     receiver.finish_direct_transfer(descriptor, success=True)
                     reserved = False
-                    status = b"accepted"
+                    status = DSparkDraftKVStatus.ACCEPTED
         except Exception as error:
-            status = b"failed"
+            status = DSparkDraftKVStatus.FAILED
             if descriptor is not None and reserved and receiver is not None:
                 try:
                     receiver.finish_direct_transfer(descriptor, success=False)
@@ -457,7 +458,7 @@ class MembPullReadThread(threading.Thread):
                 (
                     identity,
                     b"",
-                    encoder.encode((DSPARK_DRAFT_KV_ACK, request_id, generation, status)),
+                    encoder.encode((DSPARK_DRAFT_KV_ACK, request_id, generation, status.value)),
                 )
             )
 

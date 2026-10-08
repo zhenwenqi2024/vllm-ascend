@@ -77,7 +77,8 @@ def _speculator(monkeypatch, kind, architecture, width, padded, step, use_dcp=Tr
     cls = AscendDSparkSpeculator if kind == "dspark" else AscendMTPSpeculator
     spec = object.__new__(cls)
     if kind == "mtp":
-        spec._offload_draft_req_ids = []
+        spec._sparse_kv_offload_metadata = SimpleNamespace(build_kwargs=lambda *args: None)
+        spec.model_state = object()
     spec.attn_architecture = architecture
     spec.use_dcp = use_dcp
     spec.dcp_manager = manager

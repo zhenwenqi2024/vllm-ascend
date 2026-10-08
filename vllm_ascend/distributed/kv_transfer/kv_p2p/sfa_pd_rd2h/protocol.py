@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -26,6 +27,15 @@ DSPARK_DRAFT_KV_ACK = b"dspark_draft_kv_ack"
 # producers with PP>1 require the structured acknowledgement below.
 SFAPD_PROTOCOL_VERSION = 1
 MF_META_ACK = b"mf_meta_ack"
+
+
+class DSparkDraftKVStatus(Enum):
+    """Draft-KV acknowledgement states with their existing wire values."""
+
+    ACCEPTED = b"accepted"
+    BACKPRESSURE = b"backpressure"
+    STALE = b"stale"
+    FAILED = b"failed"
 
 
 def infer_sfa_component_group_ids(kv_cache_config: Any) -> tuple[int, int]:

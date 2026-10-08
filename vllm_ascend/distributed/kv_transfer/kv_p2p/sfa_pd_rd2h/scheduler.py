@@ -47,6 +47,7 @@ from vllm_ascend.spec_decode.dspark_utils import get_dspark_aux_layer_ids
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 METASERVER_MAX_RETRIES = 3
@@ -293,6 +294,8 @@ class SFAPDRD2HScheduler:
         # req_ids awaiting their first build_connector_meta seed (so the worker
         # can build request_map for get_finished even while async-waiting KV).
         self._reqs_need_recv: set[str] = set()
+        self._dspark_pending_recv: set[str] = set()
+        self._deferred_finished_req_ids: set[str] = set()
         self.executor = ThreadPoolExecutor(32)
         self._metaserver_futures = {}
         self._metaserver_retry_timers = {}
@@ -389,6 +392,7 @@ class SFAPDRD2HScheduler:
                 dspark_context_descriptor,
                 dspark_draft_block_ids_by_group,
             )
+            self._dspark_pending_recv.add(request.request_id)
         self._reqs_need_recv.add(request.request_id)
         allocator = getattr(self, "_copy_sfa_slot_allocator", None)
         if allocator is not None:
@@ -499,25 +503,41 @@ class SFAPDRD2HScheduler:
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
+        if request.request_id in self._dspark_pending_recv:
+            # Let the existing rendezvous and reads drain naturally. vLLM
+            # retains the KV blocks; retain the connector's destinations too.
+            self._deferred_finished_req_ids.add(request.request_id)
+            return True, None
+        self._cleanup_finished_request(request.request_id)
+        return False, None
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        completed = set(connector_output.finished_recving or ())
+        self._dspark_pending_recv.difference_update(completed)
+        for request_id in completed & self._deferred_finished_req_ids:
+            self._cleanup_finished_request(request_id)
+
+    def _cleanup_finished_request(self, request_id: str) -> None:
         # vLLM owns the block lifecycle; the connector only drops its lookup.
-        self._request_trackers.pop(request.request_id, None)
-        getattr(self, "_dspark_context_requests", {}).pop(request.request_id, None)
-        self._reqs_need_recv.discard(request.request_id)
+        self._request_trackers.pop(request_id, None)
+        getattr(self, "_dspark_context_requests", {}).pop(request_id, None)
+        self._reqs_need_recv.discard(request_id)
+        self._dspark_pending_recv.discard(request_id)
+        self._deferred_finished_req_ids.discard(request_id)
         copy_sfa_bindings = getattr(self, "_copy_sfa_bindings", None)
         if copy_sfa_bindings is not None:
-            copy_sfa_bindings.pop(request.request_id, None)
+            copy_sfa_bindings.pop(request_id, None)
         allocator = getattr(self, "_copy_sfa_slot_allocator", None)
         if allocator is not None:
-            allocator.release(request.request_id)
+            allocator.release(request_id)
         with self._metaserver_lock:
-            self._cancelled_metaserver_requests.add(request.request_id)
-            future = self._metaserver_futures.pop(request.request_id, None)
-            timer = self._metaserver_retry_timers.pop(request.request_id, None)
+            self._cancelled_metaserver_requests.add(request_id)
+            future = self._metaserver_futures.pop(request_id, None)
+            timer = self._metaserver_retry_timers.pop(request_id, None)
         if future is not None:
             future.cancel()
         if timer is not None:
             timer.cancel()
-        return False, None
 
     # ------------------------------------------------------------------
     # helpers

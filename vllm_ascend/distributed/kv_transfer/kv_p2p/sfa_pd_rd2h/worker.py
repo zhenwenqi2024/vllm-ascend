@@ -174,6 +174,8 @@ class SFAPDRD2HConsumerWorker:
         # not a per-layer barrier.
         self._terminal_ext_ids: set[str] = set()
         self._dspark_context_receiver: DSparkContextReceiver | None = None
+        self._dspark_pending_recv: set[str] = set()
+        self._deferred_finished_req_ids: set[str] = set()
         self._dspark_draft_blocks_by_req: dict[str, dict[int, tuple[int, ...]]] = {}
         self.dspark_draft_layer_names: tuple[str, ...] = ()
         self.dspark_draft_kv_metadata: dict[str, DraftKVCacheMetadata] = {}
@@ -262,6 +264,7 @@ class SFAPDRD2HConsumerWorker:
                         group_id: tuple(block_ids_by_group[group_id]) for group_id in group_ids
                     }
                     receiver.register_request(descriptor)
+                    self._dspark_pending_recv.add(req_id)
                 pool_slot = getattr(req, "pool_slot", None)
                 if pool_slot is not None:
                     self.copy_sfa_slots_by_req[req_id] = int(pool_slot)
@@ -296,6 +299,12 @@ class SFAPDRD2HConsumerWorker:
         for req_id in req_ids:
             ext_id = get_external_request_id(req_id)
             ext_ids.add(ext_id)
+            receiver = getattr(self, "_dspark_context_receiver", None)
+            if receiver is not None:
+                # Check transfer ownership before dropping any DMA destination.
+                receiver.discard_request_id(ext_id)
+                self._dspark_pending_recv.discard(req_id)
+                self._deferred_finished_req_ids.discard(req_id)
             self._cpu_blocks_by_req.pop(req_id, None)
             self.request_map.pop(ext_id, None)
             self._dest_blocks_by_req.pop(ext_id, None)
@@ -304,9 +313,6 @@ class SFAPDRD2HConsumerWorker:
             getattr(self, "_copy_sfa_tail_by_req", {}).pop(ext_id, None)
             self._pending_done.discard(ext_id)
             self._terminal_ext_ids.discard(ext_id)
-            receiver = getattr(self, "_dspark_context_receiver", None)
-            if receiver is not None:
-                receiver.discard_request_id(ext_id)
         # Drop any partial contributor-completion state so a dead contributor or a
         # retried external id cannot complete a later request on stale arrivals.
         if self._mf_read_thread is not None:
@@ -355,7 +361,7 @@ class SFAPDRD2HConsumerWorker:
             for ext_id in finished_on_all - failed_on_any:
                 descriptor = receiver.get_descriptor(ext_id)
                 if descriptor is not None:
-                    logger.info(
+                    logger.debug(
                         "DSpark remote prompt ready: req=%s tokens=%d aux_layers=%s draft_groups=%s tp_rank=%d",
                         ext_id,
                         descriptor.prompt_tokens,
@@ -404,7 +410,15 @@ class SFAPDRD2HConsumerWorker:
         # request_map[ext_id] and discard _pending_done[ext_id] before the
         # resolution loop above, leaking any finished req whose DONE arrives in
         # the same step (unmappable -> stuck in _pending_done forever).
-        if finished_req_ids:
+        if receiver is not None:
+            self._dspark_pending_recv.difference_update(done_recving)
+            self._deferred_finished_req_ids.update(finished_req_ids or ())
+            # Cancellation does not abort the remote reads. Keep their lookup
+            # tables until the original target+draft join completes on every TP.
+            ready_to_cleanup = self._deferred_finished_req_ids - self._dspark_pending_recv
+            if ready_to_cleanup:
+                self._cleanup_request_state(ready_to_cleanup)
+        elif finished_req_ids:
             self._cleanup_request_state(finished_req_ids)
 
         return set(), done_recving
@@ -938,7 +952,7 @@ class SFAPDRD2HProducerWorker:
             draft_kv_metadata=self._draft_kv_metadata_to_wire(self.dspark_draft_kv_metadata),
             source_blocks_by_group=source_blocks_by_group,
         )
-        logger.info(
+        logger.debug(
             "DSpark P draft KV transferred: req=%s tokens=%d draft_layers=%d draft_groups=%s tp_rank=%d",
             descriptor.request_id,
             descriptor.prompt_tokens,

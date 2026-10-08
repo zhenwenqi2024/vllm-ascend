@@ -27,6 +27,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     READ_FAILED,
     READ_READY_BATCH,
     SFAPD_PROTOCOL_VERSION,
+    DSparkDraftKVStatus,
     LayerMetadata,
     SendTask,
     get_external_request_id,
@@ -314,12 +315,12 @@ class MembPullSendingThread(threading.Thread):
             if reply[1] != descriptor.request_id or reply[2] != descriptor.generation:
                 continue
             status = reply[3]
-            if status == b"accepted":
+            if status == DSparkDraftKVStatus.ACCEPTED.value:
                 return
-            if status == b"backpressure":
+            if status == DSparkDraftKVStatus.BACKPRESSURE.value:
                 time.sleep(0.01)
                 continue
-            if status == b"stale":
+            if status == DSparkDraftKVStatus.STALE.value:
                 raise RuntimeError(
                     f"D discarded stale DSpark draft-KV allocation {descriptor.request_id}/{descriptor.generation}"
                 )

@@ -1510,6 +1510,8 @@ def test_consumer_scheduler_binds_copy_sfa_tail_at_alloc():
     )
     scheduler._request_trackers = {}
     scheduler._reqs_need_recv = set()
+    scheduler._dspark_pending_recv = set()
+    scheduler._deferred_finished_req_ids = set()
     scheduler._copy_sfa_bindings = {}
     scheduler._copy_sfa_hot_tokens = 8192
     scheduler._copy_sfa_slot_allocator = CopySfaTopkSlotAllocator(4)

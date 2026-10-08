@@ -39,6 +39,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.worker import (
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.v1.attention.backend import AttentionMetadata
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 _LAYER_IDX_RE = re.compile(r"layers\.(\d+)")
@@ -146,6 +147,11 @@ class SfaRemoteD2HConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished_all_groups(request, block_ids)
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        if self.is_consumer:
+            assert self.connector_scheduler is not None
+            self.connector_scheduler.update_connector_output(connector_output)
 
     # ------------------------------------------------------------------
     # Worker side

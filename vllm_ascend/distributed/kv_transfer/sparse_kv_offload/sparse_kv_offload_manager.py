@@ -1171,7 +1171,8 @@ class SparseKVOffloadManager:
             if isinstance(block_table, torch.Tensor):
                 if block_table.device != topk_k.device:
                     raise ValueError("Tensor block table must be on the same device as the top-k buffers")
-                # int32 block IDs promote to int64 when multiplied by byte strides.
+                # block_bytes is a dimensioned int64 tensor, not a Python scalar.
+                # The product is int64 before adding the host base, including offsets above 2 GiB.
                 src_offsets = block_table[row, :nblocks].view(1, -1) * block_bytes
             else:
                 src_tokens = torch.tensor(
