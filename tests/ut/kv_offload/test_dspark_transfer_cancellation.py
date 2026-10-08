@@ -144,6 +144,7 @@ def _fixture(names=("cancel",), *, admit=True):
     upstream.requests = {request.request_id: request for request in requests.values()}
     upstream.running = []
     upstream.waiting = Mock()
+    upstream.skipped_waiting = Mock()
     upstream.kv_holding_waiting = Mock()
     upstream.deferred_waiting = set()
     upstream.finished_recving_kv_req_ids = set()
