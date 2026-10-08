@@ -377,7 +377,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.model_state._offload_live_req_ids = self.req_states.req_id_to_index
             self.model_state._offload_draft_layer_names = (
-                getattr(self.speculator, "draft_attn_layer_names", set()) - resident_draft_names
+                getattr(self.speculator, "draft_attn_layer_names", set[str]()) - resident_draft_names
                 if sparse_cfg.use_fused_copy_sfa
                 else set()
             )

@@ -217,7 +217,7 @@ def _normalize_glm_mla_dspark(self):
     """
     draft = getattr(self, "draft_model_config", None)
     config = getattr(draft, "hf_config", None)
-    if not isinstance(config, SpeculatorsConfig):
+    if draft is None or not isinstance(config, SpeculatorsConfig):
         return
     source, _ = SpeculatorsConfig.get_config_dict(draft.model)
     if "Glm5DSparkForCausalLM" not in (source.get("architectures") or ()):

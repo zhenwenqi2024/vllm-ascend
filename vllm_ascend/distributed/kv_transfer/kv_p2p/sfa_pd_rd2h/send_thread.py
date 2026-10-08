@@ -250,6 +250,7 @@ class MembPullSendingThread(threading.Thread):
         remote_engine_id: str | None = None,
         timeout: float = 180.0,
     ) -> None:
+        completed = threading.Event()
         task = DSparkDraftKVSendTask(
             host=host,
             port=port,
@@ -258,10 +259,10 @@ class MembPullSendingThread(threading.Thread):
             source_blocks_by_group=source_blocks_by_group,
             remote_engine_id=remote_engine_id,
             timeout=timeout,
-            completed=threading.Event(),
+            completed=completed,
         )
         self.dspark_draft_kv_queue.put(task)
-        if not task.completed.wait(timeout):
+        if not completed.wait(timeout):
             raise TimeoutError(f"Timed out sending DSpark draft KV for {descriptor.request_id}")
         if task.error is not None:
             raise RuntimeError("MemFabric DSpark draft-KV transfer failed") from task.error

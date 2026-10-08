@@ -141,8 +141,7 @@ class Glm5DSparkModel(nn.Module):
     ) -> None:
         if context_states.numel() == 0 or context_slot_mapping is None:
             return
-        per_layer = isinstance(context_slot_mapping, (list, tuple))
-        if per_layer and len(context_slot_mapping) != len(self.layers):
+        if isinstance(context_slot_mapping, (list, tuple)) and len(context_slot_mapping) != len(self.layers):
             raise ValueError("context_slot_mapping must contain one entry per GLM MLA draft layer.")
         if context_positions.numel() != context_states.shape[0]:
             raise ValueError("GLM MLA draft context positions must match context rows.")
@@ -153,7 +152,9 @@ class Glm5DSparkModel(nn.Module):
         cos = cos.repeat(1, 2)[context_positions].unsqueeze(1).unsqueeze(2)
         sin = sin.repeat(1, 2)[context_positions].unsqueeze(1).unsqueeze(2)
         for index, layer in enumerate(self.layers):
-            slots = context_slot_mapping[index] if per_layer else context_slot_mapping
+            slots = (
+                context_slot_mapping[index] if isinstance(context_slot_mapping, (list, tuple)) else context_slot_mapping
+            )
             if slots is None or slots.numel() == 0:
                 continue
             if slots.numel() != context_states.shape[0]:
