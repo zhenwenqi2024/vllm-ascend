@@ -386,15 +386,19 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        """Resolve the FP32 input consumed by the internal router gate."""
+        """Prepare only the input needed by a pre-cast FP32 router gate."""
+        gate = self.gate
+        assert gate is not None
+        if not hasattr(gate, "weight_fp32"):
+            return hidden_states
         return router_logits if router_logits.dtype == torch.float32 else hidden_states.float()
 
     def _apply_router_linear(self, router_input: torch.Tensor) -> torch.Tensor:
         """Apply the internal router gate to an already prepared input."""
         gate = self.gate
         assert gate is not None
-        # Gate weights are normally pre-cast by AscendUnquantizedLinearMethod
-        # to avoid a weight Cast in this hot path.
+        # Gates without pre-cast FP32 weights keep their registered forward
+        # path and its dtype semantics.
         if hasattr(gate, "weight_fp32"):
             return F.linear(router_input, gate.weight_fp32)
         gate_out = gate(router_input)

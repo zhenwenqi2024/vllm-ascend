@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-import subprocess
-import sys
+import ast
 import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -53,15 +53,23 @@ from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8Dyna
 from vllm_ascend.quantization.quant_type import QuantType
 
 
-def test_quantization_base_import_before_moe_has_no_cycle():
-    """A fresh process catches import cycles hidden by test-module import order."""
-    code = """\
-from typing import get_args
-from vllm_ascend.quantization.methods.base import PreparedLinearInput
-from vllm_ascend.ops.fused_moe.shared_experts import LinearInput
-assert PreparedLinearInput in get_args(LinearInput)
-"""
-    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+def test_prepared_linear_input_import_does_not_cycle_through_moe():
+    """Both modules must use the leaf contract, even when imports are cached."""
+    leaf_module = "vllm_ascend.quantization.prepared_linear_input"
+    repository_root = Path(__file__).resolve().parents[3]
+    for relative_path in (
+        "vllm_ascend/quantization/methods/base.py",
+        "vllm_ascend/ops/fused_moe/shared_experts.py",
+    ):
+        source = (repository_root / relative_path).read_text(encoding="utf-8")
+        imports = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ImportFrom)]
+        assert any(
+            node.module == leaf_module and any(alias.name == "PreparedLinearInput" for alias in node.names)
+            for node in imports
+        ), relative_path
+        if relative_path.endswith("shared_experts.py"):
+            assert all(node.module != "vllm_ascend.quantization.methods.base" for node in imports)
+    assert PreparedLinearInput in get_args(shared_experts_module.LinearInput)
 
 
 @pytest.fixture
@@ -2599,6 +2607,66 @@ def test_internal_router_releases_shared_stream_after_input_cast(monkeypatch):
     assert actual_router_ready is router_output_ready
     assert actual_submitted_gate_up is submitted_gate_up
     torch.testing.assert_close(router_logits, original_linear(hidden_states.float(), gate_weight))
+
+
+def test_internal_router_without_precast_keeps_registered_gate_forward(monkeypatch):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    hidden_states = MagicMock()
+    hidden_states.float.side_effect = AssertionError("fallback must not allocate an unused FP32 input")
+    prepared_input = PreparedSharedExpertInput(hidden_states)
+    shared_input_ready = object()
+    router_output_ready = object()
+    prepared_execution = object()
+    submitted_gate_up = object()
+    gate_logits = object()
+    operation_order = []
+    events = iter((shared_input_ready, router_output_ready))
+
+    def record_event():
+        event = next(events)
+        operation_order.append("shared_input_ready" if event is shared_input_ready else "router_output_ready")
+        return event
+
+    def gate_forward(states):
+        assert states is hidden_states
+        operation_order.append("gate_forward")
+        return gate_logits, None
+
+    def prepare_shared(actual_input, actual_event):
+        assert actual_input is prepared_input
+        assert actual_event is shared_input_ready
+        operation_order.append("prepare_shared")
+        return prepared_execution
+
+    def enqueue_gate_up(actual_execution, actual_event):
+        assert actual_execution is prepared_execution
+        assert actual_event is router_output_ready
+        operation_order.append("submit_gate_up")
+        return submitted_gate_up
+
+    runner.gate = MagicMock(spec=AscendGateLinear, side_effect=gate_forward)
+    runner.ascend_shared_experts = SimpleNamespace(
+        multistream_overlap=True,
+        prepare_for_router_overlap=MagicMock(side_effect=prepare_shared),
+        enqueue_gate_up_after_router=MagicMock(side_effect=enqueue_gate_up),
+    )
+    current_stream = MagicMock()
+    current_stream.record_event.side_effect = record_event
+    monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: True))
+    monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
+
+    result = runner._prepare_router_and_milestones(prepared_input, hidden_states, object())
+
+    assert result == (gate_logits, shared_input_ready, router_output_ready, submitted_gate_up)
+    assert operation_order == [
+        "shared_input_ready",
+        "prepare_shared",
+        "gate_forward",
+        "router_output_ready",
+        "submit_gate_up",
+    ]
+    hidden_states.float.assert_not_called()
 
 
 @pytest.mark.parametrize("has_shared_experts", [False, True])
