@@ -70,10 +70,37 @@ def test_aligned_state_indices_preserve_int32_bits(max_reqs, slots, seq_dtype):
     assert torch.all(ctx.aligned_state_indices[:, num_reqs:].cpu() == -99)
 
 
-@pytest.mark.parametrize("max_reqs,slots", [(64, 3), (64, 16), (33, 4)])
-def test_aligned_state_indices_aclgraph_replay(max_reqs, slots):
+@pytest.mark.parametrize("num_groups", [1, 24])
+@pytest.mark.parametrize("seq_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("seq_length", [0, 1, 113, 129])
+def test_aligned_state_indices_single_row_window(num_groups, seq_dtype, seq_length):
     torch.npu.set_device(0)
-    num_groups, num_reqs, columns = 24, 17, 32
+    max_reqs, columns, slots = 33, 32, 8
+    tables = torch.arange(num_groups * max_reqs * columns * 2, dtype=torch.int32, device="npu").view(
+        num_groups, max_reqs, columns * 2
+    )[:, :, :columns]
+    seq_lens = torch.full((max_reqs * 2,), seq_length, dtype=seq_dtype, device="npu")[::2]
+    output = torch.full((num_groups, max_reqs, slots), -99, dtype=torch.int32, device="npu")
+    ctx = SimpleNamespace(
+        is_initialized=True,
+        block_table_ptrs=torch.tensor([table.data_ptr() for table in tables], dtype=torch.int64, device="npu"),
+        block_table_stride_req=tables.stride(1),
+        block_size=16,
+        num_groups=num_groups,
+        aligned_state_indices=output,
+    )
+    actual = _compute_aligned_state_indices(ctx, seq_lens, 1, columns)
+    first_slot = max((seq_length - 1) // 16, 0)
+    expected = tables[:, :1, first_slot : first_slot + slots]
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0, atol=0)
+    assert torch.all(output[:, 1:].cpu() == -99)
+
+
+@pytest.mark.parametrize("num_reqs", [1, 17])
+@pytest.mark.parametrize("max_reqs,slots", [(64, 3), (64, 16), (33, 4), (33, 8)])
+def test_aligned_state_indices_aclgraph_replay(max_reqs, slots, num_reqs):
+    torch.npu.set_device(0)
+    num_groups, columns = 24, 32
     tables = torch.arange(num_groups * max_reqs * columns, dtype=torch.int32, device="npu").view(
         num_groups, max_reqs, columns
     )
