@@ -964,7 +964,6 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             spec_sequence_masks=spec_sequence_masks,
-            spec_sequence_masks_cpu=spec_sequence_masks_cpu,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
@@ -1023,7 +1022,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             else:
                 block_table = mamba_get_block_table_tensor(block_table, m.gdn_seq_lens, self.kv_cache_spec, "align")
         spec_indices = non_spec_indices = prefill_indices = conv_cache_indices = None
-        if m.spec_sequence_masks_cpu is None:
+        if m.spec_sequence_masks is None:
             non_spec_indices = block_table[:, 0]
             conv_cache_indices = block_table
             if m.num_prefills > 0:
@@ -1073,8 +1072,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_state_indices_tensor=spec_indices,
             non_spec_state_indices_tensor=non_spec_indices,
             prefill_state_indices=prefill_indices,
-            checkpoint=m.checkpoint.regather_state_indices(blk_table) if m.checkpoint is not None else None,
         )
+        # Checkpoint metadata is optional and absent from vLLM v0.30.0.
+        checkpoint = getattr(m, "checkpoint", None)
+        if checkpoint is not None:
+            result.checkpoint = checkpoint.regather_state_indices(blk_table)
         for name in ("gdn_num_reqs", "gdn_seq_lens", "spec_sequence_indices", "non_spec_sequence_indices"):
             setattr(result, name, getattr(m, name))
         result.non_spec_prefill_metadata = m.non_spec_prefill_metadata

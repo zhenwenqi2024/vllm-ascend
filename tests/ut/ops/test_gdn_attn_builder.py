@@ -3,12 +3,11 @@
 from contextlib import ExitStack
 from dataclasses import dataclass, is_dataclass
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
-from vllm.model_executor.layers.mamba.checkpoint import MambaPrefillCheckpointMetadata
 from vllm.third_party.flash_linear_attention.ops import index as _fla_index
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
@@ -475,13 +474,20 @@ def test_reused_gdn_checkpoint_rebinds_physical_indices():
     common = create_common_attn_metadata(BatchSpec([50, 40], [1, 1]), 16, torch.device("cpu"))
     common.block_table_tensor = torch.arange(8, dtype=torch.int32).view(2, 4)
     source = builder.build(0, common)
-    source.checkpoint = MambaPrefillCheckpointMetadata(
+    source.checkpoint = SimpleNamespace(
         checkpoint_offsets=torch.tensor([16, 0]),
         state_indices=torch.tensor([2, NULL_BLOCK_ID], dtype=torch.int32),
-        request_rows=torch.tensor([0, 1]),
-        block_cols=torch.tensor([2, -1]),
+        regather_state_indices=Mock(),
     )
-    updated = builder.update_block_table(source, common.block_table_tensor + 100)
+    rebound_checkpoint = SimpleNamespace(
+        checkpoint_offsets=source.checkpoint.checkpoint_offsets,
+        state_indices=torch.tensor([102, NULL_BLOCK_ID], dtype=torch.int32),
+    )
+    source.checkpoint.regather_state_indices.return_value = rebound_checkpoint
+    other_table = common.block_table_tensor + 100
+    updated = builder.update_block_table(source, other_table)
+    source.checkpoint.regather_state_indices.assert_called_once_with(other_table)
+    assert updated.checkpoint is rebound_checkpoint
     assert updated.checkpoint.state_indices.tolist() == [102, NULL_BLOCK_ID]
     assert source.checkpoint.state_indices.tolist() == [2, NULL_BLOCK_ID]
     assert updated.checkpoint.checkpoint_offsets is source.checkpoint.checkpoint_offsets
