@@ -1079,6 +1079,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             setattr(result, name, getattr(m, name))
         result.non_spec_prefill_metadata = m.non_spec_prefill_metadata
         if m.non_spec_prefill_metadata is not None:
+            assert conv_cache_indices is not None, "Prefill metadata requires cache indices"
             prefill = m.non_spec_prefill_metadata
             result.non_spec_prefill_metadata = replace(
                 prefill,
@@ -1088,6 +1089,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
         result.spec_decode_metadata = m.spec_decode_metadata
         if m.spec_decode_metadata is not None:
+            assert spec_indices is not None, "Speculative metadata requires state indices"
             spec = m.spec_decode_metadata
             result.spec_decode_metadata = replace(
                 spec,
@@ -1097,6 +1099,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
         result.non_spec_decode_metadata = m.non_spec_decode_metadata
         if m.non_spec_decode_metadata is not None:
+            assert conv_cache_indices is not None, "Decode metadata requires cache indices"
             decode = m.non_spec_decode_metadata
             result.non_spec_decode_metadata = replace(
                 decode,
