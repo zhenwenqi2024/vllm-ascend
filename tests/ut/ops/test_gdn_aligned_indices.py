@@ -9,6 +9,18 @@ import torch
 from vllm_ascend.ops.triton.v2.mamba import aligned_indices
 
 
+@pytest.fixture(autouse=True)
+def _patch_missing_next_power_of_2(monkeypatch):
+    # vLLM's CPU Triton placeholder omits this host arithmetic helper.
+    if not hasattr(aligned_indices.triton, "next_power_of_2"):
+        monkeypatch.setattr(
+            aligned_indices.triton,
+            "next_power_of_2",
+            lambda value: 1 << (value - 1).bit_length(),
+            raising=False,
+        )
+
+
 @pytest.mark.parametrize("num_reqs", [1, 2, 17, 32, 33, 128])
 @pytest.mark.parametrize("slots", [1, 3, 4, 7, 8, 16, 17])
 def test_window_launch_covers_rows_without_partial_write_overlap(num_reqs, slots):
