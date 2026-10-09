@@ -86,16 +86,25 @@ def _aligned_indices_flat_kernel(
 ):
     # Whole 32-byte output spans avoid cross-core partial-write overlap when
     # max_reqs * state_slots leaves adjacent group bases unaligned.
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    group = offsets // (MAX_REQS * STATE_SLOTS)
+    program_start = tl.program_id(0) * BLOCK
+    offsets = program_start + tl.arange(0, BLOCK)
+    groups = offsets // (MAX_REQS * STATE_SLOTS)
     rows = offsets // STATE_SLOTS % MAX_REQS
     slots = offsets % STATE_SLOTS
-    valid = (group < NUM_GROUPS) & (rows < num_reqs)
+    valid = (groups < NUM_GROUPS) & (rows < num_reqs)
     lengths = tl.load(seq_lens + rows * seq_stride, valid, other=1)
     first_slot = tl.maximum((lengths - 1) // CACHE_BLOCK_SIZE, 0).to(tl.int32)
-    # The same mask guards the pointer lookup and its dependent table load.
-    table_base = tl.load(table_ptrs + group, valid, other=0).to(tl.pointer_type(tl.int32))
-    values = tl.load(table_base + rows.to(tl.int64) * table_stride + first_slot + slots, valid, other=0)
+    first_group = program_start // (MAX_REQS * STATE_SLOTS)
+    last_group = tl.minimum(tl.cdiv(program_start + BLOCK, MAX_REQS * STATE_SLOTS), NUM_GROUPS)
+    values = tl.full((BLOCK,), 0, tl.int32)
+    for group in range(first_group, last_group):
+        # A vector int-to-pointer base aborts Ascend OffsetAnalysis. Keep the
+        # base scalar and visit only groups intersecting this program's output.
+        table_base = tl.load(table_ptrs + group).to(tl.pointer_type(tl.int32))
+        group_mask = valid & (groups == group)
+        group_values = tl.load(table_base + rows.to(tl.int64) * table_stride + first_slot + slots, group_mask, other=0)
+        values = tl.where(group_mask, group_values, values)
+    # One store retains disjoint 32-byte ownership across group boundaries.
     tl.store(output + offsets, values, valid)
 
 
