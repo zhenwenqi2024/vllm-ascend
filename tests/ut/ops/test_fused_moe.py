@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-import subprocess
-import sys
+import ast
 import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -53,15 +53,23 @@ from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8Dyna
 from vllm_ascend.quantization.quant_type import QuantType
 
 
-def test_quantization_base_import_before_moe_has_no_cycle():
-    """A fresh process catches import cycles hidden by test-module import order."""
-    code = """\
-from typing import get_args
-from vllm_ascend.quantization.methods.base import PreparedLinearInput
-from vllm_ascend.ops.fused_moe.shared_experts import LinearInput
-assert PreparedLinearInput in get_args(LinearInput)
-"""
-    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+def test_prepared_linear_input_import_does_not_cycle_through_moe():
+    """Both modules must use the leaf contract, even when imports are cached."""
+    leaf_module = "vllm_ascend.quantization.prepared_linear_input"
+    repository_root = Path(__file__).resolve().parents[3]
+    for relative_path in (
+        "vllm_ascend/quantization/methods/base.py",
+        "vllm_ascend/ops/fused_moe/shared_experts.py",
+    ):
+        source = (repository_root / relative_path).read_text(encoding="utf-8")
+        imports = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ImportFrom)]
+        assert any(
+            node.module == leaf_module and any(alias.name == "PreparedLinearInput" for alias in node.names)
+            for node in imports
+        ), relative_path
+        if relative_path.endswith("shared_experts.py"):
+            assert all(node.module != "vllm_ascend.quantization.methods.base" for node in imports)
+    assert PreparedLinearInput in get_args(shared_experts_module.LinearInput)
 
 
 @pytest.fixture
