@@ -50,7 +50,9 @@ def _aligned_indices_window_kernel(
         valid_rows = rows < num_reqs
         # Masked tl.load/store lanes do not access GM; tail offsets stay unclamped.
         lengths = tl.load(seq_lens + rows * seq_stride, valid_rows, other=1)
-        first_slot = tl.maximum((lengths - 1) // CACHE_BLOCK_SIZE, 0).to(tl.int32)
+        # Preserve the length dtype: Ascend BlockPtrAnalysis cannot parse an
+        # int64-to-int32 truncation in GM pointer offsets.
+        first_slot = tl.maximum((lengths - 1) // CACHE_BLOCK_SIZE, 0)
         window_start = first_slot // 8 * 8
         source_columns = window_start[:, None] + columns[None, :]
         # Only a small contiguous window enters UB, rather than the whole table.
@@ -60,7 +62,9 @@ def _aligned_indices_window_kernel(
             other=0,
         )
         # Masked output lanes must also have valid UB gather indices.
-        local_indices = first_slot[:, None] - window_start[:, None] + tl.minimum(slots[None, :], STATE_SLOTS - 1)
+        local_indices = (first_slot[:, None] - window_start[:, None] + tl.minimum(slots[None, :], STATE_SLOTS - 1)).to(
+            tl.int32
+        )
         # Ascend gather supports fp32 but not int32; preserve physical ID bits.
         values = tl.gather(source.to(tl.float32, bitcast=True), local_indices, axis=1).to(tl.int32, bitcast=True)
         tl.store(
