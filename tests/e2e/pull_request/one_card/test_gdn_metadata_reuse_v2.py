@@ -46,6 +46,30 @@ def test_aligned_state_indices_match_physical_tables(num_groups, num_reqs, num_s
 
 
 @pytest.mark.parametrize("max_reqs,slots", [(64, 3), (64, 16), (33, 4)])
+def test_aligned_state_indices_preserve_int32_bits(max_reqs, slots):
+    torch.npu.set_device(0)
+    num_groups, num_reqs, columns = 24, 17, 32
+    # Include IDs beyond exact fp32 integer precision, subnormal and NaN bits.
+    values = torch.tensor([0, 1, -1, 2**24 + 1, 2**31 - 1, -(2**31), 0x7F800001, -0x7FFFFF], dtype=torch.int32)
+    tables = values.repeat(num_groups * max_reqs * columns // values.numel()).view(num_groups, max_reqs, columns)
+    tables = tables.to("npu")
+    lengths = (torch.arange(max_reqs, dtype=torch.int32) % (columns - slots + 1)) * 16 + 1
+    ctx = SimpleNamespace(
+        is_initialized=True,
+        block_table_ptrs=torch.tensor([table.data_ptr() for table in tables], dtype=torch.int64, device="npu"),
+        block_table_stride_req=columns,
+        block_size=16,
+        num_groups=num_groups,
+        aligned_state_indices=torch.full((num_groups, max_reqs, slots), -99, dtype=torch.int32, device="npu"),
+    )
+    actual = _compute_aligned_state_indices(ctx, lengths.to("npu"), num_reqs, columns)
+    cols = (lengths[:num_reqs, None] - 1) // 16 + torch.arange(slots)
+    expected = torch.stack([table.cpu().gather(1, cols.long()) for table in tables])
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    assert torch.all(ctx.aligned_state_indices[:, num_reqs:].cpu() == -99)
+
+
+@pytest.mark.parametrize("max_reqs,slots", [(64, 3), (64, 16), (33, 4)])
 def test_aligned_state_indices_aclgraph_replay(max_reqs, slots):
     torch.npu.set_device(0)
     num_groups, num_reqs, columns = 24, 17, 32

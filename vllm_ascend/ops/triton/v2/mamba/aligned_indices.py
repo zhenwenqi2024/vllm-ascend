@@ -61,7 +61,8 @@ def _aligned_indices_window_kernel(
         )
         # Masked output lanes must also have valid UB gather indices.
         local_indices = first_slot[:, None] - window_start[:, None] + tl.minimum(slots[None, :], STATE_SLOTS - 1)
-        values = tl.gather(source, local_indices, axis=1)
+        # Ascend gather supports fp32 but not int32; preserve physical ID bits.
+        values = tl.gather(source.to(tl.float32, bitcast=True), local_indices, axis=1).to(tl.int32, bitcast=True)
         tl.store(
             output + group * output_group_stride + rows[:, None] * output_row_stride + slots[None, :],
             values,
