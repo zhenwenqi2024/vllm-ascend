@@ -35,7 +35,7 @@ def test_window_launch_covers_rows_without_partial_write_overlap(num_reqs, slots
 
 
 @pytest.mark.parametrize("num_reqs", [0, 1, 17, 33])
-@pytest.mark.parametrize("max_reqs,slots", [(64, 4), (64, 3), (33, 4), (33, 3)])
+@pytest.mark.parametrize("max_reqs,slots", [(64, 4), (64, 3), (33, 4), (33, 3), (33, 1)])
 def test_npu_gather_dispatches_once_and_keeps_output_storage(monkeypatch, num_reqs, max_reqs, slots):
     window_kernel, flat_kernel = MagicMock(), MagicMock()
     monkeypatch.setattr(aligned_indices, "_aligned_indices_window_kernel", window_kernel)

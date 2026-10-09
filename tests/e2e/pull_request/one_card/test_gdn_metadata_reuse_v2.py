@@ -45,7 +45,7 @@ def test_aligned_state_indices_match_physical_tables(num_groups, num_reqs, num_s
     assert torch.all(output[:, num_reqs:].cpu() == -99)
 
 
-@pytest.mark.parametrize("max_reqs,slots", [(64, 3), (64, 16), (33, 4)])
+@pytest.mark.parametrize("max_reqs,slots", [(64, 3), (64, 16), (33, 4), (33, 1), (33, 3)])
 def test_aligned_state_indices_preserve_int32_bits(max_reqs, slots):
     torch.npu.set_device(0)
     num_groups, num_reqs, columns = 24, 17, 32
