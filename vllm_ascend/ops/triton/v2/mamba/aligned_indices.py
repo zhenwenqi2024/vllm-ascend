@@ -48,6 +48,7 @@ def _aligned_indices_window_kernel(
     for tile in range(first_tile, last_tile):
         rows = tile * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
         valid_rows = rows < num_reqs
+        # Masked tl.load/store lanes do not access GM; tail offsets stay unclamped.
         lengths = tl.load(seq_lens + rows * seq_stride, valid_rows, other=1)
         first_slot = tl.maximum((lengths - 1) // CACHE_BLOCK_SIZE, 0).to(tl.int32)
         window_start = first_slot // 8 * 8
@@ -91,6 +92,7 @@ def _aligned_indices_flat_kernel(
     valid = (group < NUM_GROUPS) & (rows < num_reqs)
     lengths = tl.load(seq_lens + rows * seq_stride, valid, other=1)
     first_slot = tl.maximum((lengths - 1) // CACHE_BLOCK_SIZE, 0).to(tl.int32)
+    # The same mask guards the pointer lookup and its dependent table load.
     table_base = tl.load(table_ptrs + group, valid, other=0).to(tl.pointer_type(tl.int32))
     values = tl.load(table_base + rows.to(tl.int64) * table_stride + first_slot + slots, valid, other=0)
     tl.store(output + offsets, values, valid)

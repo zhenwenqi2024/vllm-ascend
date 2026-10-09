@@ -153,6 +153,67 @@ def test_rebind_gdn_group_matches_full_build(
 
 
 @pytest.mark.parametrize("builder_cls", [AscendGDNAttentionMetadataBuilder, AscendGDNHostMetadataBuilder])
+@pytest.mark.parametrize("num_spec", [0, 3])
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_empty_align_batch_skips_gather_on_build_and_update(builder_cls, num_spec, precomputed):
+    device = torch.device("cpu")
+    empty = torch.empty(0, dtype=torch.int32)
+    query = torch.zeros(1, dtype=torch.int32)
+    table = torch.empty((0, 16), dtype=torch.int32)
+    common = AscendCommonAttentionMetadata(
+        query_start_loc=query,
+        query_start_loc_cpu=query,
+        seq_lens=empty,
+        _seq_lens_cpu=empty,
+        seq_lens_cpu=empty,
+        seq_lens_cpu_upper_bound=empty,
+        _num_computed_tokens_cpu=empty,
+        num_computed_tokens_cpu=empty,
+        num_reqs=0,
+        num_actual_tokens=0,
+        max_query_len=0,
+        max_seq_len=0,
+        block_table_tensor=table,
+        slot_mapping=torch.empty(0, dtype=torch.int64),
+        is_prefilling=torch.empty(0, dtype=torch.bool),
+    )
+    owner, other = [
+        _make_builder(
+            device=device,
+            num_heads=32,
+            num_speculative_tokens=num_spec,
+            num_speculative_blocks=num_spec,
+            builder_cls=builder_cls,
+            mamba_cache_mode="align",
+        )
+        for _ in range(2)
+    ]
+    if precomputed:
+        for builder in (owner, other):
+            builder.mamba_aligned_state_indices = torch.empty((0, num_spec + 1), dtype=torch.int32)
+    kwargs = dict(
+        num_decode_draft_tokens_cpu=empty if num_spec else None,
+        num_accepted_tokens=empty if num_spec else None,
+        num_actual_reqs=0,
+    )
+    # The upstream helper accepts empty tensors; V2 should avoid launching its
+    # arithmetic/gather operations when the output is already known to be empty.
+    expected_table = ascend_gdn_attn_builder.mamba_get_block_table_tensor(table, empty, owner.kv_cache_spec, "align")
+    assert expected_table.shape == (0, num_spec + 1)
+    with patch.object(
+        ascend_gdn_attn_builder, "mamba_get_block_table_tensor", side_effect=AssertionError("Skip empty gather")
+    ):
+        source = owner.build(0, common, **kwargs)
+        updated = other.update_block_table(source, table, common.slot_mapping)
+    _assert_reused_gdn_metadata_matches(updated, source)
+    assert updated is not source
+    assert updated.non_spec_state_indices_tensor.shape == (0,)
+    assert updated.non_spec_query_start_loc is source.non_spec_query_start_loc
+    assert updated.non_spec_decode_metadata is None
+    assert updated.non_spec_prefill_metadata is None
+
+
+@pytest.mark.parametrize("builder_cls", [AscendGDNAttentionMetadataBuilder, AscendGDNHostMetadataBuilder])
 @pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
 @pytest.mark.parametrize("spec", [False, True])
 def test_shared_gdn_graph_inputs_refresh_without_repeated_public_staging(builder_cls, mamba_cache_mode, spec):
