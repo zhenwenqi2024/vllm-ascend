@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import subprocess
+import sys
 import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
@@ -49,6 +51,17 @@ from vllm_ascend.ops.fused_moe.shared_experts import (
 from vllm_ascend.quantization.methods.base import PreparedLinearInput
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
 from vllm_ascend.quantization.quant_type import QuantType
+
+
+def test_quantization_base_import_before_moe_has_no_cycle():
+    """A fresh process catches import cycles hidden by test-module import order."""
+    code = """\
+from typing import get_args
+from vllm_ascend.quantization.methods.base import PreparedLinearInput
+from vllm_ascend.ops.fused_moe.shared_experts import LinearInput
+assert PreparedLinearInput in get_args(LinearInput)
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
 
 
 @pytest.fixture

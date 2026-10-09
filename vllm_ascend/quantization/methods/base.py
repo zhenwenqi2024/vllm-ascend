@@ -19,13 +19,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch_npu
 
 from vllm_ascend.ops.fused_moe.moe_utils import maybe_normalize_mxfp_scale_layout
+from vllm_ascend.quantization.prepared_linear_input import PreparedLinearInput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.weight_switch import (
     WeightLoadPartition,
@@ -71,15 +71,6 @@ def get_moe_num_logical_experts(
         return int(num_logical_experts)
 
     return int(num_experts - global_redundant_expert_num - num_shared_experts)
-
-
-@dataclass(frozen=True)
-class PreparedLinearInput:
-    """Quantized input prepared before a multistream scheduling barrier."""
-
-    quantized: torch.Tensor
-    scale: torch.Tensor | None
-    output_dtype: torch.dtype
 
 
 class AscendLinearScheme(WeightSwitchMixin, ABC):
