@@ -45,15 +45,16 @@ def test_aligned_state_indices_match_physical_tables(num_groups, num_reqs, num_s
     assert torch.all(output[:, num_reqs:].cpu() == -99)
 
 
-@pytest.mark.parametrize("max_reqs,slots", [(64, 3), (64, 16), (33, 4), (33, 1), (33, 3)])
-def test_aligned_state_indices_preserve_int32_bits(max_reqs, slots):
+@pytest.mark.parametrize("seq_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("max_reqs,slots", [(64, 3), (64, 16), (33, 4), (33, 1), (33, 3), (33, 8)])
+def test_aligned_state_indices_preserve_int32_bits(max_reqs, slots, seq_dtype):
     torch.npu.set_device(0)
     num_groups, num_reqs, columns = 24, 17, 32
     # Include IDs beyond exact fp32 integer precision, subnormal and NaN bits.
     values = torch.tensor([0, 1, -1, 2**24 + 1, 2**31 - 1, -(2**31), 0x7F800001, -0x7FFFFF], dtype=torch.int32)
     tables = values.repeat(num_groups * max_reqs * columns // values.numel()).view(num_groups, max_reqs, columns)
     tables = tables.to("npu")
-    lengths = (torch.arange(max_reqs, dtype=torch.int32) % (columns - slots + 1)) * 16 + 1
+    lengths = (torch.arange(max_reqs, dtype=seq_dtype) % (columns - slots + 1)) * 16 + 1
     ctx = SimpleNamespace(
         is_initialized=True,
         block_table_ptrs=torch.tensor([table.data_ptr() for table in tables], dtype=torch.int64, device="npu"),
