@@ -711,13 +711,19 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
         aligned_indices = getattr(self, "mamba_aligned_state_indices", None)
-        block_table_tensor = (
-            aligned_indices[: m.num_reqs]
-            if aligned_indices is not None
-            else mamba_get_block_table_tensor(
+        if aligned_indices is not None:
+            block_table_tensor = aligned_indices[: m.num_reqs]
+        elif (
+            self.vllm_config.use_v2_model_runner
+            and m.num_reqs == 0
+            and self.vllm_config.cache_config.mamba_cache_mode == "align"
+        ):
+            # Match the helper's (0, state_slots) shape without device work.
+            block_table_tensor = m.block_table_tensor[:0, : 1 + self.kv_cache_spec.num_speculative_blocks]
+        else:
+            block_table_tensor = mamba_get_block_table_tensor(
                 m.block_table_tensor, m.seq_lens, self.kv_cache_spec, self.vllm_config.cache_config.mamba_cache_mode
             )
-        )
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
         spec_sequence_indices: torch.Tensor | None = None
@@ -1010,11 +1016,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         block_table = blk_table[: m.gdn_num_reqs]
         if self.vllm_config.cache_config.mamba_cache_mode == "align":
             aligned = self.mamba_aligned_state_indices
-            block_table = (
-                aligned[: m.gdn_num_reqs]
-                if aligned is not None
-                else mamba_get_block_table_tensor(block_table, m.gdn_seq_lens, self.kv_cache_spec, "align")
-            )
+            if aligned is not None:
+                block_table = aligned[: m.gdn_num_reqs]
+            elif m.gdn_num_reqs == 0:
+                block_table = block_table[:, : 1 + self.kv_cache_spec.num_speculative_blocks]
+            else:
+                block_table = mamba_get_block_table_tensor(block_table, m.gdn_seq_lens, self.kv_cache_spec, "align")
         spec_indices = non_spec_indices = prefill_indices = conv_cache_indices = None
         if m.spec_sequence_masks_cpu is None:
             non_spec_indices = block_table[:, 0]
