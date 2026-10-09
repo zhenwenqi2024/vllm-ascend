@@ -25,6 +25,7 @@ from vllm_ascend.ops.fused_moe.dataclass.shared_experts import (
     RoutedMoEMilestones,
 )
 from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
+from vllm_ascend.ops.fused_moe.gate_linear import AscendGateLinear
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, AlltoAllCommImpl, MC2CommImpl
 from vllm_ascend.ops.fused_moe.routed_experts import (
     AscendRoutedExperts,
@@ -2585,6 +2586,66 @@ def test_internal_router_releases_shared_stream_after_input_cast(monkeypatch):
     assert actual_router_ready is router_output_ready
     assert actual_submitted_gate_up is submitted_gate_up
     torch.testing.assert_close(router_logits, original_linear(hidden_states.float(), gate_weight))
+
+
+def test_internal_router_without_precast_preserves_gate_forward_and_early_shared_prepare(monkeypatch):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    hidden_states = MagicMock()
+    hidden_states.float.side_effect = AssertionError("fallback must not allocate an unused FP32 input")
+    prepared_input = PreparedSharedExpertInput(hidden_states)
+    prepared_execution = object()
+    submitted_gate_up = object()
+    gate_logits = object()
+    operation_order = []
+    shared_input_ready = object()
+    router_output_ready = object()
+    events = iter((shared_input_ready, router_output_ready))
+
+    def record_event():
+        event = next(events)
+        operation_order.append("shared_input_ready" if event is shared_input_ready else "router_output_ready")
+        return event
+
+    def gate_forward(states):
+        assert states is hidden_states
+        operation_order.append("gate_forward")
+        return gate_logits, None
+
+    def prepare_shared(actual_input, actual_event):
+        assert actual_input is prepared_input
+        assert actual_event is shared_input_ready
+        operation_order.append("prepare_shared")
+        return prepared_execution
+
+    def enqueue_gate_up(actual_execution, actual_event):
+        assert actual_execution is prepared_execution
+        assert actual_event is router_output_ready
+        operation_order.append("submit_gate_up")
+        return submitted_gate_up
+
+    runner.gate = MagicMock(spec=AscendGateLinear, side_effect=gate_forward)
+    runner.ascend_shared_experts = SimpleNamespace(
+        multistream_overlap=True,
+        prepare_for_router_overlap=MagicMock(side_effect=prepare_shared),
+        enqueue_gate_up_after_router=MagicMock(side_effect=enqueue_gate_up),
+    )
+    current_stream = MagicMock()
+    current_stream.record_event.side_effect = record_event
+    monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: True))
+    monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
+
+    result = runner._prepare_router_and_milestones(prepared_input, hidden_states, object())
+
+    assert result == (gate_logits, shared_input_ready, router_output_ready, submitted_gate_up)
+    assert operation_order == [
+        "shared_input_ready",
+        "prepare_shared",
+        "gate_forward",
+        "router_output_ready",
+        "submit_gate_up",
+    ]
+    hidden_states.float.assert_not_called()
 
 
 @pytest.mark.parametrize("has_shared_experts", [False, True])

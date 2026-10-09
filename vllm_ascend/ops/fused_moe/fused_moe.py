@@ -449,15 +449,16 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
     ]:
         if self.is_internal_router:
             router_input = self._prepare_router_input(shared_hidden_states, router_logits)
-            # Release shared Vector/AIV preparation only after the router input
-            # Cast. It then overlaps the Cube-heavy gate matmul instead of
-            # competing with another Vector/AIV operation.
+            # Release shared Vector/AIV preparation after any external FP32
+            # router-input Cast. Gates using their registered forward path may
+            # still prepare their input internally.
             shared_input_ready = torch.npu.current_stream().record_event()
             prepared_execution = self._prepare_shared_for_router_overlap(
                 prepared_shared_input,
                 shared_input_ready,
             )
             router_logits = self._apply_router_linear(router_input)
+            del router_input
             router_output_ready = torch.npu.current_stream().record_event()
         else:
             shared_input_ready = torch.npu.current_stream().record_event()
