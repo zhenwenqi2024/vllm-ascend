@@ -49,12 +49,22 @@ def _aligned_indices_window_kernel(
         rows = tile * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
         valid_rows = rows < num_reqs
         # Masked tl.load/store lanes do not access GM; tail offsets stay unclamped.
-        lengths = tl.load(seq_lens + rows * seq_stride, valid_rows, other=1)
+        if BLOCK_ROWS == 1:
+            # A true scalar keeps max/div out of Ascend's single-element
+            # tensor pointer analysis, which does not support tensor maxsi.
+            lengths = tl.load(seq_lens + tile * seq_stride, tile < num_reqs, other=1)
+        else:
+            lengths = tl.load(seq_lens + rows * seq_stride, valid_rows, other=1)
         # Preserve the length dtype: Ascend BlockPtrAnalysis cannot parse an
         # int64-to-int32 truncation in GM pointer offsets.
         first_slot = tl.maximum((lengths - 1) // CACHE_BLOCK_SIZE, 0)
         window_start = first_slot // 8 * 8
-        source_columns = window_start[:, None] + columns[None, :]
+        if BLOCK_ROWS == 1:
+            source_columns = window_start + columns[None, :]
+            local_indices = first_slot - window_start + tl.minimum(slots[None, :], STATE_SLOTS - 1)
+        else:
+            source_columns = window_start[:, None] + columns[None, :]
+            local_indices = first_slot[:, None] - window_start[:, None] + tl.minimum(slots[None, :], STATE_SLOTS - 1)
         # Only a small contiguous window enters UB, rather than the whole table.
         source = tl.load(
             table_base + rows[:, None].to(tl.int64) * table_stride + source_columns,
@@ -62,9 +72,7 @@ def _aligned_indices_window_kernel(
             other=0,
         )
         # Masked output lanes must also have valid UB gather indices.
-        local_indices = (first_slot[:, None] - window_start[:, None] + tl.minimum(slots[None, :], STATE_SLOTS - 1)).to(
-            tl.int32
-        )
+        local_indices = local_indices.to(tl.int32)
         # Ascend gather supports fp32 but not int32; preserve physical ID bits.
         values = tl.gather(source.to(tl.float32, bitcast=True), local_indices, axis=1).to(tl.int32, bitcast=True)
         tl.store(
