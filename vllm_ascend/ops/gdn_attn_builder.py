@@ -658,6 +658,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         """Refresh graph-owned pure decode buffers in one NPU launch."""
         from vllm_ascend.ops.triton.v2.mamba.cached_decode import materialize_cached_gdn_decode
 
+        assert self.spec_actual_seq_lengths is not None
         actual_request_count = metadata.num_spec_decodes
         token_count = metadata.spec_token_indx.numel()
         assert metadata.non_spec_token_indx.numel() == 0

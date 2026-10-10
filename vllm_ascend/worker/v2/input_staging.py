@@ -21,7 +21,7 @@ class BatchInputStaging:
         self.max_num_reqs = max_num_reqs
         self.device = device
         self.stream = None
-        self.banks: list[tuple[torch.Tensor, torch.Tensor, object]] = []
+        self.banks: list[tuple[torch.Tensor, torch.Tensor, torch.npu.Event]] = []
 
     def copy(
         self,
