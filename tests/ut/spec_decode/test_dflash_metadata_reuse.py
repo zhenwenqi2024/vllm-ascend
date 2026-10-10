@@ -9,9 +9,13 @@ import numpy as np
 import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
+from vllm_ascend.attention.attention_v1 import AscendMetadata
+from vllm_ascend.worker.v2.spec_decode.dflash import aclgraph as graph_module
 from vllm_ascend.worker.v2.spec_decode.dflash import speculator as dflash_module
+from vllm_ascend.worker.v2.spec_decode.dflash.aclgraph import DFlashAclGraphManager
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpeculator
 
 
@@ -137,3 +141,161 @@ def test_dflash_metadata_shares_exact_lengths_and_refreshes_after_rejection(monk
     assert [value.tolist() for value in supplied] == [[73, 22666, 0, 0], [74, 22674, 0, 0]]
     assert upper_bound.tolist() == [99, 99999]
     assert parent.call_count == 2
+
+
+def test_prefetched_lengths_wait_on_copy_event_and_clear_old_padding():
+    spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    spec._draft_seq_lens_cpu = torch.tensor([73, 81, 99, 99], dtype=torch.int32)
+    spec._draft_seq_lens_copy_count = 2
+    spec._draft_seq_lens_copy_event = MagicMock()
+    # A copy from the compute stream here would deadlock after early replay.
+    spec.input_buffers = SimpleNamespace(seq_lens=MagicMock(side_effect=AssertionError("Unexpected D2H")))
+    mirror = spec._prepare_draft_seq_lens_cpu(2, 4)
+    assert mirror.tolist() == [73, 81, 0, 0]
+    assert mirror.data_ptr() == spec._draft_seq_lens_cpu.data_ptr()
+    assert spec._draft_seq_lens_copy_count is None
+    spec._draft_seq_lens_copy_event.synchronize.assert_called_once_with()
+
+
+def test_snapshot_is_started_only_after_final_group_writer():
+    spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    spec._in_draft_proposal = spec._use_cpu_seq_lens = True
+    spec._draft_input_groups_prepared = 0
+    spec.draft_kv_cache_group_ids = [2, 5]
+    spec.input_batch = SimpleNamespace(num_reqs=3)
+    spec._start_draft_seq_lens_copy = MagicMock()
+    spec._on_draft_inputs_prepared()
+    spec._start_draft_seq_lens_copy.assert_not_called()
+    spec._on_draft_inputs_prepared()
+    spec._start_draft_seq_lens_copy.assert_called_once_with(3)
+
+
+def test_full_layout_reuse_refreshes_lengths_and_each_groups_physical_cache(monkeypatch):
+    spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    spec._use_cpu_seq_lens = spec._reuse_draft_layout = True
+    spec._prepared_draft_attn_metadata = spec._draft_metadata_template = None
+    spec.input_buffers = SimpleNamespace(
+        seq_lens=torch.tensor([73, 81, 999, 999]), query_start_loc=torch.arange(5), positions=torch.arange(32)
+    )
+    spec.draft_is_prefilling = torch.zeros(4, dtype=torch.bool)
+    spec.vllm_config = SimpleNamespace(parallel_config=object())
+    monkeypatch.setattr(AscendDFlashSpeculator, "attn_vllm_config", property(lambda self: self.vllm_config))
+    spec.attn_groups = [[SimpleNamespace(layer_names=["a", "b"])], [SimpleNamespace(layer_names=["c"])]]
+    spec.block_tables = SimpleNamespace(
+        input_block_tables=[torch.full((4, 2), i) for i in (1, 2)],
+        slot_mappings=torch.arange(64).reshape(2, 32),
+    )
+    original = {
+        "a": AscendMetadata(query_start_loc=torch.arange(5), actual_seq_lengths_q=[8, 16, 16, 16]),
+        "c": AscendMetadata(query_start_loc=torch.arange(5), actual_seq_lengths_q=[8, 16, 16, 16]),
+    }
+    original["b"] = original["a"]
+    parent = MagicMock(return_value=original)
+    monkeypatch.setattr(DFlashSpeculator, "_build_attn_metadata", parent)
+    monkeypatch.setattr(dflash_module, "build_attn_metadata_factory", lambda *a, **kw: nullcontext())
+    desc = SimpleNamespace(cg_mode=CUDAGraphMode.FULL, num_reqs=4, num_tokens=32)
+    args = (2, desc, np.array([0, 8, 16]), torch.tensor([100, 100]), 8, False)
+    spec._build_attn_metadata(*args)
+    # Simulate rejection, a new block allocation and changed slot mappings.
+    spec.input_buffers.seq_lens[:2] = torch.tensor([60, 82])
+    spec.block_tables.input_block_tables = [torch.full((4, 2), i) for i in (10, 20)]
+    spec.block_tables.slot_mappings = torch.arange(64, 128).reshape(2, 32)
+    refreshed = spec._build_attn_metadata(*args)
+    parent.assert_called_once()
+    assert refreshed["a"] is refreshed["b"]
+    assert refreshed["a"] is not refreshed["c"]
+    assert refreshed["a"].query_start_loc is original["a"].query_start_loc
+    for name, index in (("a", 0), ("c", 1)):
+        assert refreshed[name].seq_lens_list == [60, 82, 0, 0]
+        assert refreshed[name].block_tables.data_ptr() == spec.block_tables.input_block_tables[index].data_ptr()
+        assert refreshed[name].slot_mapping.data_ptr() == spec.block_tables.slot_mappings[index].data_ptr()
+        assert refreshed[name].qfa_metadata_cache == {}
+    # A different query layout must rebuild instead of reusing the old shape.
+    spec._build_attn_metadata(2, desc, np.array([0, 4, 16]), args[3], 8, False)
+    assert parent.call_count == 2
+
+
+def test_graph_replay_precedes_deferred_build_but_update_stream_wait_precedes_replay(monkeypatch):
+    manager = DFlashAclGraphManager.__new__(DFlashAclGraphManager)
+    calls = []
+    graph = MagicMock()
+    monkeypatch.setattr(graph_module, "UpdatableGraph", MagicMock)
+    metadata = {"draft": object()}
+    desc = BatchExecutionDescriptor(cg_mode=CUDAGraphMode.FULL, num_tokens=32, num_reqs=4)
+    manager.graphs = {desc: graph}
+    manager.speculator = SimpleNamespace(
+        _deferred_draft_attn_metadata=object(),
+        attn_backends={"draft": object()},
+        input_batch=SimpleNamespace(seq_lens_cpu_upper_bound=object()),
+        build_draft_attn_metadatas=lambda *a: calls.append("build") or [metadata],
+    )
+    manager.update_stream = SimpleNamespace(wait_stream=lambda stream: calls.append("wait_inputs"))
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: object())
+    monkeypatch.setattr(torch.npu, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(graph_module.DFlashCudaGraphManager, "run_fullgraph", lambda *a: calls.append("replay") or 7)
+    graph.resolve_tasks.side_effect = lambda source: calls.append("resolve") or ()
+    graph.update.side_effect = lambda *a: calls.append("update")
+    assert manager.run_fullgraph(desc) == 7
+    assert calls == ["wait_inputs", "replay", "build", "resolve", "update"]
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
+def test_deferred_metadata_requires_prefetch_and_captured_fia_events(monkeypatch, mode):
+    spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    spec._in_draft_proposal = spec._reuse_draft_layout = True
+    spec._materializing_draft_metadata = False
+    spec._draft_seq_lens_copy_count = 2
+    desc = BatchExecutionDescriptor(cg_mode=mode, num_tokens=32, num_reqs=4)
+    graph = MagicMock()
+    graph.tasks = [object()]
+    monkeypatch.setattr(dflash_module, "UpdatableGraph", MagicMock)
+    spec.query_cudagraph_manager = SimpleNamespace(graphs={desc: graph})
+    assert spec._can_defer_draft_metadata(desc) == (mode == CUDAGraphMode.FULL)
+    graph.tasks = []
+    assert not spec._can_defer_draft_metadata(desc)
+    graph.tasks = [object()]
+    spec._draft_seq_lens_copy_count = None
+    assert not spec._can_defer_draft_metadata(desc)
+
+
+def test_deferred_build_materializes_current_proposal_once(monkeypatch):
+    spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    spec.num_query_per_req = 8
+    spec._prepared_draft_attn_metadata = None
+    spec._materializing_draft_metadata = False
+    desc = BatchExecutionDescriptor(cg_mode=CUDAGraphMode.FULL, num_tokens=32, num_reqs=4)
+    args = (2, desc, np.array([0, 8, 16]), torch.tensor([100, 100]), 8, False, None)
+    spec._deferred_draft_attn_metadata = args
+    metadata = {"draft": SimpleNamespace(actual_seq_lengths_q=None)}
+
+    def build(*actual):
+        assert spec._materializing_draft_metadata
+        assert actual == args
+        assert spec._deferred_draft_attn_metadata is None
+        spec._prepared_draft_attn_metadata = (4, metadata)
+
+    builder = MagicMock(side_effect=build)
+    monkeypatch.setattr(spec, "_build_attn_metadata", builder)
+    assert spec.build_draft_attn_metadatas(4, args[3]) == [metadata]
+    assert metadata["draft"].actual_seq_lengths_q == [8, 16, 24, 32]
+    assert spec.build_draft_attn_metadatas(4, args[3])[0] is metadata
+    builder.assert_called_once()
+    assert not spec._materializing_draft_metadata
+
+
+@pytest.mark.parametrize("has_context_prefix", [False, True])
+def test_capture_preserves_upstream_context_kv_callback(monkeypatch, has_context_prefix):
+    manager = DFlashAclGraphManager.__new__(DFlashAclGraphManager)
+    manager.speculator = object()
+    parent = MagicMock()
+    monkeypatch.setattr(graph_module.DFlashCudaGraphManager, "capture", parent)
+    monkeypatch.setattr(graph_module, "communicator_switch", lambda: nullcontext())
+    monkeypatch.setattr(graph_module, "model_capture_wrapper", lambda *args: nullcontext())
+    callback = MagicMock() if has_context_prefix else None
+    manager.capture(*([None] * 6), False, "Capture draft", precompute_context_kv=callback)
+    parent.assert_called_once()
+    assert parent.call_args.kwargs["progress_bar_desc"] == "Capture draft"
+    if has_context_prefix:
+        assert parent.call_args.kwargs["precompute_context_kv"] is callback
+    else:
+        assert "precompute_context_kv" not in parent.call_args.kwargs
