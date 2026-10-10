@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from typing import Any, cast
 
@@ -51,6 +51,9 @@ def prepare_dflash_inputs_factory(
 
 
 class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
+    _deferred_draft_attn_metadata: tuple[Any, ...] | None
+    _draft_query_lengths: tuple[tuple[int, int], list[int]] | None
+
     def load_draft_model(
         self,
         target_model: torch.nn.Module,
@@ -120,9 +123,9 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         super().__init__(vllm_config, device)
         self._lmhead_tp_validate_draft_sampling()
         self._prepared_draft_attn_metadata: tuple[int, dict[str, Any]] | None = None
-        self._deferred_draft_attn_metadata: tuple[Any, ...] | None = None
+        self._deferred_draft_attn_metadata = None
         self._draft_metadata_template: tuple[Any, dict[str, AscendMetadata]] | None = None
-        self._draft_query_lengths: tuple[tuple[int, int], list[int]] | None = None
+        self._draft_query_lengths = None
         self._draft_seq_lens_cpu: torch.Tensor | None = None
         self._draft_seq_lens_copy_stream: torch.npu.Stream | None = None
         self._draft_seq_lens_copy_event: torch.npu.Event | None = None
@@ -254,7 +257,7 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
                 dcp_local_seq_lens,
             )
             return None
-        context = nullcontext()
+        context: AbstractContextManager[Any] = nullcontext()
         template_key = None
         if getattr(self, "_use_cpu_seq_lens", False):
             num_reqs_padded = batch_desc.num_reqs or num_reqs
