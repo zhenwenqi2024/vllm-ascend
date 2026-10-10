@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import Any, cast
 
 import torch
@@ -15,8 +16,9 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 from vllm_ascend.ops.triton.v2.spec_decode.prepare_dflash_inputs import prepare_dflash_inputs_triton
-from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
+from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_attn_metadata_wrapper
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_profiling_chunk_for_draft,
@@ -91,6 +93,16 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         super().__init__(vllm_config, device)
         self._lmhead_tp_validate_draft_sampling()
         self._prepared_draft_attn_metadata: tuple[int, dict[str, Any]] | None = None
+        self._use_cpu_seq_lens = False
+
+    def _prepare_draft_seq_lens_cpu(self, num_reqs: int, num_reqs_padded: int) -> torch.Tensor:
+        # Match GLM5.2/DSpark: transfer the device's valid lengths once, then
+        # share the host mirror across FIA builders. The target CPU upper bound
+        # still includes rejected tokens and cannot replace this exact mirror.
+        seq_lens_cpu = torch.zeros(num_reqs_padded, dtype=torch.int32, device="cpu")
+        if num_reqs:
+            seq_lens_cpu[:num_reqs].copy_(self.input_buffers.seq_lens[:num_reqs])
+        return seq_lens_cpu
 
     def _build_attn_metadata(
         self,
@@ -102,18 +114,34 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         causal=True,
         dcp_local_seq_lens=None,
     ):
-        metadata = super()._build_attn_metadata(
-            num_reqs,
-            batch_desc,
-            query_start_loc_np,
-            seq_lens_cpu_upper_bound,
-            step,
-            causal,
-            dcp_local_seq_lens,
-        )
+        context = nullcontext()
+        if getattr(self, "_use_cpu_seq_lens", False):
+            num_reqs_padded = batch_desc.num_reqs or num_reqs
+            seq_lens_cpu = self._prepare_draft_seq_lens_cpu(num_reqs, num_reqs_padded)
+            num_tokens = (
+                batch_desc.num_tokens if batch_desc.cg_mode == CUDAGraphMode.FULL else int(query_start_loc_np[-1])
+            )
+            context = build_attn_metadata_factory(
+                self.input_buffers.positions,
+                num_tokens,
+                is_prefilling=self.draft_is_prefilling[:num_reqs_padded],
+                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_cpu_is_exact=True,
+                parallel_config=self.attn_vllm_config.parallel_config,
+            )
+        with context:
+            metadata = super()._build_attn_metadata(
+                num_reqs,
+                batch_desc,
+                query_start_loc_np,
+                seq_lens_cpu_upper_bound,
+                step,
+                causal,
+                dcp_local_seq_lens,
+            )
         # Upstream builds this even for FULL replay, refreshing builder state.
         # Reuse that result when the graph manager asks again in this proposal.
-        # Group-local cache tensors and all copy/synchronization paths are kept.
+        # The result includes group-local cache tensors and exact host lengths.
         if metadata is not None and batch_desc.cg_mode == CUDAGraphMode.FULL:
             self._prepared_draft_attn_metadata = (batch_desc.num_reqs or num_reqs, metadata)
         return metadata
@@ -164,6 +192,11 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
                 attn_backends[layer_name] = attn_layers[layer_name].get_attn_backend()
 
         self.attn_backends = attn_backends
+        self._use_cpu_seq_lens = (
+            AscendAttentionBackend in attn_backends.values()
+            and self.attn_vllm_config.parallel_config.decode_context_parallel_size == 1
+            and self.attn_vllm_config.parallel_config.prefill_context_parallel_size == 1
+        )
         dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_factory(
             self.vllm_config.cache_config.block_size
         )
