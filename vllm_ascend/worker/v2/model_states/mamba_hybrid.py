@@ -105,6 +105,16 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         self._layerwise_mamba_copy: _LayerwiseMambaCopyState | None = None
         self._layer_state_ranges: dict[str, tuple[int, int]] | None = None
 
+    def _get_aligned_state_index_views(self, indices: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        # The gather refreshes values in fixed storage. Reuse only row views;
+        # a request-count, stride or backing-storage change rebuilds them.
+        key = (indices.data_ptr(), indices.shape, indices.stride(), indices.dtype, indices.device)
+        cached = getattr(self, "_aligned_state_index_views", None)
+        if cached is None or cached[0] != key:
+            cached = (key, indices.unbind(0))
+            self._aligned_state_index_views = cached
+        return cached[1]
+
     def _get_layer_state_ranges(self, kv_cache_config: KVCacheConfig) -> dict[str, tuple[int, int]]:
         """Map every mamba layer name to its (start, end) range in the
         flattened (layer, state-type) metadata arrays of
@@ -326,8 +336,9 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
                 ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
                 table_cols = block_tables[mamba_group_ids[0]].shape[1]
                 indices = _compute_aligned_state_indices(ctx, input_batch.seq_lens, num_reqs, table_cols)
+                index_views = self._get_aligned_state_index_views(indices)
                 for group_idx, builder in aligned_builders:
-                    builder.mamba_aligned_state_indices = indices[group_idx]
+                    builder.mamba_aligned_state_indices = index_views[group_idx]
 
         model_specific_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,

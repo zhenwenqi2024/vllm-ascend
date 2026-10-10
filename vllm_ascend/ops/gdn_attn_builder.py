@@ -654,6 +654,42 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             _GDN_GRAPH_DUMMY_ACCEPTED_TOKEN_COUNT,
         )
 
+    def _materialize_cached_spec_decode(self, metadata: GDNAttentionMetadata, graph_request_count: int) -> None:
+        """Refresh graph-owned pure decode buffers in one NPU launch."""
+        from vllm_ascend.ops.triton.v2.mamba.cached_decode import materialize_cached_gdn_decode
+
+        actual_request_count = metadata.num_spec_decodes
+        token_count = metadata.spec_token_indx.numel()
+        assert metadata.non_spec_token_indx.numel() == 0
+        materialize_cached_gdn_decode(
+            metadata.spec_state_indices_tensor,
+            metadata.spec_query_start_loc,
+            metadata.num_accepted_tokens,
+            metadata.spec_token_indx,
+            self.spec_state_indices_tensor,
+            self.spec_query_start_loc,
+            self.num_accepted_tokens,
+            self.spec_token_indx,
+            self.spec_sequence_masks,
+            self.spec_actual_seq_lengths,
+            actual_request_count,
+            graph_request_count,
+        )
+        metadata.spec_state_indices_tensor = self.spec_state_indices_tensor[:graph_request_count]
+        metadata.spec_query_start_loc = self.spec_query_start_loc[: graph_request_count + 1]
+        metadata.num_accepted_tokens = self.num_accepted_tokens[:graph_request_count]
+        metadata.spec_sequence_masks = self.spec_sequence_masks[:graph_request_count]
+        metadata.spec_token_indx = self.spec_token_indx[:token_count]
+        metadata.non_spec_token_indx = self.non_spec_token_indx[:0]
+        metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
+            spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
+                query_start_loc=metadata.spec_query_start_loc,
+                cache_indices=metadata.spec_state_indices_tensor,
+                num_accepted_tokens=metadata.num_accepted_tokens,
+            ),
+            actual_seq_lengths=self.spec_actual_seq_lengths[: graph_request_count + 1],
+        )
+
     def _pad_decode_metadata(
         self,
         attn_metadata: GDNAttentionMetadata,
@@ -744,7 +780,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             num_reqs = metadata.gdn_num_reqs
             metadata.gdn_seq_lens = common_attn_metadata.seq_lens[:num_reqs]
             metadata.spec_query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
-            metadata.num_accepted_tokens = torch.index_select(num_accepted_tokens, 0, metadata.spec_sequence_indices)
+            # A cached pure decode layout has an identity speculative row map.
+            # Keep current accepted counts in the graph-owned buffer below.
+            metadata.num_accepted_tokens = num_accepted_tokens[:num_reqs]
             aligned = self.mamba_aligned_state_indices
             block_table = (
                 aligned[:num_reqs]
@@ -757,8 +795,23 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 )
             )
             metadata.spec_state_indices_tensor = block_table[:, : self.num_spec + 1]
-            self._pad_spec_decode_metadata(metadata, common_attn_metadata.num_reqs)
-            self._attach_spec_decode_metadata(metadata)
+            if (
+                self._USE_COMMON_KERNEL_METADATA
+                and metadata.spec_state_indices_tensor.device.type == "npu"
+                and all(
+                    value.dtype == torch.int32
+                    for value in (
+                        metadata.spec_state_indices_tensor,
+                        metadata.spec_query_start_loc,
+                        metadata.num_accepted_tokens,
+                        metadata.spec_token_indx,
+                    )
+                )
+            ):
+                self._materialize_cached_spec_decode(metadata, common_attn_metadata.num_reqs)
+            else:
+                self._pad_spec_decode_metadata(metadata, common_attn_metadata.num_reqs)
+                self._attach_spec_decode_metadata(metadata)
             return metadata
         self._decode_layout_key = None
         self._decode_layout_metadata = None
@@ -1149,10 +1202,16 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             result.spec_state_indices_tensor = view
             result.non_spec_state_indices_tensor = result.prefill_state_indices = None
             if m.spec_decode_metadata is not None:
-                result.spec_decode_metadata = copy(m.spec_decode_metadata)
-                conv = copy(m.spec_decode_metadata.spec_causal_conv1d)
-                conv.cache_indices = view
-                result.spec_decode_metadata.spec_causal_conv1d = conv
+                spec = m.spec_decode_metadata
+                conv = spec.spec_causal_conv1d
+                result.spec_decode_metadata = GDNSpecDecodeMetadata(
+                    spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
+                        query_start_loc=conv.query_start_loc,
+                        cache_indices=view,
+                        num_accepted_tokens=conv.num_accepted_tokens,
+                    ),
+                    actual_seq_lengths=spec.actual_seq_lengths,
+                )
             return result
         block_table = blk_table[: m.gdn_num_reqs]
         if self.vllm_config.cache_config.mamba_cache_mode == "align":

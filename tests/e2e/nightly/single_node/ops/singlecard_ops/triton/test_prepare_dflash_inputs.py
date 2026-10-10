@@ -595,7 +595,7 @@ def test_prepare_dflash_inputs_wrapper_forwards_dcp():
 
 
 @pytest.mark.parametrize("case", ACCURACY_CASES, ids=lambda case: case["name"])
-@pytest.mark.parametrize("num_groups", [2, 3])
+@pytest.mark.parametrize("num_groups", [2, 3, 6, 7])
 def test_grouped_prepare_keeps_each_groups_slots(case, num_groups):
     data = _build_inputs(case, "npu")
     group_data = [data]
@@ -636,13 +636,16 @@ def test_grouped_prepare_keeps_each_groups_slots(case, num_groups):
     _cleanup()
 
 
-def test_grouped_prepare_replay_refreshes_rejection_and_pages():
+@pytest.mark.parametrize("num_groups", [2, 6, 7])
+def test_grouped_prepare_replay_refreshes_rejection_and_pages(num_groups):
     case = next(case for case in ACCURACY_CASES if case["name"] == "mixed_prefill_rejected")
-    data = _build_inputs(case, "npu")
-    other = _build_inputs(case, "npu")
-    groups = (
-        (data.outputs.query_slot_mapping, data.outputs.context_slot_mapping, data.block_table, case["block_size"]),
-        (other.outputs.query_slot_mapping, other.outputs.context_slot_mapping, other.block_table, case["block_size"]),
+    items = [_build_inputs(case, "npu") for _ in range(num_groups)]
+    data = items[0]
+    for index, item in enumerate(items):
+        item.block_table.add_(101 * index)
+    groups = tuple(
+        (item.outputs.query_slot_mapping, item.outputs.context_slot_mapping, item.block_table, case["block_size"])
+        for item in items
     )
 
     def prepare():
@@ -654,17 +657,21 @@ def test_grouped_prepare_replay_refreshes_rejection_and_pages():
     with torch.npu.graph(graph):
         prepare()
     addresses = [tensor.data_ptr() for group in groups for tensor in group[:3]]
-    data.num_rejected.copy_(torch.tensor([1, 0, 3, 0], dtype=torch.int32, device="npu"))
-    other.num_rejected.copy_(data.num_rejected)
-    data.block_table.add_(11)
-    other.block_table.add_(777)
-    graph.replay()
-    torch.npu.synchronize()
-    _validate_outputs(data, case, _build_reference(data, case))
-    ref = _build_reference(other, case)
-    _assert_exact(other.outputs.query_slot_mapping, ref.query_slot_mapping)
-    _assert_exact(other.outputs.context_slot_mapping[: sum(case["req_lens"])], ref.context_slot_mapping)
-    assert addresses == [tensor.data_ptr() for group in groups for tensor in group[:3]]
+    for step, rejected in enumerate(([1, 0, 3, 0], [0, 0, 0, 0], [2, 0, 1, 0])):
+        data.num_rejected.copy_(torch.tensor(rejected, dtype=torch.int32, device="npu"))
+        for index, item in enumerate(items):
+            item.num_rejected.copy_(data.num_rejected)
+            item.block_table.add_(11 + 37 * index + step)
+            item.outputs.query_slot_mapping.fill_(123456)
+            item.outputs.context_slot_mapping.fill_(123456)
+        graph.replay()
+        torch.npu.synchronize()
+        _validate_outputs(data, case, _build_reference(data, case))
+        for item in items[1:]:
+            ref = _build_reference(item, case)
+            _assert_exact(item.outputs.query_slot_mapping, ref.query_slot_mapping)
+            _assert_exact(item.outputs.context_slot_mapping[: sum(case["req_lens"])], ref.context_slot_mapping)
+        assert addresses == [tensor.data_ptr() for group in groups for tensor in group[:3]]
     _cleanup()
 
 

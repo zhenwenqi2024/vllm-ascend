@@ -139,6 +139,56 @@ def _make_gdn_reuse_inputs(num_groups):
     return builders, kwargs
 
 
+@pytest.mark.parametrize("num_groups", [2, 38])
+@pytest.mark.parametrize("for_capture", [False, True])
+def test_standard_mamba_common_fields_follow_each_current_batch(num_groups, for_capture, monkeypatch):
+    builders, kwargs = _make_gdn_reuse_inputs(num_groups)
+    provider = MambaHybridAttnMetadata(
+        is_prefilling=torch.tensor([False, True]),
+        num_accepted_tokens=torch.tensor([2, 3], dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([3, 3], dtype=torch.int32),
+    )
+    kwargs["model_specific_attn_metadata"] = provider
+    kwargs["for_cudagraph_capture"] = for_capture
+    original = MambaHybridAttnMetadata.get_extra_common_attn_kwargs
+    calls = []
+
+    def record_common_fields(self, group, num_reqs):
+        calls.append((group, num_reqs))
+        return original(self, group, num_reqs)
+
+    monkeypatch.setattr(MambaHybridAttnMetadata, "get_extra_common_attn_kwargs", record_common_fields)
+    # Disable builder reuse to inspect the common fields for every cache group.
+    for builder in builders:
+        builder.supports_update_block_table = False
+    for step, num_reqs in enumerate((2, 1, 2)):
+        provider.is_prefilling = torch.tensor([bool(step % 2), bool((step + 1) % 2)])
+        kwargs["num_reqs"] = num_reqs
+        attn_utils.build_attn_metadata(**kwargs)
+        common = [builder.build_calls[-1][0] for builder in builders]
+        assert all(metadata.is_prefilling is common[0].is_prefilling for metadata in common)
+        assert torch.equal(common[0].is_prefilling, provider.is_prefilling[:num_reqs])
+        assert common[0].is_prefilling.data_ptr() == provider.is_prefilling.data_ptr()
+    assert calls == [(0, 2), (0, 1), (0, 2)]
+
+
+def test_mamba_instance_common_override_keeps_group_specific_fields():
+    builders, kwargs = _make_gdn_reuse_inputs(2)
+    provider = MambaHybridAttnMetadata(is_prefilling=torch.zeros(2, dtype=torch.bool))
+    masks = [torch.zeros(2, dtype=torch.bool), torch.ones(2, dtype=torch.bool)]
+    fields = [{"is_prefilling": masks[i], "num_computed_tokens_cpu": torch.full((2,), i)} for i in range(2)]
+    override = MagicMock(side_effect=lambda group, n: fields[group].copy())
+    provider.get_extra_common_attn_kwargs = override
+    kwargs["model_specific_attn_metadata"] = provider
+    attn_utils.build_attn_metadata(**kwargs)
+    assert [entry.args for entry in override.call_args_list] == [(0, 2), (1, 2)]
+    for i, builder in enumerate(builders):
+        common = builder.build_calls[0][0]
+        assert common.is_prefilling is masks[i]
+        assert torch.equal(common.num_computed_tokens_cpu, torch.full((2,), i))
+        assert set(fields[i]) == {"is_prefilling", "num_computed_tokens_cpu"}
+
+
 def test_exact_cpu_lengths_require_a_separate_mirror():
     builders, kwargs = _make_gdn_reuse_inputs(1)
     kwargs["seq_lens_cpu_is_exact"] = True
