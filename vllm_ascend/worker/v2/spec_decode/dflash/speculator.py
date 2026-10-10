@@ -186,8 +186,7 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         # compute can start before the CPU metadata is ready; attention cannot.
         return isinstance(graph, UpdatableGraph) and bool(graph.tasks)
 
-    def _refresh_draft_layout(self, template, seq_lens_cpu, num_reqs_padded, num_tokens):
-        lengths = seq_lens_cpu.tolist()
+    def _refresh_draft_layout(self, template, num_reqs_padded, num_tokens):
         refreshed = {}
         group_metadata = {}
         for group_index, groups in enumerate(self.attn_groups):
@@ -198,9 +197,6 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
                     if key not in group_metadata:
                         group_metadata[key] = replace(
                             previous,
-                            seq_lens=seq_lens_cpu,
-                            seq_lens_cpu=seq_lens_cpu,
-                            seq_lens_list=lengths,
                             seq_lens_gpu=self.input_buffers.seq_lens[:num_reqs_padded],
                             query_start_loc_gpu=self.input_buffers.query_start_loc[: num_reqs_padded + 1],
                             block_tables=AscendAttentionMetadataBuilder._pad_block_table(
@@ -238,7 +234,6 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         template_key = None
         if getattr(self, "_use_cpu_seq_lens", False):
             num_reqs_padded = batch_desc.num_reqs or num_reqs
-            seq_lens_cpu = self._prepare_draft_seq_lens_cpu(num_reqs, num_reqs_padded)
             num_tokens = (
                 batch_desc.num_tokens if batch_desc.cg_mode == CUDAGraphMode.FULL else int(query_start_loc_np[-1])
             )
@@ -253,9 +248,17 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
                 )
                 cached = self._draft_metadata_template
                 if cached is not None and cached[0] == template_key:
-                    metadata = self._refresh_draft_layout(cached[1], seq_lens_cpu, num_reqs_padded, num_tokens)
+                    # Refresh physical cache views while the exact-length D2H
+                    # is pending. These are fresh objects, not the cached ones.
+                    metadata = self._refresh_draft_layout(cached[1], num_reqs_padded, num_tokens)
+                    seq_lens_cpu = self._prepare_draft_seq_lens_cpu(num_reqs, num_reqs_padded)
+                    lengths = seq_lens_cpu.tolist()
+                    for value in metadata.values():
+                        value.seq_lens = value.seq_lens_cpu = seq_lens_cpu
+                        value.seq_lens_list = lengths
                     self._prepared_draft_attn_metadata = (num_reqs_padded, metadata)
                     return metadata
+            seq_lens_cpu = self._prepare_draft_seq_lens_cpu(num_reqs, num_reqs_padded)
             context = build_attn_metadata_factory(
                 self.input_buffers.positions,
                 num_tokens,

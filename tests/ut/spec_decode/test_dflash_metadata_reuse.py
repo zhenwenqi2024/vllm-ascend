@@ -200,7 +200,15 @@ def test_full_layout_reuse_refreshes_lengths_and_each_groups_physical_cache(monk
     spec.input_buffers.seq_lens[:2] = torch.tensor([60, 82])
     spec.block_tables.input_block_tables = [torch.full((4, 2), i) for i in (10, 20)]
     spec.block_tables.slot_mappings = torch.arange(64, 128).reshape(2, 32)
+    order = []
+    refresh = spec._refresh_draft_layout
+    prepare_lengths = spec._prepare_draft_seq_lens_cpu
+    monkeypatch.setattr(spec, "_refresh_draft_layout", lambda *args: order.append("layout") or refresh(*args))
+    monkeypatch.setattr(
+        spec, "_prepare_draft_seq_lens_cpu", lambda *args: order.append("length_wait") or prepare_lengths(*args)
+    )
     refreshed = spec._build_attn_metadata(*args)
+    assert order == ["layout", "length_wait"]
     parent.assert_called_once()
     assert refreshed["a"] is refreshed["b"]
     assert refreshed["a"] is not refreshed["c"]
@@ -233,7 +241,7 @@ def test_graph_replay_precedes_deferred_build_but_update_stream_wait_precedes_re
     monkeypatch.setattr(torch.npu, "current_stream", lambda: object())
     monkeypatch.setattr(torch.npu, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(graph_module.DFlashCudaGraphManager, "run_fullgraph", lambda *a: calls.append("replay") or 7)
-    graph.resolve_tasks.side_effect = lambda source: calls.append("resolve") or ()
+    graph.iter_resolved_tasks.side_effect = lambda source: calls.append("resolve") or iter(())
     graph.update.side_effect = lambda *a: calls.append("update")
     assert manager.run_fullgraph(desc) == 7
     assert calls == ["wait_inputs", "replay", "build", "resolve", "update"]

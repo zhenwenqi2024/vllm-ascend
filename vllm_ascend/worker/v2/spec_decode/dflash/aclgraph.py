@@ -106,7 +106,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                 metadata = self.speculator.build_draft_attn_metadatas(
                     desc.num_reqs, self.speculator.input_batch.seq_lens_cpu_upper_bound
                 )
-                resolved_tasks = graph.resolve_tasks(ContextSource(metadata[0]))
+                resolved_tasks = graph.iter_resolved_tasks(ContextSource(metadata[0]))
                 graph.update(self.update_stream, resolved_tasks)
             return ret
         draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
