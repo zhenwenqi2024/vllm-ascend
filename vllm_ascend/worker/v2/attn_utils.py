@@ -438,6 +438,7 @@ def build_attn_metadata(
     common_v41_batch_metadata: dict[str, Any] = {}
     cached_dense_metadata: dict[tuple[Any, ...], AscendMetadata] = {}
     cached_gdn_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
+    gdn_graph_updates: dict[tuple[KVCacheSpec, type], tuple[Any, list]] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
     batch_tq_slots = uses_turboquant_groups(kv_cache_groups)
     formatted_slot_mappings = None
@@ -611,10 +612,14 @@ def build_attn_metadata(
                     else None
                 )
                 if gdn_cache_key is not None and gdn_cache_key in cached_gdn_metadata:
+                    update_kwargs = {}
+                    if gdn_cache_key in gdn_graph_updates:
+                        update_kwargs["graph_state_updates"] = gdn_graph_updates[gdn_cache_key][1]
                     metadata = attn_metadata_builder.update_block_table(
                         cached_gdn_metadata[gdn_cache_key],
                         variant_common.block_table_tensor,
                         variant_common.slot_mapping,
+                        **update_kwargs,
                     )
                 elif for_cudagraph_capture:
                     metadata = attn_metadata_builder.build_for_cudagraph_capture(
@@ -623,6 +628,8 @@ def build_attn_metadata(
                     )
                     if gdn_cache_key is not None:
                         cached_gdn_metadata[gdn_cache_key] = metadata
+                        if hasattr(attn_metadata_builder, "graph_state_updater"):
+                            gdn_graph_updates[gdn_cache_key] = (attn_metadata_builder.graph_state_updater, [])
                 elif dense_cache_key is not None and dense_cache_key in cached_dense_metadata:
                     metadata = attn_metadata_builder.update_block_table(
                         cached_dense_metadata[dense_cache_key],
@@ -645,12 +652,16 @@ def build_attn_metadata(
                         cached_dense_metadata[dense_cache_key] = metadata
                     if gdn_cache_key is not None:
                         cached_gdn_metadata[gdn_cache_key] = metadata
+                        if hasattr(attn_metadata_builder, "graph_state_updater"):
+                            gdn_graph_updates[gdn_cache_key] = (attn_metadata_builder.graph_state_updater, [])
                 if is_dsa_builder:
                     # Preserve sharing even if a builder replaces one of the
                     # dictionaries while constructing its metadata.
                     common_ratio_to_sas_metadata = attn_metadata_builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
                 for layer_name in variant_names:
                     attn_metadata[layer_name] = metadata
+    for updater, updates in gdn_graph_updates.values():
+        updater.apply(updates)
     return attn_metadata
 
 
