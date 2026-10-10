@@ -355,6 +355,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         # One layout only: a fallback build may overwrite the graph inputs.
         self._decode_layout_key: tuple | None = None
         self._decode_layout_metadata: GDNAttentionMetadata | None = None
+        self._spec_state_view: torch.Tensor | None = None
         if self.supports_update_block_table:
             self.mamba_aligned_state_indices: torch.Tensor | None = None
             # Lazy load for MRV2; MRV1 keeps its existing graph input path.
@@ -1106,6 +1107,53 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         """
         assert self.supports_update_block_table
         m = metadata
+        if (
+            graph_state_updates is not None
+            and self.use_full_cuda_graph
+            and m.num_prefills == 0
+            and m.num_decodes == 0
+            and m.num_spec_decodes > 0
+            and getattr(m, "checkpoint", None) is None
+            and self._can_pad_spec_decode(m.spec_query_start_loc.size(0) - 1, m.num_spec_decode_tokens)
+        ):
+            # The batched writer already bounds live rows and state columns.
+            # Pass the full current table instead of rebuilding prefix views
+            # for every cache group, and reuse only the captured output view.
+            source = blk_table
+            if self.vllm_config.cache_config.mamba_cache_mode == "align":
+                source = self.mamba_aligned_state_indices
+                if source is None:
+                    source = mamba_get_block_table_tensor(
+                        blk_table[: m.gdn_num_reqs], m.gdn_seq_lens, self.kv_cache_spec, "align"
+                    )
+            graph_rows = m.spec_query_start_loc.size(0) - 1
+            view = self._spec_state_view
+            if (
+                view is None
+                or view.size(0) != graph_rows
+                or view.data_ptr() != self.spec_state_indices_tensor.data_ptr()
+            ):
+                view = self.spec_state_indices_tensor[:graph_rows]
+                self._spec_state_view = view
+            graph_state_updates.append(
+                (
+                    source,
+                    self.spec_state_indices_tensor,
+                    m.num_spec_decodes,
+                    graph_rows,
+                    self._SPEC_GRAPH_PAD_SLOT_ID,
+                    None,
+                )
+            )
+            result = copy(m)
+            result.spec_state_indices_tensor = view
+            result.non_spec_state_indices_tensor = result.prefill_state_indices = None
+            if m.spec_decode_metadata is not None:
+                result.spec_decode_metadata = copy(m.spec_decode_metadata)
+                conv = copy(m.spec_decode_metadata.spec_causal_conv1d)
+                conv.cache_indices = view
+                result.spec_decode_metadata.spec_causal_conv1d = conv
+            return result
         block_table = blk_table[: m.gdn_num_reqs]
         if self.vllm_config.cache_config.mamba_cache_mode == "align":
             aligned = self.mamba_aligned_state_indices
