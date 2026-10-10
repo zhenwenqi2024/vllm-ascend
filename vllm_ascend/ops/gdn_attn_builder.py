@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import copy
 from dataclasses import dataclass, replace
 
 import torch
@@ -351,6 +352,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             and vllm_config.use_v2_model_runner
             and vllm_config.parallel_config.prefill_context_parallel_size == 1
         )
+        # One layout only: a fallback build may overwrite the graph inputs.
+        self._decode_layout_key: tuple | None = None
+        self._decode_layout_metadata: GDNAttentionMetadata | None = None
         if self.supports_update_block_table:
             self.mamba_aligned_state_indices: torch.Tensor | None = None
             # Lazy load for MRV2; MRV1 keeps its existing graph input path.
@@ -677,6 +681,39 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             graph_request_count,
         )
 
+    def _get_decode_layout_key(
+        self,
+        common: CommonAttentionMetadata,
+        draft_tokens: torch.Tensor | None,
+        accepted_tokens: torch.Tensor | None,
+        num_actual_reqs: int | None,
+    ) -> tuple | None:
+        """Identify a pure MRV2 decode layout using host metadata only."""
+        if not (self.supports_update_block_table and self.use_full_cuda_graph and self.use_spec_decode):
+            return None
+        if draft_tokens is None or accepted_tokens is None or draft_tokens.device.type != "cpu":
+            return None
+        graph_reqs = common.num_reqs
+        actual_reqs = graph_reqs if num_actual_reqs is None else num_actual_reqs
+        if not 0 < actual_reqs <= graph_reqs or draft_tokens.numel() < graph_reqs:
+            return None
+        prefilling = common.is_prefilling
+        if prefilling is not None:
+            if prefilling.device.type != "cpu" or any(prefilling[:actual_reqs].tolist()):
+                return None
+        drafts = tuple(draft_tokens[:graph_reqs].tolist())
+        if any(count < 0 for count in drafts[:actual_reqs]):
+            return None
+        queries = tuple(common.query_start_loc_cpu[: graph_reqs + 1].tolist())
+        if len(queries) != graph_reqs + 1 or any(
+            not 0 < queries[i + 1] - queries[i] <= self.num_spec + 1 for i in range(actual_reqs)
+        ):
+            return None
+        host_lengths = common.seq_lens_cpu_upper_bound
+        # Padding normalization depends on zero host lengths, not their values.
+        padding = None if host_lengths is None else tuple(length == 0 for length in host_lengths[:graph_reqs].tolist())
+        return (graph_reqs, actual_reqs, queries, drafts, padding, common.num_actual_tokens)
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -686,13 +723,44 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         fast_build: bool = False,
         num_actual_reqs: int | None = None,
     ) -> GDNAttentionMetadata:
-        # Normalize FIA's full-width dummy queries before slicing requests:
-        # its common token count may still include those inactive rows.
+        layout_key = self._get_decode_layout_key(
+            common_attn_metadata, num_decode_draft_tokens_cpu, num_accepted_tokens, num_actual_reqs
+        )
+        # Preserve padding normalization and its current query Tensor before
+        # reusing a host layout. Captured inputs can be overwritten by other
+        # executions even when the next batch has the same host shape.
         if self.use_full_cuda_graph and self.use_spec_decode:
             common_attn_metadata = _remove_spec_graph_padding_queries(
                 common_attn_metadata,
                 num_decode_draft_tokens_cpu,
             )
+        if layout_key is not None and layout_key == self._decode_layout_key:
+            assert self._decode_layout_metadata is not None
+            assert num_accepted_tokens is not None
+            # Ascend descriptors are attached dynamically on older vLLM
+            # releases, so dataclasses.replace would discard those fields.
+            metadata = copy(self._decode_layout_metadata)
+            num_reqs = metadata.gdn_num_reqs
+            metadata.gdn_seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+            metadata.spec_query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
+            metadata.num_accepted_tokens = torch.index_select(num_accepted_tokens, 0, metadata.spec_sequence_indices)
+            aligned = self.mamba_aligned_state_indices
+            block_table = (
+                aligned[:num_reqs]
+                if aligned is not None
+                else mamba_get_block_table_tensor(
+                    common_attn_metadata.block_table_tensor[:num_reqs],
+                    metadata.gdn_seq_lens,
+                    self.kv_cache_spec,
+                    self.vllm_config.cache_config.mamba_cache_mode,
+                )
+            )
+            metadata.spec_state_indices_tensor = block_table[:, : self.num_spec + 1]
+            self._pad_spec_decode_metadata(metadata, common_attn_metadata.num_reqs)
+            self._attach_spec_decode_metadata(metadata)
+            return metadata
+        self._decode_layout_key = None
+        self._decode_layout_metadata = None
         m = common_attn_metadata
         # Common metadata follows the padded graph shape. Build request-phase
         # metadata from the logical batch, then materialize graph-sized buffers.
@@ -1000,6 +1068,27 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         attn_metadata.gdn_seq_lens = m.seq_lens
         attn_metadata.spec_sequence_indices = spec_sequence_indices
         attn_metadata.non_spec_sequence_indices = non_spec_sequence_indices
+        if (
+            layout_key is not None
+            and num_spec_decodes == num_actual_reqs
+            and num_prefills == 0
+            and num_decodes == 0
+            and self._can_pad_spec_decode(graph_request_count, num_spec_decode_tokens)
+            and getattr(attn_metadata, "checkpoint", None) is None
+        ):
+            self._decode_layout_key = layout_key
+            # The template owns immutable layout sources, not captured inputs.
+            # Every hit copies them back into the current graph buffers.
+            template = copy(attn_metadata)
+            for name in (
+                "spec_sequence_masks",
+                "spec_token_indx",
+                "non_spec_token_indx",
+                "spec_sequence_indices",
+                "non_spec_sequence_indices",
+            ):
+                setattr(template, name, getattr(attn_metadata, name).clone())
+            self._decode_layout_metadata = template
         return attn_metadata
 
     def update_block_table(

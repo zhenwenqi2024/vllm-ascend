@@ -223,7 +223,7 @@ def test_gdn_shared_metadata_aclgraph_reads_updated_group_states():
             slot_mapping=torch.empty(graph_reqs * width, dtype=torch.int64, device="npu"),
             is_prefilling=torch.zeros(graph_reqs, dtype=torch.bool),
         )
-        accepted = torch.full((graph_reqs,), step, dtype=torch.int32, device="npu")
+        accepted = torch.full((graph_reqs,), (step - 1) % width + 1, dtype=torch.int32, device="npu")
         drafts = torch.tensor([3] * count + [-1] * (graph_reqs - count), dtype=torch.int32)
         first = builders[0].build(0, common, accepted, drafts, num_actual_reqs=count)
         updates = []
@@ -239,6 +239,8 @@ def test_gdn_shared_metadata_aclgraph_reads_updated_group_states():
     state_outputs = torch.empty((24, graph_reqs, width), dtype=torch.int32, device="npu")
     accepted_output = torch.empty(graph_reqs, dtype=torch.int32, device="npu")
     query_output = torch.empty(graph_reqs + 1, dtype=torch.int32, device="npu")
+    mask_output = torch.empty(graph_reqs, dtype=torch.bool, device="npu")
+    lengths_output = torch.empty(graph_reqs + 1, dtype=torch.int32, device="npu")
     with torch.npu.stream(stream):
         stream.wait_stream(torch.npu.default_stream())
         captured = prepare(graph_reqs, 1)
@@ -248,25 +250,45 @@ def test_gdn_shared_metadata_aclgraph_reads_updated_group_states():
                 state_outputs[i].copy_(metadata.spec_state_indices_tensor)
             accepted_output.copy_(captured[0].num_accepted_tokens)
             query_output.copy_(captured[0].spec_query_start_loc)
+            mask_output.copy_(captured[0].spec_sequence_masks)
+            lengths_output.copy_(captured[0].spec_decode_metadata.actual_seq_lengths)
 
         consume()
         torch.npu.synchronize()
         with torch.npu.graph(graph, stream=stream):
             consume()
         snapshots = []
-        for step, count in enumerate([1, 3, 2], start=2):
+        # Repeat layouts while refreshing accepted offsets and group-local IDs.
+        for step, count in enumerate([1, 1, 3, 3, 2, 2], start=2):
             for bt in group_tables:
                 bt.add_(100)
+            # A layout cache must restore graph inputs, not assume the last
+            # execution left their contents intact.
+            builders[0].spec_query_start_loc.fill_(-1)
+            builders[0].spec_sequence_masks.fill_(False)
+            builders[0].spec_actual_seq_lengths.fill_(-1)
             current = prepare(count, step)
             for before, after in zip(captured, current):
                 assert before.spec_state_indices_tensor.data_ptr() == after.spec_state_indices_tensor.data_ptr()
                 assert before.num_accepted_tokens.data_ptr() == after.num_accepted_tokens.data_ptr()
             graph.replay()
-            snapshots.append((count, step, state_outputs.clone(), accepted_output.clone(), query_output.clone()))
+            snapshots.append(
+                (
+                    count,
+                    step,
+                    state_outputs.clone(),
+                    accepted_output.clone(),
+                    query_output.clone(),
+                    mask_output.clone(),
+                    lengths_output.clone(),
+                )
+            )
     torch.npu.synchronize()
-    for count, step, states, accepted, query in snapshots:
+    for count, step, states, accepted, query, masks, lengths in snapshots:
         expected = torch.stack([table.cpu() + i * 1000 + (step - 1) * 100 for i in range(24)])
         expected[:, count:].zero_()
         torch.testing.assert_close(states.cpu(), expected, rtol=0, atol=0)
-        assert accepted.cpu().tolist() == [step] * count + [1] * (graph_reqs - count)
+        assert accepted.cpu().tolist() == [(step - 1) % width + 1] * count + [1] * (graph_reqs - count)
         assert query.cpu().tolist() == [min(i, count) * width for i in range(graph_reqs + 1)]
+        assert masks.cpu().tolist() == [True] * count + [False] * (graph_reqs - count)
+        assert lengths.cpu().tolist() == [0] + [width] * count + [0] * (graph_reqs - count)

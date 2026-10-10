@@ -474,9 +474,11 @@ def build_attn_metadata(
                 dsa_builder.tq_group_block_sizes = block_sizes
             plan = get_dsa_attn_kv_plan(dsa_builder.vllm_config, dsa_builder.compressor_ratio)
             formatted_slot_mappings = plan.format_dsa_slot_mapping(slot_mappings[:, :num_input_tokens], block_sizes)
+    # Every group consumes the same request-length view. Create it once rather
+    # than issuing a slice for each group in hybrid models.
+    batch_seq_lens = seq_lens[:num_reqs]
     for i, kv_cache_spec in enumerate(kv_cache_groups):
         block_table = block_tables[i]
-        slot_mapping = slot_mappings[i]
         # Hybrid drafters can configure causality per KV cache group.
         group_causal = causal if isinstance(causal, bool) else causal.get(i, True)
         common_v41_metadata: dict[str, Any] = {}
@@ -490,13 +492,43 @@ def build_attn_metadata(
             "is_prefilling",
             is_prefilling,
         )
+        if len(attn_groups[i]) == 1:
+            group = attn_groups[i][0]
+            builder = group.get_metadata_builder(0)
+            if (
+                isinstance(builder, AscendGDNAttentionMetadataBuilder)
+                and builder.supports_update_block_table
+                and isinstance(group.kv_cache_spec, MambaSpec)
+                and (
+                    model_specific_attn_metadata is None
+                    or type(model_specific_attn_metadata) is MambaHybridAttnMetadata
+                )
+                and not common_attn_metadata_extra_kwargs
+                and pcp_context is None
+                and (for_cudagraph_capture or getattr(builder, "_gdn_reuse_at_capture", None) is not False)
+            ):
+                key = (builder.kv_cache_spec, type(builder))
+                if key in cached_gdn_metadata:
+                    if for_cudagraph_capture:
+                        builder._gdn_reuse_at_capture = True
+                    # GDN consumes only its physical state table here. Reusing
+                    # the batch view avoids constructing common metadata and a
+                    # slot-mapping view for every recurrent cache group.
+                    update_kwargs = {}
+                    if key in gdn_graph_updates:
+                        update_kwargs["graph_state_updates"] = gdn_graph_updates[key][1]
+                    metadata = builder.update_block_table(cached_gdn_metadata[key], block_table, **update_kwargs)
+                    for layer_name in group.layer_names:
+                        attn_metadata[layer_name] = metadata
+                    continue
+        slot_mapping = slot_mappings[i]
         common_attn_metadata = AscendCommonAttentionMetadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_cpu_is_exact=seq_lens_cpu_is_exact,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            seq_lens=seq_lens[:num_reqs],
+            seq_lens=batch_seq_lens,
             num_reqs=num_reqs,
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,

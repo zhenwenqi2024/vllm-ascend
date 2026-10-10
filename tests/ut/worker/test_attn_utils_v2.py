@@ -173,6 +173,8 @@ def test_batch_global_mamba_gdn_groups_reuse_during_capture_and_replay(for_captu
     provider = kwargs["model_specific_attn_metadata"]
     extra_inputs = MagicMock(wraps=provider.get_extra_attn_kwargs)
     monkeypatch.setattr(provider, "get_extra_attn_kwargs", extra_inputs)
+    common_builds = MagicMock(wraps=attn_utils.AscendCommonAttentionMetadata)
+    monkeypatch.setattr(attn_utils, "AscendCommonAttentionMetadata", common_builds)
     kwargs["for_cudagraph_capture"] = for_capture
     result = attn_utils.build_attn_metadata(**kwargs)
     assert len(builders[0].build_calls) == 1
@@ -180,6 +182,7 @@ def test_batch_global_mamba_gdn_groups_reuse_during_capture_and_replay(for_captu
     for i, metadata in enumerate(result.values()):
         assert metadata.block_table is kwargs["block_tables"][i]
     assert extra_inputs.call_count == (0 if for_capture else 1)
+    assert common_builds.call_count == 1
 
 
 @pytest.mark.parametrize("for_capture", [False, True])

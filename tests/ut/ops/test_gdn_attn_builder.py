@@ -705,6 +705,95 @@ def _make_builder(
     return builder_cls(spec, ["layer0"], vllm_config, device)
 
 
+@pytest.mark.parametrize("builder_cls", [AscendGDNAttentionMetadataBuilder, AscendGDNHostMetadataBuilder])
+@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+@pytest.mark.parametrize("draft_count", [0, 3])
+def test_decode_layout_reuse_refreshes_offsets_lengths_and_physical_states(builder_cls, mamba_cache_mode, draft_count):
+    kwargs = dict(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        num_speculative_blocks=3,
+        builder_cls=builder_cls,
+        mamba_cache_mode=mamba_cache_mode,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+    )
+    builder = _make_builder(**kwargs)
+    reference = _make_builder(**kwargs)
+    reference.supports_update_block_table = False
+    drafts = torch.full((2,), draft_count, dtype=torch.int32)
+    with patch.object(
+        builder, "_copy_sequence_indices_to_device", wraps=builder._copy_sequence_indices_to_device
+    ) as plan:
+        for step in range(3):
+            common = create_common_attn_metadata(
+                BatchSpec([64 + step * 16, 96 + step * 16], [draft_count + 1] * 2), 16, kwargs["device"]
+            )
+            common.is_prefilling.zero_()
+            # Request ordering and cache contents change even with a fixed layout.
+            common.block_table_tensor = torch.arange(32, dtype=torch.int32).view(2, 16).flip(0) + step * 100
+            accepted = torch.tensor([1 + step, 3 - step], dtype=torch.int32)
+            if step:
+                builder.spec_sequence_masks.fill_(False)
+                builder.spec_token_indx.fill_(-1)
+                builder.spec_query_start_loc.fill_(-1)
+                builder.spec_actual_seq_lengths.fill_(-1)
+                builder.num_accepted_tokens.fill_(-1)
+                builder.spec_state_indices_tensor.fill_(-1)
+            actual = builder.build(0, common, accepted, drafts)
+            expected = reference.build(0, common, accepted, drafts)
+            _assert_reused_gdn_metadata_matches(actual, expected)
+            if step == 0:
+                query_ptr = actual.spec_query_start_loc.data_ptr()
+            assert actual.spec_query_start_loc.data_ptr() == query_ptr
+        assert plan.call_count == 1
+
+        # A different query layout must rebuild the static graph inputs.
+        changed = create_common_attn_metadata(BatchSpec([112, 144], [1, 4]), 16, kwargs["device"])
+        changed.block_table_tensor = common.block_table_tensor
+        changed.is_prefilling.zero_()
+        actual = builder.build(0, changed, accepted, drafts)
+        expected = reference.build(0, changed, accepted, drafts)
+        _assert_reused_gdn_metadata_matches(actual, expected)
+        assert plan.call_count == 2
+
+        # Prefill overwrites graph inputs. Returning to decode cannot reuse them.
+        prefill = create_common_attn_metadata(BatchSpec([16, 16], [16, 16]), 16, kwargs["device"])
+        prefill.block_table_tensor = common.block_table_tensor
+        builder.build(0, prefill)
+        assert builder._decode_layout_metadata is None
+        actual = builder.build(0, common, accepted, drafts)
+        expected = reference.build(0, common, accepted, drafts)
+        _assert_reused_gdn_metadata_matches(actual, expected)
+        assert plan.call_count == 3
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_decode_layout_reuse_respects_runner_and_padding_changes(use_v2):
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        num_speculative_blocks=3,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+    )
+    builder.vllm_config.use_v2_model_runner = use_v2
+    builder.supports_update_block_table = use_v2
+    with patch.object(
+        builder, "_copy_sequence_indices_to_device", wraps=builder._copy_sequence_indices_to_device
+    ) as plan:
+        for count in [2, 2, 1, 1, 2]:
+            common = create_common_attn_metadata(BatchSpec([64, 64], [4, 4]), 16, torch.device("cpu"))
+            common.is_prefilling.zero_()
+            common.seq_lens_cpu_upper_bound[count:] = 0
+            drafts = torch.tensor([3] * count + [-1] * (2 - count), dtype=torch.int32)
+            accepted = torch.tensor([count, count], dtype=torch.int32)
+            metadata = builder.build(0, common, accepted, drafts, num_actual_reqs=count)
+            assert metadata.num_accepted_tokens.tolist() == [count] * count + [1] * (2 - count)
+            assert metadata.spec_query_start_loc.tolist() == [min(i, count) * 4 for i in range(3)]
+        assert plan.call_count == (3 if use_v2 else 5)
+
+
 def _build_attn_metadata(
     batch_spec: BatchSpec,
     *,
