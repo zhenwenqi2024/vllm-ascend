@@ -477,6 +477,17 @@ def build_attn_metadata(
     # Every group consumes the same request-length view. Create it once rather
     # than issuing a slice for each group in hybrid models.
     batch_seq_lens = seq_lens[:num_reqs]
+    batch_common_attn_kwargs = None
+    if (
+        type(model_specific_attn_metadata) is MambaHybridAttnMetadata
+        and getattr(model_specific_attn_metadata.get_extra_common_attn_kwargs, "__func__", None)
+        is MambaHybridAttnMetadata.get_extra_common_attn_kwargs
+        and kv_cache_groups
+    ):
+        # The standard Mamba provider exposes a batch-global prefill mask.
+        # Fetch the current view once per step; custom providers retain the
+        # per-group calls, including methods overridden on an instance.
+        batch_common_attn_kwargs = model_specific_attn_metadata.get_extra_common_attn_kwargs(0, num_reqs)
     for i, kv_cache_spec in enumerate(kv_cache_groups):
         block_table = block_tables[i]
         # Hybrid drafters can configure causality per KV cache group.
@@ -484,7 +495,9 @@ def build_attn_metadata(
         common_v41_metadata: dict[str, Any] = {}
 
         common_attn_metadata_extra_kwargs = (
-            model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
+            batch_common_attn_kwargs.copy()
+            if batch_common_attn_kwargs is not None
+            else model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
             if model_specific_attn_metadata is not None
             else {}
         )

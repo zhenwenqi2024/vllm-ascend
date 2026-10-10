@@ -2086,3 +2086,40 @@ def test_spec_graph_real_prefill_is_not_treated_as_padding():
 
     assert runtime.num_spec_decodes == 1
     assert runtime.num_prefills == 1
+
+
+@pytest.mark.parametrize("actual_reqs", [1, 2])
+@pytest.mark.parametrize("draft_count", [0, 3])
+def test_cached_pure_decode_reads_current_strided_accepted_counts(actual_reqs, draft_count):
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        num_speculative_blocks=3,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+    )
+    common = create_common_attn_metadata(BatchSpec([64, 64], [draft_count + 1] * 2), 16, torch.device("cpu"))
+    common.is_prefilling.zero_()
+    common.seq_lens_cpu_upper_bound[actual_reqs:] = 0
+    drafts = torch.tensor([draft_count] * actual_reqs + [-1] * (2 - actual_reqs), dtype=torch.int32)
+    source = torch.tensor([1, -99, 2, -99], dtype=torch.int32)
+    accepted = source[::2]
+    first = builder.build(0, common, accepted, drafts, num_actual_reqs=actual_reqs)
+    assert first.spec_sequence_indices.tolist() == list(range(actual_reqs))
+    pointer = first.num_accepted_tokens.data_ptr()
+    for step in (1, 2):
+        source.add_(1)
+        builder.num_accepted_tokens.fill_(-1)
+        with patch.object(torch, "index_select", wraps=torch.index_select) as gather:
+            current = builder.build(0, common, accepted, drafts, num_actual_reqs=actual_reqs)
+        gather.assert_not_called()
+        assert current.num_accepted_tokens.data_ptr() == pointer
+        assert current.num_accepted_tokens.tolist() == [step + i + 1 for i in range(actual_reqs)] + [1] * (
+            2 - actual_reqs
+        )
+        # The graph destination remains owned independently of the input view.
+        source.add_(100)
+        assert current.num_accepted_tokens.tolist() == [step + i + 1 for i in range(actual_reqs)] + [1] * (
+            2 - actual_reqs
+        )
+        source.sub_(100)

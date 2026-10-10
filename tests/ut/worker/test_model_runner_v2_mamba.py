@@ -396,6 +396,9 @@ def test_prepare_attn_zero_drafts_and_align_groups(monkeypatch, drafts, for_capt
         _get_mamba_group_info=MagicMock(return_value=(list(range(24)), None)),
         _ensure_align_ctx=MagicMock(return_value=object()),
     )
+    state._get_aligned_state_index_views = lambda values: AscendMambaHybridModelState._get_aligned_state_index_views(
+        state, values
+    )
     batch = SimpleNamespace(
         num_reqs=4,
         num_reqs_after_padding=6,
