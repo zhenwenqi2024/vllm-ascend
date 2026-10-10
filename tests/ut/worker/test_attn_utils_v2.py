@@ -139,6 +139,14 @@ def _make_gdn_reuse_inputs(num_groups):
     return builders, kwargs
 
 
+def test_exact_cpu_lengths_require_a_separate_mirror():
+    builders, kwargs = _make_gdn_reuse_inputs(1)
+    kwargs["seq_lens_cpu_is_exact"] = True
+    with pytest.raises(ValueError, match="Exact CPU sequence lengths"):
+        attn_utils.build_attn_metadata(**kwargs)
+    assert not builders[0].build_calls
+
+
 @pytest.mark.parametrize("for_capture", [False, True])
 def test_custom_gdn_provider_keeps_group_builds_separate(for_capture):
     builders, kwargs = _make_gdn_reuse_inputs(24)
@@ -836,6 +844,23 @@ def test_build_attn_metadata_factory_applies_state(monkeypatch, state_kwargs, fa
     assert captured_kwargs["is_prefilling"] is is_prefilling
     assert captured_kwargs["attn_state"] == factory_state
     assert captured_kwargs["copy_sfa_draft_index"] == 2
+
+
+def test_build_attn_metadata_factory_passes_exact_host_lengths(monkeypatch):
+    raw = MagicMock(return_value="metadata")
+    monkeypatch.setattr(attn_utils._BUILD_ATTN_METADATA_MODULE, "build_attn_metadata", raw)
+    seq_lens_cpu = torch.tensor([73, 22666, 0, 0], dtype=torch.int32)
+    with attn_utils.build_attn_metadata_factory(
+        torch.arange(32),
+        32,
+        torch.zeros(4, dtype=torch.bool),
+        seq_lens_cpu=seq_lens_cpu,
+        seq_lens_cpu_is_exact=True,
+    ):
+        assert attn_utils._BUILD_ATTN_METADATA_MODULE.build_attn_metadata() == "metadata"
+    assert raw.call_args.kwargs["seq_lens_cpu_is_exact"]
+    np.testing.assert_array_equal(raw.call_args.kwargs["seq_lens_np"], seq_lens_cpu.numpy())
+    assert attn_utils._BUILD_ATTN_METADATA_MODULE.build_attn_metadata is raw
 
 
 @pytest.mark.parametrize("dcp_size", [2])
