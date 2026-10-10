@@ -4,6 +4,7 @@
 
 from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any, cast
 
 import torch
@@ -16,7 +17,8 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionMetadataBuilder, AscendMetadata
+from vllm_ascend.compilation.updatable_graph import UpdatableGraph
 from vllm_ascend.ops.triton.v2.spec_decode.prepare_dflash_inputs import prepare_dflash_inputs_triton
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_attn_metadata_wrapper
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
@@ -25,13 +27,17 @@ from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
 )
 
 
-def prepare_dflash_inputs_factory(kv_cache_block_size: int) -> Callable[..., None]:
+def prepare_dflash_inputs_factory(
+    kv_cache_block_size: int, on_inputs_prepared: Callable[[], None] | None = None
+) -> Callable[..., None]:
     # Upstream uses the attention kernel block size for DCP ownership, which is
     # incorrect when physical KV blocks are larger than kernel blocks. Bind the
     # physical size so ownership uses KV cache blocks while slot lookup uses the
     # kernel-sized block table supplied by the upstream caller.
     def prepare_with_block_size(*args: Any, **kwargs: Any) -> None:
         prepare_dflash_inputs(*args, **kwargs, kv_cache_block_size=kv_cache_block_size)
+        if on_inputs_prepared is not None:
+            on_inputs_prepared()
 
     return prepare_with_block_size
 
@@ -46,6 +52,14 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
             return super().load_draft_model(target_model, target_attn_layer_names)
 
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
+        pending = getattr(self, "_deferred_draft_attn_metadata", None)
+        if pending is not None:
+            self._deferred_draft_attn_metadata = None
+            self._materializing_draft_metadata = True
+            try:
+                self._build_attn_metadata(*pending)
+            finally:
+                self._materializing_draft_metadata = False
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
         cached = self._prepared_draft_attn_metadata
         if cached is not None and cached[0] == num_reqs_padded:
@@ -85,7 +99,12 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         being replayed; otherwise tiling fails with
         ``queryT != last element of actualSequenceLengthQ``.
         """
-        query_lens_list = [(i + 1) * self.num_query_per_req for i in range(num_reqs_padded)]
+        query_key = (num_reqs_padded, self.num_query_per_req)
+        cached = getattr(self, "_draft_query_lengths", None)
+        if cached is None or cached[0] != query_key:
+            cached = (query_key, [(i + 1) * self.num_query_per_req for i in range(num_reqs_padded)])
+            self._draft_query_lengths = cached
+        query_lens_list = cached[1]
         for metadata in attn_metadata.values():
             metadata.actual_seq_lengths_q = query_lens_list
 
@@ -93,9 +112,58 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         super().__init__(vllm_config, device)
         self._lmhead_tp_validate_draft_sampling()
         self._prepared_draft_attn_metadata: tuple[int, dict[str, Any]] | None = None
+        self._deferred_draft_attn_metadata: tuple[Any, ...] | None = None
+        self._draft_metadata_template: tuple[Any, dict[str, AscendMetadata]] | None = None
+        self._draft_query_lengths: tuple[tuple[int, int], list[int]] | None = None
+        self._draft_seq_lens_cpu: torch.Tensor | None = None
+        self._draft_seq_lens_copy_stream: torch.npu.Stream | None = None
+        self._draft_seq_lens_copy_event: torch.npu.Event | None = None
+        self._draft_seq_lens_copy_count: int | None = None
+        self._draft_input_groups_prepared = 0
+        self._in_draft_proposal = False
+        self._materializing_draft_metadata = False
+        self._reuse_draft_layout = False
         self._use_cpu_seq_lens = False
 
+    def _on_draft_inputs_prepared(self) -> None:
+        if not self._in_draft_proposal or not self._use_cpu_seq_lens:
+            return
+        self._draft_input_groups_prepared += 1
+        # All cache groups write the shared length buffer. Snapshot only after
+        # the final writer, before context KV work or graph replay is submitted.
+        if self._draft_input_groups_prepared != len(self.draft_kv_cache_group_ids):
+            return
+        self._start_draft_seq_lens_copy(self.input_batch.num_reqs)
+
+    def _start_draft_seq_lens_copy(self, num_reqs: int) -> None:
+        source = self.input_buffers.seq_lens
+        if self._draft_seq_lens_cpu is None:
+            self._draft_seq_lens_cpu = torch.empty(source.numel(), dtype=source.dtype, device="cpu", pin_memory=True)
+            self._draft_seq_lens_copy_stream = torch.npu.Stream(device=source.device)
+            self._draft_seq_lens_copy_event = torch.npu.Event()
+        assert self._draft_seq_lens_copy_stream is not None
+        assert self._draft_seq_lens_copy_event is not None
+        current_stream = torch.npu.current_stream()
+        with torch.npu.stream(self._draft_seq_lens_copy_stream):
+            self._draft_seq_lens_copy_stream.wait_stream(current_stream)
+            self._draft_seq_lens_cpu[:num_reqs].copy_(source[:num_reqs], non_blocking=True)
+            self._draft_seq_lens_copy_event.record()
+        self._draft_seq_lens_copy_count = num_reqs
+
     def _prepare_draft_seq_lens_cpu(self, num_reqs: int, num_reqs_padded: int) -> torch.Tensor:
+        if getattr(self, "_draft_seq_lens_copy_count", None) == num_reqs:
+            assert self._draft_seq_lens_copy_event is not None
+            assert self._draft_seq_lens_cpu is not None
+            # Wait only for the snapshot, not the compute stream's context KV
+            # work or its newly launched graph (which waits for FIA updates).
+            self._draft_seq_lens_copy_event.synchronize()
+            self._draft_seq_lens_copy_count = None
+            seq_lens_cpu = self._draft_seq_lens_cpu[:num_reqs_padded]
+            if seq_lens_cpu.numel() != num_reqs_padded:
+                seq_lens_cpu = torch.zeros(num_reqs_padded, dtype=self._draft_seq_lens_cpu.dtype)
+                seq_lens_cpu[:num_reqs].copy_(self._draft_seq_lens_cpu[:num_reqs])
+            seq_lens_cpu[num_reqs:].zero_()
+            return seq_lens_cpu
         # Match GLM5.2/DSpark: transfer the device's valid lengths once, then
         # share the host mirror across FIA builders. The target CPU upper bound
         # still includes rejected tokens and cannot replace this exact mirror.
@@ -103,6 +171,47 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         if num_reqs:
             seq_lens_cpu[:num_reqs].copy_(self.input_buffers.seq_lens[:num_reqs])
         return seq_lens_cpu
+
+    def _can_defer_draft_metadata(self, batch_desc) -> bool:
+        if (
+            not getattr(self, "_in_draft_proposal", False)
+            or not getattr(self, "_reuse_draft_layout", False)
+            or getattr(self, "_materializing_draft_metadata", False)
+            or getattr(self, "_draft_seq_lens_copy_count", None) is None
+            or batch_desc.cg_mode != CUDAGraphMode.FULL
+        ):
+            return False
+        graph = self.query_cudagraph_manager.graphs.get(batch_desc)
+        # Every FIA task waits on its own external update event. Graph prefix
+        # compute can start before the CPU metadata is ready; attention cannot.
+        return isinstance(graph, UpdatableGraph) and bool(graph.tasks)
+
+    def _refresh_draft_layout(self, template, seq_lens_cpu, num_reqs_padded, num_tokens):
+        lengths = seq_lens_cpu.tolist()
+        refreshed = {}
+        group_metadata = {}
+        for group_index, groups in enumerate(self.attn_groups):
+            for group in groups:
+                for name in group.layer_names:
+                    previous = template[name]
+                    key = (group_index, id(previous))
+                    if key not in group_metadata:
+                        group_metadata[key] = replace(
+                            previous,
+                            seq_lens=seq_lens_cpu,
+                            seq_lens_cpu=seq_lens_cpu,
+                            seq_lens_list=lengths,
+                            seq_lens_gpu=self.input_buffers.seq_lens[:num_reqs_padded],
+                            query_start_loc_gpu=self.input_buffers.query_start_loc[: num_reqs_padded + 1],
+                            block_tables=AscendAttentionMetadataBuilder._pad_block_table(
+                                self.block_tables.input_block_tables[group_index][:num_reqs_padded], num_reqs_padded
+                            ),
+                            slot_mapping=self.block_tables.slot_mappings[group_index][:num_tokens],
+                            reshape_cache_event=None,
+                            qfa_metadata_cache={},
+                        )
+                    refreshed[name] = group_metadata[key]
+        return refreshed
 
     def _build_attn_metadata(
         self,
@@ -114,13 +223,39 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         causal=True,
         dcp_local_seq_lens=None,
     ):
+        if self._can_defer_draft_metadata(batch_desc):
+            self._deferred_draft_attn_metadata = (
+                num_reqs,
+                batch_desc,
+                query_start_loc_np,
+                seq_lens_cpu_upper_bound,
+                step,
+                causal,
+                dcp_local_seq_lens,
+            )
+            return None
         context = nullcontext()
+        template_key = None
         if getattr(self, "_use_cpu_seq_lens", False):
             num_reqs_padded = batch_desc.num_reqs or num_reqs
             seq_lens_cpu = self._prepare_draft_seq_lens_cpu(num_reqs, num_reqs_padded)
             num_tokens = (
                 batch_desc.num_tokens if batch_desc.cg_mode == CUDAGraphMode.FULL else int(query_start_loc_np[-1])
             )
+            if getattr(self, "_reuse_draft_layout", False) and batch_desc.cg_mode == CUDAGraphMode.FULL:
+                template_key = (
+                    num_reqs,
+                    num_reqs_padded,
+                    num_tokens,
+                    step,
+                    tuple(query_start_loc_np.tolist()),
+                    causal if isinstance(causal, bool) else tuple(sorted(causal.items())),
+                )
+                cached = self._draft_metadata_template
+                if cached is not None and cached[0] == template_key:
+                    metadata = self._refresh_draft_layout(cached[1], seq_lens_cpu, num_reqs_padded, num_tokens)
+                    self._prepared_draft_attn_metadata = (num_reqs_padded, metadata)
+                    return metadata
             context = build_attn_metadata_factory(
                 self.input_buffers.positions,
                 num_tokens,
@@ -144,6 +279,8 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         # The result includes group-local cache tensors and exact host lengths.
         if metadata is not None and batch_desc.cg_mode == CUDAGraphMode.FULL:
             self._prepared_draft_attn_metadata = (batch_desc.num_reqs or num_reqs, metadata)
+            if template_key is not None and all(type(value) is AscendMetadata for value in metadata.values()):
+                self._draft_metadata_template = (template_key, metadata)
         return metadata
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -197,8 +334,16 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
             and self.attn_vllm_config.parallel_config.decode_context_parallel_size == 1
             and self.attn_vllm_config.parallel_config.prefill_context_parallel_size == 1
         )
+        # Specialized builders own additional per-step state. Keep their full
+        # build path; only standard, non-CP FIA layouts are reusable here.
+        self._reuse_draft_layout = self._use_cpu_seq_lens and all(
+            type(group.get_metadata_builder(0)) is AscendAttentionMetadataBuilder
+            and group.get_metadata_builder(0).supports_update_block_table
+            for groups in self.attn_groups
+            for group in groups
+        )
         dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_factory(
-            self.vllm_config.cache_config.block_size
+            self.vllm_config.cache_config.block_size, self._on_draft_inputs_prepared
         )
 
     def propose(
@@ -223,6 +368,9 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         self.input_batch = input_batch
         # Physical cache rows and accepted lengths change between proposals.
         self._prepared_draft_attn_metadata = None
+        self._deferred_draft_attn_metadata = None
+        self._draft_input_groups_prepared = 0
+        self._in_draft_proposal = True
         sync_state = dp_sync
         if dummy_run and skip_attn_for_dummy_run:
             # Profiling runs the draft with its own query token count, which
@@ -231,25 +379,28 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
             # TODO: Remove this guard once main2main includes upstream vLLM
             # #54856 (facd9a74a1), which resets the profiling DP counts.
             sync_state = None
-        with build_attn_metadata_wrapper():
-            return super().propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings,
-                last_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                next_prefill_tokens,
-                temperature,
-                seeds,
-                sync_state,
-                dummy_run,
-                skip_attn_for_dummy_run,
-                mm_inputs,
-                is_profile=is_profile,
-            )
+        try:
+            with build_attn_metadata_wrapper():
+                return super().propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings,
+                    last_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    sync_state,
+                    dummy_run,
+                    skip_attn_for_dummy_run,
+                    mm_inputs,
+                    is_profile=is_profile,
+                )
+        finally:
+            self._in_draft_proposal = False
 
 
 def prepare_dflash_inputs(
