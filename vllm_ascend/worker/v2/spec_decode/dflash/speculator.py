@@ -19,7 +19,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionMetadataBuilder, AscendMetadata
 from vllm_ascend.compilation.updatable_graph import UpdatableGraph
-from vllm_ascend.ops.triton.v2.spec_decode.prepare_dflash_inputs import prepare_dflash_inputs_triton
+from vllm_ascend.ops.triton.v2.spec_decode.prepare_dflash_inputs import DFlashKVGroup, prepare_dflash_inputs_triton
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_factory, build_attn_metadata_wrapper
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
@@ -28,14 +28,22 @@ from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
 
 
 def prepare_dflash_inputs_factory(
-    kv_cache_block_size: int, on_inputs_prepared: Callable[[], None] | None = None
+    kv_cache_block_size: int,
+    on_inputs_prepared: Callable[[], None] | None = None,
+    get_kv_groups: Callable[[], tuple[DFlashKVGroup, ...] | None] | None = None,
 ) -> Callable[..., None]:
     # Upstream uses the attention kernel block size for DCP ownership, which is
     # incorrect when physical KV blocks are larger than kernel blocks. Bind the
     # physical size so ownership uses KV cache blocks while slot lookup uses the
     # kernel-sized block table supplied by the upstream caller.
     def prepare_with_block_size(*args: Any, **kwargs: Any) -> None:
-        prepare_dflash_inputs(*args, **kwargs, kv_cache_block_size=kv_cache_block_size)
+        groups = get_kv_groups() if get_kv_groups is not None else None
+        # The upstream proposal loops over groups before any input consumer.
+        # The first call prepares all groups; subsequent calls need no launch.
+        # Outside a proposal, retain the single-group API (None).
+        if groups == ():
+            return
+        prepare_dflash_inputs(*args, **kwargs, kv_cache_block_size=kv_cache_block_size, kv_groups=groups)
         if on_inputs_prepared is not None:
             on_inputs_prepared()
 
@@ -119,21 +127,37 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         self._draft_seq_lens_copy_stream: torch.npu.Stream | None = None
         self._draft_seq_lens_copy_event: torch.npu.Event | None = None
         self._draft_seq_lens_copy_count: int | None = None
-        self._draft_input_groups_prepared = 0
+        self._draft_inputs_prepared = False
         self._in_draft_proposal = False
         self._materializing_draft_metadata = False
         self._reuse_draft_layout = False
         self._use_cpu_seq_lens = False
 
+    def _get_draft_input_groups(self) -> tuple[DFlashKVGroup, ...] | None:
+        if not self._in_draft_proposal:
+            return None
+        if self._draft_inputs_prepared:
+            return ()
+        # Read current group views, rather than caching block-table addresses
+        # across proposals. Keep the slot buffers used by captured graphs.
+        return tuple(
+            (
+                self.block_tables.slot_mappings[gid],
+                self._context_slot_mappings[index],
+                self.block_tables.input_block_tables[gid],
+                self.block_tables.kernel_block_sizes[gid],
+            )
+            for index, gid in enumerate(self.draft_kv_cache_group_ids)
+        )
+
     def _on_draft_inputs_prepared(self) -> None:
-        if not self._in_draft_proposal or not self._use_cpu_seq_lens:
+        if not self._in_draft_proposal:
             return
-        self._draft_input_groups_prepared += 1
-        # All cache groups write the shared length buffer. Snapshot only after
-        # the final writer, before context KV work or graph replay is submitted.
-        if self._draft_input_groups_prepared != len(self.draft_kv_cache_group_ids):
-            return
-        self._start_draft_seq_lens_copy(self.input_batch.num_reqs)
+        self._draft_inputs_prepared = True
+        # Grouped preparation writes common lengths once. Snapshot afterward,
+        # before context KV work or graph replay is submitted.
+        if self._use_cpu_seq_lens:
+            self._start_draft_seq_lens_copy(self.input_batch.num_reqs)
 
     def _start_draft_seq_lens_copy(self, num_reqs: int) -> None:
         source = self.input_buffers.seq_lens
@@ -346,7 +370,7 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
             for group in groups
         )
         dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_factory(
-            self.vllm_config.cache_config.block_size, self._on_draft_inputs_prepared
+            self.vllm_config.cache_config.block_size, self._on_draft_inputs_prepared, self._get_draft_input_groups
         )
 
     def propose(
@@ -372,7 +396,7 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         # Physical cache rows and accepted lengths change between proposals.
         self._prepared_draft_attn_metadata = None
         self._deferred_draft_attn_metadata = None
-        self._draft_input_groups_prepared = 0
+        self._draft_inputs_prepared = False
         self._in_draft_proposal = True
         sync_state = dp_sync
         if dummy_run and skip_attn_for_dummy_run:
@@ -437,6 +461,7 @@ def prepare_dflash_inputs(
     sample_from_anchor: bool = False,
     *,
     kv_cache_block_size: int,
+    kv_groups: tuple[DFlashKVGroup, ...] | None = None,
 ) -> None:
     prepare_dflash_inputs_triton(
         input_buffers,
@@ -468,4 +493,5 @@ def prepare_dflash_inputs(
         max_model_len,
         sample_from_anchor,
         kv_cache_block_size=kv_cache_block_size,
+        kv_groups=kv_groups,
     )
