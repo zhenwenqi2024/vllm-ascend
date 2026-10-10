@@ -212,6 +212,56 @@ def test_empty_align_batch_skips_gather_on_build_and_update(builder_cls, num_spe
     assert updated.non_spec_prefill_metadata is None
 
 
+@pytest.mark.parametrize("draft_count", [None, 0, 3])
+@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+def test_batched_gdn_graph_updates_match_individual_group_updates(draft_count, mamba_cache_mode):
+    builders = [
+        _make_builder(
+            device=torch.device("cpu"),
+            num_heads=32,
+            num_speculative_tokens=3,
+            num_speculative_blocks=3,
+            mamba_cache_mode=mamba_cache_mode,
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        )
+        for _ in range(25)
+    ]
+    owner, reference, *others = builders
+    addresses = [(b.spec_state_indices_tensor.data_ptr(), b.non_spec_state_indices_tensor.data_ptr()) for b in others]
+    width = 1 if draft_count is None else draft_count + 1
+    for step, count in enumerate([4, 2, 1, 0, 4]):
+        common = create_common_attn_metadata(
+            BatchSpec([32] * count + [0] * (4 - count), [width] * count + [0] * (4 - count)),
+            16,
+            torch.device("cpu"),
+        )
+        common.block_table_tensor = torch.arange(64, dtype=torch.int32).view(4, 16) + step * 10000
+        drafts = None if draft_count is None else torch.tensor([draft_count] * count + [-1] * (4 - count))
+        accepted = torch.full((4,), 2, dtype=torch.int32) if drafts is not None else None
+        source = owner.build(0, common, accepted, drafts, num_actual_reqs=count)
+        updates, actual = [], []
+        for i, other in enumerate(others):
+            other.spec_state_indices_tensor.fill_(-99)
+            other.non_spec_state_indices_tensor.fill_(-99)
+            actual.append(
+                other.update_block_table(source, common.block_table_tensor + (i + 1) * 100, graph_state_updates=updates)
+            )
+            assert torch.all(other.spec_state_indices_tensor == -99)
+            assert torch.all(other.non_spec_state_indices_tensor == -99)
+        assert len(updates) == 23
+        owner.graph_state_updater.apply(updates)
+        for i, (other, metadata) in enumerate(zip(others, actual)):
+            # Separate storage prevents the reference from overwriting and
+            # concealing an incorrect batched write.
+            expected = reference.update_block_table(source, common.block_table_tensor + (i + 1) * 100)
+            _assert_reused_gdn_metadata_matches(metadata, expected)
+            if count == 0 or draft_count is None:
+                assert torch.all(other.spec_state_indices_tensor[:4] == PAD_SLOT_ID)
+        assert addresses == [
+            (b.spec_state_indices_tensor.data_ptr(), b.non_spec_state_indices_tensor.data_ptr()) for b in others
+        ]
+
+
 @pytest.mark.parametrize("builder_cls", [AscendGDNAttentionMetadataBuilder, AscendGDNHostMetadataBuilder])
 @pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
 @pytest.mark.parametrize("spec", [False, True])
