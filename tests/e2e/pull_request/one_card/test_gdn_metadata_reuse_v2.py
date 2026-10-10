@@ -11,7 +11,58 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
+from vllm_ascend.ops.triton.v2.mamba.graph_state import GDNGraphStateUpdater
 from vllm_ascend.worker.v2.model_states.mamba_hybrid import _compute_aligned_state_indices
+
+
+@pytest.mark.parametrize("width", [1, 3, 8, 17])
+@pytest.mark.parametrize("reset_spec", [False, True])
+def test_batched_graph_state_replay_reads_current_group_ids(width, reset_spec):
+    torch.npu.set_device(0)
+    groups, capacity = 23, 8
+    tables = (
+        torch.arange(groups * capacity * (width + 2), dtype=torch.int32, device="npu").view(groups, capacity, width + 2)
+        + 2**24
+        + 1
+    )
+    outputs = [torch.full((capacity, width), -99, dtype=torch.int32, device="npu") for _ in range(groups)]
+    resets = [
+        torch.full((capacity, 4), 99, dtype=torch.int32, device="npu") if reset_spec else None for _ in range(groups)
+    ]
+    addresses = [dst.data_ptr() for dst in outputs]
+    updater = GDNGraphStateUpdater()
+
+    def prepare(count):
+        updater.apply(
+            [(src[:, :width], dst, count, capacity, 0, reset) for src, dst, reset in zip(tables, outputs, resets)]
+        )
+
+    main_stream = torch.npu.current_stream()
+    stream, graph = torch.npu.Stream(), torch.npu.NPUGraph()
+    snapshots = []
+    with torch.npu.stream(stream):
+        stream.wait_stream(main_stream)
+        prepare(5)
+        torch.npu.synchronize()
+        with torch.npu.graph(graph, stream=stream):
+            captured = torch.stack(outputs)
+            captured_resets = torch.stack(resets) if reset_spec else None
+        for step, count in enumerate([5, 1, 0, 8], 1):
+            tables.add_(100)
+            prepare(count)
+            graph.replay()
+            snapshots.append(
+                (step, count, captured.clone(), None if captured_resets is None else captured_resets.clone())
+            )
+    torch.npu.synchronize()
+    original = torch.arange(groups * capacity * (width + 2), dtype=torch.int32).view(groups, capacity, width + 2)
+    for step, count, current, cleared in snapshots:
+        expected = original[:, :, :width].clone() + 2**24 + 1 + step * 100
+        expected[:, count:] = 0
+        torch.testing.assert_close(current.cpu(), expected, rtol=0, atol=0)
+        if cleared is not None:
+            assert torch.all(cleared.cpu() == -1)
+    assert [dst.data_ptr() for dst in outputs] == addresses
 
 
 @pytest.mark.parametrize("num_groups", [1, 24])
@@ -175,7 +226,13 @@ def test_gdn_shared_metadata_aclgraph_reads_updated_group_states():
         accepted = torch.full((graph_reqs,), step, dtype=torch.int32, device="npu")
         drafts = torch.tensor([3] * count + [-1] * (graph_reqs - count), dtype=torch.int32)
         first = builders[0].build(0, common, accepted, drafts, num_actual_reqs=count)
-        return [first] + [builder.update_block_table(first, bt) for builder, bt in zip(builders[1:], group_tables[1:])]
+        updates = []
+        metadata = [first] + [
+            builder.update_block_table(first, bt, graph_state_updates=updates)
+            for builder, bt in zip(builders[1:], group_tables[1:])
+        ]
+        builders[0].graph_state_updater.apply(updates)
+        return metadata
 
     stream = torch.npu.Stream()
     graph = torch.npu.NPUGraph()

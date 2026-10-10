@@ -45,6 +45,11 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
 
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
+        cached = self._prepared_draft_attn_metadata
+        if cached is not None and cached[0] == num_reqs_padded:
+            attn_metadata = cached[1]
+            self._update_draft_attn_metadata(attn_metadata, num_reqs_padded)
+            return [attn_metadata]
         with build_attn_metadata_wrapper():
             # vLLM main (#56181) replaced _build_draft_attn_metadata with
             # _build_uniform_attn_metadata (BatchExecutionDescriptor).
@@ -85,6 +90,33 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self._lmhead_tp_validate_draft_sampling()
+        self._prepared_draft_attn_metadata: tuple[int, dict[str, Any]] | None = None
+
+    def _build_attn_metadata(
+        self,
+        num_reqs,
+        batch_desc,
+        query_start_loc_np,
+        seq_lens_cpu_upper_bound,
+        step,
+        causal=True,
+        dcp_local_seq_lens=None,
+    ):
+        metadata = super()._build_attn_metadata(
+            num_reqs,
+            batch_desc,
+            query_start_loc_np,
+            seq_lens_cpu_upper_bound,
+            step,
+            causal,
+            dcp_local_seq_lens,
+        )
+        # Upstream builds this even for FULL replay, refreshing builder state.
+        # Reuse that result when the graph manager asks again in this proposal.
+        # Group-local cache tensors and all copy/synchronization paths are kept.
+        if metadata is not None and batch_desc.cg_mode == CUDAGraphMode.FULL:
+            self._prepared_draft_attn_metadata = (batch_desc.num_reqs or num_reqs, metadata)
+        return metadata
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         if self.speculative_config.enforce_eager:
@@ -156,6 +188,8 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         is_profile: bool = False,
     ) -> torch.Tensor:
         self.input_batch = input_batch
+        # Physical cache rows and accepted lengths change between proposals.
+        self._prepared_draft_attn_metadata = None
         sync_state = dp_sync
         if dummy_run and skip_attn_for_dummy_run:
             # Profiling runs the draft with its own query token count, which

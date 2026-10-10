@@ -90,8 +90,10 @@ class _RecordingGDNReuseBuilder(AscendGDNAttentionMetadataBuilder):
     def build_for_cudagraph_capture(self, common_attn_metadata, **kwargs):
         return self.build(0, common_attn_metadata, **kwargs)
 
-    def update_block_table(self, metadata, blk_table, slot_mapping=None):
+    def update_block_table(self, metadata, blk_table, slot_mapping=None, graph_state_updates=None):
         self.update_calls.append(metadata)
+        if graph_state_updates is not None:
+            graph_state_updates.append(blk_table)
         return SimpleNamespace(batch=metadata.batch, block_table=blk_table)
 
 
@@ -170,6 +172,26 @@ def test_batch_global_mamba_gdn_groups_reuse_during_capture_and_replay(for_captu
     for i, metadata in enumerate(result.values()):
         assert metadata.block_table is kwargs["block_tables"][i]
     assert extra_inputs.call_count == (0 if for_capture else 1)
+
+
+@pytest.mark.parametrize("for_capture", [False, True])
+def test_v2_flushes_group_graph_writes_once_before_return(for_capture):
+    builders, kwargs = _make_gdn_reuse_inputs(24)
+    kwargs["model_specific_attn_metadata"] = MambaHybridAttnMetadata(
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+        num_accepted_tokens=torch.tensor([2, 3], dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([3, 3], dtype=torch.int32),
+    )
+    for builder in builders:
+        builder.graph_state_updater = MagicMock()
+    result = attn_utils.build_attn_metadata(**kwargs, for_cudagraph_capture=for_capture)
+    builders[0].graph_state_updater.apply.assert_called_once()
+    updates = builders[0].graph_state_updater.apply.call_args.args[0]
+    assert len(updates) == 23
+    for i, update in enumerate(updates, 1):
+        assert update is kwargs["block_tables"][i]
+        assert result[f"layer{i}"].block_table is update
+    assert all(not builder.graph_state_updater.apply.called for builder in builders[1:])
 
 
 @pytest.mark.parametrize("shared_capture", [False, True])
