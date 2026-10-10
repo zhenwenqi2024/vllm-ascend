@@ -17,7 +17,8 @@ from vllm_ascend.worker.v2.model_states.mamba_hybrid import _compute_aligned_sta
 
 @pytest.mark.parametrize("width", [1, 3, 8, 17])
 @pytest.mark.parametrize("reset_spec", [False, True])
-def test_batched_graph_state_replay_reads_current_group_ids(width, reset_spec):
+@pytest.mark.parametrize("full_source", [False, True])
+def test_batched_graph_state_replay_reads_current_group_ids(width, reset_spec, full_source):
     torch.npu.set_device(0)
     groups, capacity = 23, 8
     tables = (
@@ -34,7 +35,10 @@ def test_batched_graph_state_replay_reads_current_group_ids(width, reset_spec):
 
     def prepare(count):
         updater.apply(
-            [(src[:, :width], dst, count, capacity, 0, reset) for src, dst, reset in zip(tables, outputs, resets)]
+            [
+                (src if full_source else src[:, :width], dst, count, capacity, 0, reset)
+                for src, dst, reset in zip(tables, outputs, resets)
+            ]
         )
 
     main_stream = torch.npu.current_stream()
@@ -205,7 +209,7 @@ def test_gdn_shared_metadata_aclgraph_reads_updated_group_states():
         speculative_config=SimpleNamespace(num_speculative_tokens=3, parallel_drafting=False),
     )
     builders = [AscendGDNAttentionMetadataBuilder(spec, [f"layer{i}"], config, torch.device("npu")) for i in range(24)]
-    table = torch.arange(graph_reqs * width, dtype=torch.int32, device="npu").view(graph_reqs, width)
+    table = torch.arange(graph_reqs * (width + 2), dtype=torch.int32, device="npu").view(graph_reqs, width + 2)
     group_tables = [table + i * 1000 for i in range(24)]
 
     def prepare(count, step):
@@ -262,6 +266,10 @@ def test_gdn_shared_metadata_aclgraph_reads_updated_group_states():
         for step, count in enumerate([1, 1, 3, 3, 2, 2], start=2):
             for bt in group_tables:
                 bt.add_(100)
+            if step == 5:
+                # Replace the source allocations while graph destinations stay
+                # stable. Pointer-table caching must bind the new tables.
+                group_tables[:] = [bt.clone() for bt in group_tables]
             # A layout cache must restore graph inputs, not assume the last
             # execution left their contents intact.
             builders[0].spec_query_start_loc.fill_(-1)
@@ -285,7 +293,7 @@ def test_gdn_shared_metadata_aclgraph_reads_updated_group_states():
             )
     torch.npu.synchronize()
     for count, step, states, accepted, query, masks, lengths in snapshots:
-        expected = torch.stack([table.cpu() + i * 1000 + (step - 1) * 100 for i in range(24)])
+        expected = torch.stack([table.cpu()[:, :width] + i * 1000 + (step - 1) * 100 for i in range(24)])
         expected[:, count:].zero_()
         torch.testing.assert_close(states.cpu(), expected, rtol=0, atol=0)
         assert accepted.cpu().tolist() == [(step - 1) % width + 1] * count + [1] * (graph_reqs - count)

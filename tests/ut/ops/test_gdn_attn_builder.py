@@ -212,6 +212,56 @@ def test_empty_align_batch_skips_gather_on_build_and_update(builder_cls, num_spe
     assert updated.non_spec_prefill_metadata is None
 
 
+@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+@pytest.mark.parametrize("draft_count", [0, 3])
+def test_batched_spec_group_reuses_view_with_current_table(mamba_cache_mode, draft_count):
+    owner, other, reference = [
+        _make_builder(
+            device=torch.device("cpu"),
+            num_heads=32,
+            num_speculative_tokens=3,
+            num_speculative_blocks=3,
+            mamba_cache_mode=mamba_cache_mode,
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        )
+        for _ in range(3)
+    ]
+    width = draft_count + 1
+    previous_view = None
+    for step, (count, graph_rows) in enumerate([(2, 4), (1, 4), (2, 3), (1, 3), (3, 4)]):
+        common = create_common_attn_metadata(
+            BatchSpec([32] * count + [0] * (graph_rows - count), [width] * count + [0] * (graph_rows - count)),
+            16,
+            torch.device("cpu"),
+        )
+        common.block_table_tensor = torch.arange(graph_rows * 16, dtype=torch.int32).view(graph_rows, 16)
+        drafts = torch.tensor([draft_count] * count + [-1] * (graph_rows - count), dtype=torch.int32)
+        accepted = torch.full((graph_rows,), step % width + 1, dtype=torch.int32)
+        source = owner.build(0, common, accepted, drafts, num_actual_reqs=count)
+        table = common.block_table_tensor + 1000 * (step + 1)
+        if mamba_cache_mode == "align":
+            other.mamba_aligned_state_indices = ascend_gdn_attn_builder.mamba_get_block_table_tensor(
+                table, source.gdn_seq_lens, other.kv_cache_spec, "align"
+            )
+        expected = reference.update_block_table(source, table)
+        other.spec_state_indices_tensor.fill_(-99)
+        updates = []
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+            actual = other.update_block_table(source, table, graph_state_updates=updates)
+        # Cached destinations and full source tables need no per-group slices.
+        if previous_view is not None and previous_view.size(0) == graph_rows:
+            assert actual.spec_state_indices_tensor is previous_view
+            assert not any(event.key == "aten::slice" for event in profile.key_averages())
+        previous_view = actual.spec_state_indices_tensor
+        assert updates[0][0] is (other.mamba_aligned_state_indices if mamba_cache_mode == "align" else table)
+        owner.graph_state_updater.apply(updates)
+        _assert_reused_gdn_metadata_matches(actual, expected)
+        assert actual.spec_decode_metadata.spec_causal_conv1d.cache_indices is actual.spec_state_indices_tensor
+        assert actual.spec_decode_metadata.actual_seq_lengths is source.spec_decode_metadata.actual_seq_lengths
+        assert actual.spec_decode_metadata is not source.spec_decode_metadata
+        assert torch.all(actual.spec_state_indices_tensor[count:] == owner._SPEC_GRAPH_PAD_SLOT_ID)
+
+
 @pytest.mark.parametrize("draft_count", [None, 0, 3])
 @pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
 def test_batched_gdn_graph_updates_match_individual_group_updates(draft_count, mamba_cache_mode):
