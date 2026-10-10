@@ -157,17 +157,59 @@ def test_prefetched_lengths_wait_on_copy_event_and_clear_old_padding():
     spec._draft_seq_lens_copy_event.synchronize.assert_called_once_with()
 
 
-def test_snapshot_is_started_only_after_final_group_writer():
+def test_snapshot_is_started_after_grouped_input_launch():
     spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
     spec._in_draft_proposal = spec._use_cpu_seq_lens = True
-    spec._draft_input_groups_prepared = 0
+    spec._draft_inputs_prepared = False
     spec.draft_kv_cache_group_ids = [2, 5]
     spec.input_batch = SimpleNamespace(num_reqs=3)
     spec._start_draft_seq_lens_copy = MagicMock()
     spec._on_draft_inputs_prepared()
-    spec._start_draft_seq_lens_copy.assert_not_called()
-    spec._on_draft_inputs_prepared()
     spec._start_draft_seq_lens_copy.assert_called_once_with(3)
+    assert spec._draft_inputs_prepared
+
+
+@pytest.mark.parametrize("use_cpu_lengths", [False, True])
+def test_grouped_preparation_launches_once_per_proposal_and_refreshes_views(monkeypatch, use_cpu_lengths):
+    spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    spec._in_draft_proposal = True
+    spec._use_cpu_seq_lens = use_cpu_lengths
+    spec._draft_inputs_prepared = False
+    spec.draft_kv_cache_group_ids = [2, 0]
+    spec.input_batch = SimpleNamespace(num_reqs=3)
+    spec._start_draft_seq_lens_copy = MagicMock()
+    spec.block_tables = SimpleNamespace(
+        slot_mappings=torch.empty((3, 16), dtype=torch.int32),
+        input_block_tables=[torch.full((4, 8), i, dtype=torch.int32) for i in range(3)],
+        kernel_block_sizes=[64, 128, 32],
+    )
+    spec._context_slot_mappings = torch.empty((2, 16), dtype=torch.int32)
+    launch = MagicMock()
+    monkeypatch.setattr(dflash_module, "prepare_dflash_inputs", launch)
+    prepare = dflash_module.prepare_dflash_inputs_factory(
+        128, spec._on_draft_inputs_prepared, spec._get_draft_input_groups
+    )
+    prepare("common_inputs")
+    prepare("common_inputs")
+    launch.assert_called_once()
+    groups = launch.call_args.kwargs["kv_groups"]
+    for index, gid in enumerate(spec.draft_kv_cache_group_ids):
+        assert groups[index][0].data_ptr() == spec.block_tables.slot_mappings[gid].data_ptr()
+        assert groups[index][1].data_ptr() == spec._context_slot_mappings[index].data_ptr()
+        assert groups[index][2] is spec.block_tables.input_block_tables[gid]
+        assert groups[index][3] == spec.block_tables.kernel_block_sizes[gid]
+    assert spec._start_draft_seq_lens_copy.call_count == int(use_cpu_lengths)
+    # A new proposal must pick up current table views and launch again.
+    spec._draft_inputs_prepared = False
+    spec.block_tables.input_block_tables[2] = torch.full((4, 8), 99, dtype=torch.int32)
+    prepare("next_proposal")
+    assert launch.call_count == 2
+    assert launch.call_args.kwargs["kv_groups"][0][2] is spec.block_tables.input_block_tables[2]
+    # Dummy/standalone calls outside a proposal retain the single-group API.
+    spec._in_draft_proposal = False
+    prepare("standalone")
+    assert launch.call_count == 3
+    assert launch.call_args.kwargs["kv_groups"] is None
 
 
 def test_full_layout_reuse_refreshes_lengths_and_each_groups_physical_cache(monkeypatch):
