@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
+import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
@@ -88,3 +90,50 @@ def test_proposal_invalidates_previous_metadata_before_upstream_execution(monkey
 
     monkeypatch.setattr(DFlashSpeculator, "propose", propose)
     assert speculator.propose(batch, *([None] * 10)) is result
+
+
+@pytest.mark.parametrize("num_reqs,padded", [(0, 4), (1, 1), (1, 4), (2, 4)])
+def test_dflash_cpu_mirror_reads_valid_rows_and_zeroes_padding(num_reqs, padded):
+    spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    spec.input_buffers = SimpleNamespace(seq_lens=torch.tensor([73, 22666, 99999, 99999], dtype=torch.int32))
+    actual = spec._prepare_draft_seq_lens_cpu(num_reqs, padded)
+    assert actual.device.type == "cpu"
+    assert actual.dtype == torch.int32
+    assert actual.tolist() == [73, 22666][:num_reqs] + [0] * (padded - num_reqs)
+    assert spec.input_buffers.seq_lens.tolist() == [73, 22666, 99999, 99999]
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
+def test_dflash_metadata_shares_exact_lengths_and_refreshes_after_rejection(monkeypatch, mode):
+    spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    spec._use_cpu_seq_lens = True
+    spec._prepared_draft_attn_metadata = None
+    spec.input_buffers = SimpleNamespace(
+        seq_lens=torch.tensor([73, 22666, 99999, 99999], dtype=torch.int32),
+        positions=torch.arange(32),
+    )
+    spec.draft_is_prefilling = torch.zeros(4, dtype=torch.bool)
+    spec.vllm_config = SimpleNamespace(parallel_config=object())
+    monkeypatch.setattr(AscendDFlashSpeculator, "attn_vllm_config", property(lambda self: self.vllm_config))
+    descriptor = SimpleNamespace(cg_mode=mode, num_reqs=4, num_tokens=32)
+    query = np.array([0, 8, 16], dtype=np.int32)
+    upper_bound = torch.tensor([99, 99999], dtype=torch.int32)
+    supplied = []
+
+    @contextmanager
+    def factory(positions, pad, **kwargs):
+        assert positions is spec.input_buffers.positions
+        assert pad == (32 if mode == CUDAGraphMode.FULL else 16)
+        assert kwargs["seq_lens_cpu_is_exact"]
+        supplied.append(kwargs["seq_lens_cpu"])
+        yield
+
+    monkeypatch.setattr(dflash_module, "build_attn_metadata_factory", factory)
+    parent = MagicMock(return_value={"draft": object()})
+    monkeypatch.setattr(DFlashSpeculator, "_build_attn_metadata", parent)
+    spec._build_attn_metadata(2, descriptor, query, upper_bound, 8, False)
+    spec.input_buffers.seq_lens[:2].copy_(torch.tensor([74, 22674]))
+    spec._build_attn_metadata(2, descriptor, query, upper_bound, 8, False)
+    assert [value.tolist() for value in supplied] == [[73, 22666, 0, 0], [74, 22674, 0, 0]]
+    assert upper_bound.tolist() == [99, 99999]
+    assert parent.call_count == 2
