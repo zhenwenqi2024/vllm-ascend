@@ -4,6 +4,7 @@
 import gc
 import statistics
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import pytest
@@ -630,7 +631,9 @@ def test_grouped_prepare_keeps_each_groups_slots(case, num_groups):
     for item, params in zip(group_data[1:], group_cases[1:]):
         ref = _build_reference(item, params)
         _assert_exact(item.outputs.query_slot_mapping, ref.query_slot_mapping)
-        _assert_exact(item.outputs.context_slot_mapping[: sum(case["req_lens"])], ref.context_slot_mapping)
+        _assert_exact(
+            item.outputs.context_slot_mapping[: sum(cast(list[int], case["req_lens"]))], ref.context_slot_mapping
+        )
         # Only the supplied common buffer set is written.
         assert torch.all(item.outputs.input_buffers.seq_lens == -12345)
     _cleanup()
@@ -670,7 +673,9 @@ def test_grouped_prepare_replay_refreshes_rejection_and_pages(num_groups):
         for item in items[1:]:
             ref = _build_reference(item, case)
             _assert_exact(item.outputs.query_slot_mapping, ref.query_slot_mapping)
-            _assert_exact(item.outputs.context_slot_mapping[: sum(case["req_lens"])], ref.context_slot_mapping)
+            _assert_exact(
+                item.outputs.context_slot_mapping[: sum(cast(list[int], case["req_lens"]))], ref.context_slot_mapping
+            )
         assert addresses == [tensor.data_ptr() for group in groups for tensor in group[:3]]
     _cleanup()
 
@@ -713,7 +718,7 @@ def test_grouped_prepare_benchmark(num_reqs, record_property):
     for prepare in (separate, grouped):
         prepare()
     torch.npu.synchronize()
-    timings = {"separate": [], "grouped": []}
+    timings: dict[str, list[float]] = {"separate": [], "grouped": []}
     repeats = 100
     for _ in range(7):
         for label, prepare in (("separate", separate), ("grouped", grouped)):

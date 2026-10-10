@@ -245,10 +245,17 @@ def test_full_layout_reuse_refreshes_lengths_and_each_groups_physical_cache(monk
     order = []
     refresh = spec._refresh_draft_layout
     prepare_lengths = spec._prepare_draft_seq_lens_cpu
-    monkeypatch.setattr(spec, "_refresh_draft_layout", lambda *args: order.append("layout") or refresh(*args))
-    monkeypatch.setattr(
-        spec, "_prepare_draft_seq_lens_cpu", lambda *args: order.append("length_wait") or prepare_lengths(*args)
-    )
+
+    def refresh_layout(*args):
+        order.append("layout")
+        return refresh(*args)
+
+    def prepare_current_lengths(*args):
+        order.append("length_wait")
+        return prepare_lengths(*args)
+
+    monkeypatch.setattr(spec, "_refresh_draft_layout", refresh_layout)
+    monkeypatch.setattr(spec, "_prepare_draft_seq_lens_cpu", prepare_current_lengths)
     refreshed = spec._build_attn_metadata(*args)
     assert order == ["layout", "length_wait"]
     parent.assert_called_once()
@@ -273,17 +280,30 @@ def test_graph_replay_precedes_deferred_build_but_update_stream_wait_precedes_re
     metadata = {"draft": object()}
     desc = BatchExecutionDescriptor(cg_mode=CUDAGraphMode.FULL, num_tokens=32, num_reqs=4)
     manager.graphs = {desc: graph}
+
+    def build_metadata(*args):
+        calls.append("build")
+        return [metadata]
+
+    def replay(*args):
+        calls.append("replay")
+        return 7
+
+    def resolve(source):
+        calls.append("resolve")
+        return iter(())
+
     manager.speculator = SimpleNamespace(
         _deferred_draft_attn_metadata=object(),
         attn_backends={"draft": object()},
         input_batch=SimpleNamespace(seq_lens_cpu_upper_bound=object()),
-        build_draft_attn_metadatas=lambda *a: calls.append("build") or [metadata],
+        build_draft_attn_metadatas=build_metadata,
     )
     manager.update_stream = SimpleNamespace(wait_stream=lambda stream: calls.append("wait_inputs"))
     monkeypatch.setattr(torch.npu, "current_stream", lambda: object())
     monkeypatch.setattr(torch.npu, "stream", lambda stream: nullcontext())
-    monkeypatch.setattr(graph_module.DFlashCudaGraphManager, "run_fullgraph", lambda *a: calls.append("replay") or 7)
-    graph.iter_resolved_tasks.side_effect = lambda source: calls.append("resolve") or iter(())
+    monkeypatch.setattr(graph_module.DFlashCudaGraphManager, "run_fullgraph", replay)
+    graph.iter_resolved_tasks.side_effect = resolve
     graph.update.side_effect = lambda *a: calls.append("update")
     assert manager.run_fullgraph(desc) == 7
     assert calls == ["wait_inputs", "replay", "build", "resolve", "update"]

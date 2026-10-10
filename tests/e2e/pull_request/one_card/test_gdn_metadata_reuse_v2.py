@@ -230,7 +230,7 @@ def test_gdn_shared_metadata_aclgraph_reads_updated_group_states():
         accepted = torch.full((graph_reqs,), (step - 1) % width + 1, dtype=torch.int32, device="npu")
         drafts = torch.tensor([3] * count + [-1] * (graph_reqs - count), dtype=torch.int32)
         first = builders[0].build(0, common, accepted, drafts, num_actual_reqs=count)
-        updates = []
+        updates: list = []
         metadata = [first] + [
             builder.update_block_table(first, bt, graph_state_updates=updates)
             for builder, bt in zip(builders[1:], group_tables[1:])

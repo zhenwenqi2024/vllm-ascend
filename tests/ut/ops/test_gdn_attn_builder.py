@@ -245,7 +245,7 @@ def test_batched_spec_group_reuses_view_with_current_table(mamba_cache_mode, dra
             )
         expected = reference.update_block_table(source, table)
         other.spec_state_indices_tensor.fill_(-99)
-        updates = []
+        updates: list = []
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
             actual = other.update_block_table(source, table, graph_state_updates=updates)
         # Cached destinations and full source tables need no per-group slices.
@@ -289,7 +289,8 @@ def test_batched_gdn_graph_updates_match_individual_group_updates(draft_count, m
         drafts = None if draft_count is None else torch.tensor([draft_count] * count + [-1] * (4 - count))
         accepted = torch.full((4,), 2, dtype=torch.int32) if drafts is not None else None
         source = owner.build(0, common, accepted, drafts, num_actual_reqs=count)
-        updates, actual = [], []
+        updates: list = []
+        actual: list = []
         for i, other in enumerate(others):
             other.spec_state_indices_tensor.fill_(-99)
             other.non_spec_state_indices_tensor.fill_(-99)
