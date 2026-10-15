@@ -449,7 +449,6 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
     def _prepare_router_and_milestones(
         self,
         prepared_shared_input: PreparedSharedExpertInput,
-        shared_hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         record_gate_up_done: bool = False,
     ) -> tuple[
@@ -462,7 +461,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # which runs only when multistream overlap is enabled; skip the record
         # (notably slow host-side) when it is off.
         if self.is_internal_router:
-            router_input = self._prepare_router_input(shared_hidden_states, router_logits)
+            # router_logits carries the caller's token-local gate input. The
+            # shared input may instead contain all-gathered SP tokens.
+            router_input = self._prepare_router_input(router_logits, router_logits)
             # Release shared Vector/AIV preparation only after the router input
             # Cast. It then overlaps the Cube-heavy gate matmul instead of
             # competing with another Vector/AIV operation.
@@ -547,7 +548,6 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             router_logits, shared_input_ready, router_output_ready, submitted_gate_up = (
                 self._prepare_router_and_milestones(
                     prepared_shared_input,
-                    shared_hidden_states,
                     router_logits,
                     record_gate_up_done=serialize_gate_up,
                 )

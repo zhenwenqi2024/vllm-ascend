@@ -2651,7 +2651,6 @@ def test_internal_router_releases_shared_stream_after_input_cast(monkeypatch):
         runner._prepare_router_and_milestones(
             prepared_shared_input,
             hidden_states,
-            hidden_states,
         )
     )
 
@@ -2674,7 +2673,8 @@ def test_internal_router_without_precast_keeps_registered_gate_forward(monkeypat
     nn.Module.__init__(runner)
     hidden_states = MagicMock()
     hidden_states.float.side_effect = AssertionError("fallback must not allocate an unused FP32 input")
-    prepared_input = PreparedSharedExpertInput(hidden_states)
+    # SP shared input can be all-gathered; the router still sees local tokens.
+    prepared_input = PreparedSharedExpertInput(torch.randn(8, 4))
     shared_input_ready = object()
     router_output_ready = object()
     prepared_execution = object()
@@ -2722,7 +2722,7 @@ def test_internal_router_without_precast_keeps_registered_gate_forward(monkeypat
         lambda: SimpleNamespace(multistream_overlap_shared_expert=True),
     )
 
-    result = runner._prepare_router_and_milestones(prepared_input, hidden_states, object())
+    result = runner._prepare_router_and_milestones(prepared_input, hidden_states)
 
     assert result == (gate_logits, shared_input_ready, router_output_ready, submitted_gate_up)
     assert operation_order == [
