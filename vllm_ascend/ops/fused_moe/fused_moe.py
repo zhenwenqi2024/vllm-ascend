@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import _moe_forward_
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import PreparedSharedExpertInput, RoutedMoEMilestones
 from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method, setup_moe_comm_method
@@ -38,9 +39,11 @@ from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
 from vllm_ascend.ops.fused_moe.shared_experts import (
     AscendSharedExperts,
     PreparedSharedExpertExecution,
+    SharedExpertMLPPath,
     SharedExpertParallelMode,
     SubmittedSharedExpertGateUp,
 )
+from vllm_ascend.quantization.quant_type import QuantType
 
 
 def _ascend_moe_forward_shared_sp_fake(
@@ -447,11 +450,13 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         prepared_shared_input: PreparedSharedExpertInput,
         shared_hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        defer_gate_up: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.npu.Event | None,
         torch.npu.Event | None,
         SubmittedSharedExpertGateUp | None,
+        PreparedSharedExpertExecution | None,
     ]:
         # The milestones are consumed only by the shared-expert side stream,
         # which runs only when multistream overlap is enabled; skip the record
@@ -475,9 +480,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 shared_input_ready,
             )
             router_output_ready = shared_input_ready
-        # Submit Gate-Up now, before routed_experts.forward_impl enqueues TopK
-        # and dispatch. The auxiliary stream waits for router_output_ready, so
-        # Gate-Up starts together with routed TopK and can cover dispatch.
+        # Normally submit Gate-Up before routed TopK/dispatch. Kimi's unfused
+        # W4A8 SiTU path instead submits it at the routed GMM1 boundary.
         shared_experts = self.ascend_shared_experts
         assert shared_experts is not None
         submitted_gate_up = (
@@ -485,10 +489,28 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 prepared_execution,
                 router_output_ready,
             )
-            if prepared_execution is not None
+            if prepared_execution is not None and not defer_gate_up
             else None
         )
-        return router_logits, shared_input_ready, router_output_ready, submitted_gate_up
+        return router_logits, shared_input_ready, router_output_ready, submitted_gate_up, prepared_execution
+
+    def _defer_kimi_w4a8_gate_up(self) -> bool:
+        """Select the Kimi SP path with separate routed GMM1 and SiTU ops."""
+        shared_experts = self.ascend_shared_experts
+        activation = getattr(self.routed_experts, "activation", None)
+        shared_gate_up = getattr(getattr(shared_experts, "layer", None), "gate_up_proj", None)
+        return bool(
+            self._can_overlap_sp_shared_with(self.routed_input_transform)
+            and self.quant_type is QuantType.W4A8
+            and _EXTRA_CTX.moe_comm_type in {MoECommType.ALLGATHER, MoECommType.ALLTOALL, MoECommType.MC2}
+            and getattr(activation, "value", activation) == "situ"
+            and shared_experts is not None
+            and shared_experts.situ_activation is not None
+            and shared_experts.lora_context is None
+            and getattr(getattr(shared_gate_up, "weight", None), "dtype", None) == torch.int8
+            and shared_experts._select_mlp_path() is SharedExpertMLPPath.A8_INT_FUSED
+            and not get_current_hardware_profile().supports(HardwareCapability.GMM_DEQUANT_SITU_QUANT)
+        )
 
     def _forward_impl(
         self,
@@ -514,18 +536,41 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 if shared_input_is_gathered
                 else self.ascend_shared_experts.prepare_input_before_routed(shared_hidden_states)
             )
-            router_logits, shared_input_ready, router_output_ready, submitted_gate_up = (
+            defer_gate_up = self._defer_kimi_w4a8_gate_up()
+            router_logits, shared_input_ready, router_output_ready, submitted_gate_up, prepared_execution = (
                 self._prepare_router_and_milestones(
                     prepared_shared_input,
                     shared_hidden_states,
                     router_logits,
+                    defer_gate_up=defer_gate_up,
                 )
             )
-            routed_out, milestones = self.routed_experts.forward_impl(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+            if defer_gate_up:
+                assert prepared_execution is not None
+                shared_experts = self.ascend_shared_experts
+                assert shared_experts is not None
+
+                def on_gmm1_done() -> None:
+                    nonlocal submitted_gate_up
+                    if submitted_gate_up is not None:
+                        raise RuntimeError("Shared Gate-Up was already submitted for this MoE forward.")
+                    gmm1_done = torch.npu.current_stream().record_event()
+                    submitted_gate_up = shared_experts.enqueue_gate_up_after_router(prepared_execution, gmm1_done)
+
+                routed_out, milestones = self.routed_experts.forward_impl(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                    on_gmm1_done=on_gmm1_done,
+                )
+            else:
+                routed_out, milestones = self.routed_experts.forward_impl(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
+            if defer_gate_up and submitted_gate_up is None:
+                raise RuntimeError("Kimi W4A8 SiTU routed GMM1 did not expose its completion boundary.")
             assert isinstance(milestones, RoutedMoEMilestones)
             milestones.shared_input_ready = shared_input_ready
             milestones.router_output_ready = router_output_ready

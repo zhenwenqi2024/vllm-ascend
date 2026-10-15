@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -137,6 +138,7 @@ class MoECommMethod(ABC):
         self,
         fused_experts_input: MoEFusedExpertsInput,
         quant_method=None,
+        on_gmm1_done: Callable[[], None] | None = None,
     ):
         # Check constraints
         assert fused_experts_input.hidden_states.dtype in [
@@ -172,7 +174,7 @@ class MoECommMethod(ABC):
             # its own MLP implementation.
             mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
         else:
-            mlp_output, before_gmm2_evt = apply_moe_mlp(mlp_compute_input, quant_method)
+            mlp_output, before_gmm2_evt = apply_moe_mlp(mlp_compute_input, quant_method, on_gmm1_done=on_gmm1_done)
 
         if shared_activation_overlap_start_evt is None:
             shared_activation_overlap_start_evt = before_gmm2_evt

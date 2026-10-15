@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from copy import copy
 from types import SimpleNamespace
 
@@ -696,6 +696,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        on_gmm1_done: Callable[[], None] | None = None,
     ):
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice
@@ -737,14 +738,26 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         self.ascend_pertoken_scale = pertoken_scale
         self.ascend_mc2_mask = mc2_mask
         try:
-            fused_experts_results: FusedExpertsResult = self.quant_method.apply(
-                layer=self,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=None,
-                shared_experts_input=None,
-            )
+            if on_gmm1_done is not None:
+                # Only the selected W4A8 SiTU path accepts this stage hook.
+                fused_experts_results: FusedExpertsResult = self.quant_method.apply(
+                    layer=self,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=None,
+                    shared_experts_input=None,
+                    on_gmm1_done=on_gmm1_done,
+                )
+            else:
+                fused_experts_results = self.quant_method.apply(
+                    layer=self,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=None,
+                    shared_experts_input=None,
+                )
         finally:
             self.ascend_pertoken_scale = None
             self.ascend_mc2_mask = None
