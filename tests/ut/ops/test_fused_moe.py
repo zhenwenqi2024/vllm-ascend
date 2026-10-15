@@ -2968,7 +2968,7 @@ def test_shared_gate_up_records_done_event_only_for_arbitration(monkeypatch, rec
 @pytest.mark.parametrize("has_barrier", [False, True])
 def test_shared_gate_up_barrier_is_after_dispatch_and_before_routed_mlp(monkeypatch, has_barrier):
     gate_up_done = object() if has_barrier else None
-    order = []
+    order: list[str | tuple[str, object]] = []
     dispatch_output = SimpleNamespace(group_list=None, group_list_type=None, combine_metadata=None)
 
     def dispatch(**_kwargs):
@@ -3004,7 +3004,7 @@ def test_shared_gate_up_barrier_is_after_dispatch_and_before_routed_mlp(monkeypa
         quant_method=object(),
     )
 
-    expected = ["dispatch"]
+    expected: list[str | tuple[str, object]] = ["dispatch"]
     if gate_up_done is not None:
         expected.append(("wait", gate_up_done))
     assert order == [*expected, "routed_gmm1", "combine"]
