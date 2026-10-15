@@ -15,7 +15,6 @@
 # limitations under the License.
 #
 
-from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -286,10 +285,8 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         topk_ids: torch.Tensor,
         shared_experts: Any | None,
         shared_experts_input: torch.Tensor | None,
-        on_gmm1_done: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         moe_comm_method = _EXTRA_CTX.moe_comm_method
-        stage_kwargs = {"on_gmm1_done": on_gmm1_done} if on_gmm1_done is not None else {}
         return moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
@@ -307,7 +304,6 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 is_per_channel_weight=self.is_per_channel_weight,
             ),
             quant_method=self,
-            **stage_kwargs,
         )
 
     @staticmethod
@@ -522,9 +518,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             w2_scale_bias=[layer.w2_scale_bias.detach()] if hasattr(layer, "w2_scale_bias") else None,
         )
 
-    def apply_gmm1_act_quant(
-        self, mlp_compute_input: MoEMlpComputeInput, on_gmm1_done: Callable[[], None] | None = None
-    ):
+    def apply_gmm1_act_quant(self, mlp_compute_input: MoEMlpComputeInput):
         hidden_states = mlp_compute_input.hidden_states
         hidden_states, pertoken_scale = self._quant_hidden_states(hidden_states, mlp_compute_input.dynamic_scale)
         layer = mlp_compute_input.layer
@@ -583,8 +577,6 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 group_list_type=group_list_type,
                 output_dtype=torch.bfloat16 if bias1 is not None else w2_scale[0].dtype,
             )[0]
-            if on_gmm1_done is not None:
-                on_gmm1_done()
             hidden_states, swiglu_out_scale = torch.ops._C_ascend.dequant_situ_quant(
                 x=hidden_states,
                 weight_scale=None,

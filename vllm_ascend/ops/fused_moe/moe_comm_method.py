@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -138,7 +137,6 @@ class MoECommMethod(ABC):
         self,
         fused_experts_input: MoEFusedExpertsInput,
         quant_method=None,
-        on_gmm1_done: Callable[[], None] | None = None,
     ):
         # Check constraints
         assert fused_experts_input.hidden_states.dtype in [
@@ -160,6 +158,13 @@ class MoECommMethod(ABC):
         )
         token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
 
+        # Optional Cube arbitration: Gate-Up was submitted before dispatch.
+        # Do not start routed GMM1 until that side-stream Cube stage completes.
+        # This is a performance throttle, not a routed-data dependency.
+        gate_up_done = getattr(_EXTRA_CTX, "shared_gate_up_done", None)
+        if gate_up_done is not None:
+            torch.npu.current_stream().wait_event(gate_up_done)
+
         shared_activation_overlap_start_evt = None
         if self.shared_activation_overlaps_routed_gmm1:
             shared_activation_overlap_start_evt = torch.npu.current_stream().record_event()
@@ -174,7 +179,7 @@ class MoECommMethod(ABC):
             # its own MLP implementation.
             mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
         else:
-            mlp_output, before_gmm2_evt = apply_moe_mlp(mlp_compute_input, quant_method, on_gmm1_done=on_gmm1_done)
+            mlp_output, before_gmm2_evt = apply_moe_mlp(mlp_compute_input, quant_method)
 
         if shared_activation_overlap_start_evt is None:
             shared_activation_overlap_start_evt = before_gmm2_evt

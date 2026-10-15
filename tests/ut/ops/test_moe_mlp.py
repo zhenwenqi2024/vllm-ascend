@@ -322,7 +322,6 @@ class TestW4A8SituPath(unittest.TestCase):
         quantized_situ_out = torch.ones(2, 128, dtype=torch.int8)
         situ_out_scale = torch.ones(2, dtype=torch.float32)
         mock_gmm_dequant_situ_quant = MagicMock(return_value=(quantized_situ_out, situ_out_scale))
-        on_gmm1_done = MagicMock()
 
         with (
             patch("torch_npu.npu_dynamic_quant", return_value=(quantized_input, torch.ones(2)), create=True),
@@ -333,12 +332,11 @@ class TestW4A8SituPath(unittest.TestCase):
             patch("torch_npu.npu_grouped_matmul", create=True) as mock_gmm,
             patch("torch.ops._C_ascend.dequant_situ_quant", create=True) as mock_dequant_situ,
         ):
-            out, scale = method.apply_gmm1_act_quant(mlp_compute_input, on_gmm1_done=on_gmm1_done)
+            out, scale = method.apply_gmm1_act_quant(mlp_compute_input)
 
         self.assertIs(out, quantized_situ_out)
         self.assertEqual(scale.shape, torch.Size([2, 1]))
         mock_gmm.assert_not_called()
-        on_gmm1_done.assert_not_called()
         mock_dequant_situ.assert_not_called()
         gmm_dequant_situ_quant_kwargs = mock_gmm_dequant_situ_quant.call_args.kwargs
         self.assertEqual(len(gmm_dequant_situ_quant_kwargs["weight"]), 2)
@@ -460,31 +458,18 @@ class TestW4A8SituPath(unittest.TestCase):
             activation_situ_linear_beta=25.0,
             quant=MoEQuantParams(quant_type=QuantType.W4A8, is_per_channel_weight=True),
         )
-        stage_order = []
-
-        def grouped_matmul(**kwargs):
-            stage_order.append("routed_gmm1")
-            return ["bf16_out"]
-
-        def dequant_situ_quant(**kwargs):
-            stage_order.append("routed_situ")
-            return "qout", "oscale"
-
         with (
             patch("torch_npu.npu_dynamic_quant", return_value=("qx", torch.ones(2)), create=True),
-            patch("torch_npu.npu_grouped_matmul", side_effect=grouped_matmul, create=True) as mock_gmm,
+            patch("torch_npu.npu_grouped_matmul", return_value=["bf16_out"], create=True) as mock_gmm,
             patch(
                 "torch.ops._C_ascend.dequant_situ_quant",
-                side_effect=dequant_situ_quant,
+                return_value=("qout", "oscale"),
                 create=True,
             ) as mock_situ,
         ):
-            out, scale = method.apply_gmm1_act_quant(
-                mlp_compute_input, on_gmm1_done=lambda: stage_order.append("shared_gate_up")
-            )
+            out, scale = method.apply_gmm1_act_quant(mlp_compute_input)
 
         self.assertEqual((out, scale), ("qout", "oscale"))
-        self.assertEqual(stage_order, ["routed_gmm1", "shared_gate_up", "routed_situ"])
         # Per-channel W4A8 must pass the scale in [E, 1, N] layout, matching
         # upstream quant_apply_mlp's SITU branch (unsqueeze(-2)); otherwise the
         # A8W4 tiling reads the flattened scale as quantGroupNum and fails.
@@ -592,31 +577,6 @@ class TestUnquantizedFusedMoEMethod(unittest.TestCase):
         self.assertEqual(mock_gmm.call_args.kwargs["weight"][0].shape, torch.Size([2, 16, 8]))
 
 
-def test_w4a8_apply_passes_gmm1_hook_to_staged_comm():
-    method = AscendW4A8DynamicFusedMoEMethod.__new__(AscendW4A8DynamicFusedMoEMethod)
-    method.is_per_channel_weight = True
-    layer = SimpleNamespace(
-        ascend_expert_map=None,
-        global_redundant_expert_num=0,
-        ascend_mc2_mask=None,
-        apply_router_weight_on_input=False,
-        ascend_pertoken_scale=None,
-        activation=MoEActivation.SITU,
-    )
-    comm = SimpleNamespace(fused_experts=MagicMock(return_value=object()))
-    fused_input = object()
-    on_gmm1_done = MagicMock()
-    with (
-        patch.object(w4a8_module, "_EXTRA_CTX", SimpleNamespace(moe_comm_method=comm)),
-        patch.object(w4a8_module, "build_fused_experts_input", return_value=fused_input),
-    ):
-        method.apply(layer, object(), object(), object(), None, None, on_gmm1_done=on_gmm1_done)
-
-    comm.fused_experts.assert_called_once_with(
-        fused_experts_input=fused_input, quant_method=method, on_gmm1_done=on_gmm1_done
-    )
-
-
 class TestApplyMoeMlp(unittest.TestCase):
     def _quant_method(self, fused: bool):
         quant_method = MagicMock()
@@ -641,15 +601,6 @@ class TestApplyMoeMlp(unittest.TestCase):
         quant_method.apply_gmm1.assert_not_called()
         quant_method.apply_act_quant.assert_not_called()
         quant_method.apply_gmm2.assert_called_once_with(mlp_compute_input, "fused_out", "fused_scale")
-
-    def test_fused_path_passes_gmm1_stage_hook_to_quant_method(self):
-        quant_method = self._quant_method(fused=True)
-        mlp_compute_input = _mlp_compute_input()
-        on_gmm1_done = MagicMock()
-        with patch(f"{MOE_MLP}.torch.npu.current_stream", MagicMock()):
-            apply_moe_mlp(mlp_compute_input, quant_method, on_gmm1_done=on_gmm1_done)
-
-        quant_method.apply_gmm1_act_quant.assert_called_once_with(mlp_compute_input, on_gmm1_done=on_gmm1_done)
 
     def test_non_fused_path_runs_gmm1_activation_quant_gmm2(self):
         quant_method = self._quant_method(fused=False)

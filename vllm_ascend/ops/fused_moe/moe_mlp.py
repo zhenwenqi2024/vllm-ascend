@@ -15,8 +15,6 @@
 # This file is a part of the vllm-ascend project.
 
 
-from collections.abc import Callable
-
 import torch
 import torch_npu
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -51,7 +49,6 @@ def maybe_record_event() -> torch.npu.Event | None:
 def apply_moe_mlp(
     mlp_compute_input: MoEMlpComputeInput,
     quant_method,
-    on_gmm1_done: Callable[[], None] | None = None,
 ) -> tuple[torch.Tensor, torch.npu.Event | None]:
     """
     Unified MoE MLP entry.
@@ -71,12 +68,7 @@ def apply_moe_mlp(
             )
 
     if quant_method.supports_fused_activation(mlp_compute_input.activation):
-        if on_gmm1_done is None:
-            hidden_states, act_out_scale = quant_method.apply_gmm1_act_quant(mlp_compute_input)
-        else:
-            hidden_states, act_out_scale = quant_method.apply_gmm1_act_quant(
-                mlp_compute_input, on_gmm1_done=on_gmm1_done
-            )
+        hidden_states, act_out_scale = quant_method.apply_gmm1_act_quant(mlp_compute_input)
     else:
         hidden_states = quant_method.apply_gmm1(mlp_compute_input)
         hidden_states = _unified_apply_activation(mlp_compute_input, hidden_states, quant_method)
