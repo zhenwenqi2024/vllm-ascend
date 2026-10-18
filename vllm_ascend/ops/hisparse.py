@@ -228,6 +228,12 @@ class HiSparseNPUOps:
         resident_block_size,
         resident_null_block,
     ) -> None:
+        """Resolve logical selections and prepare resident/hot-cache refill plans.
+
+        Protect every selected token in a request's query-row union before
+        evicting LRU slots. Update residency and output plans in place using the
+        persistent workspace; host KV payloads are copied by the gather stage.
+        """
         workspace = self.workspace
         if workspace is None:
             raise RuntimeError("HiSparse resolver workspace must be prepared before forward")
