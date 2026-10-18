@@ -64,16 +64,26 @@ class LmheadTPDraftSamplingMixin:
     def sample_draft(
         self,
         hidden_states: torch.Tensor,
-        positions: torch.Tensor,
+        sample_src_positions: torch.Tensor,
         idx_mapping: torch.Tensor,
         temperature: torch.Tensor,
         seeds: torch.Tensor,
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
+        spec_step_idx: int = 0,
+        num_steps: int = 1,
     ):
         if not lmhead_tp_enable():
             return super().sample_draft(  # type: ignore[misc]
-                hidden_states, positions, idx_mapping, temperature, seeds, draft_step, draft_logits
+                hidden_states,
+                sample_src_positions,
+                idx_mapping,
+                temperature,
+                seeds,
+                draft_step,
+                draft_logits,
+                spec_step_idx=spec_step_idx,
+                num_steps=num_steps,
             )
         if draft_logits is not None:
             raise NotImplementedError(
@@ -90,6 +100,14 @@ class LmheadTPDraftSamplingMixin:
             "max_num_reqs * (num_speculative_steps + 1)",
         )
         out = super().sample_draft(  # type: ignore[misc]
-            padded, positions, idx_mapping, temperature, seeds, draft_step, draft_logits
+            padded,
+            sample_src_positions,
+            idx_mapping,
+            temperature,
+            seeds,
+            draft_step,
+            draft_logits,
+            spec_step_idx=spec_step_idx,
+            num_steps=num_steps,
         )
         return out[:num_logits]

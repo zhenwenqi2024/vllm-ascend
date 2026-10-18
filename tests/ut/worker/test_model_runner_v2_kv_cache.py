@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
 
 from contextlib import nullcontext
+from inspect import signature
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm.config import CompilationConfig, CUDAGraphMode
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as upstream
@@ -22,6 +24,7 @@ def test_initialize_preserves_connector_containers_and_flattens_runner_cache(is_
     runner.device = torch.device("cpu")
     runner.is_encoder_decoder = False
     runner.speculator = None
+    runner.pcp_manager = None
     runner.vocab_size = 16
     runner.max_model_len = 128
     runner.cache_config.kv_sharing_fast_prefill = False
@@ -32,6 +35,12 @@ def test_initialize_preserves_connector_containers_and_flattens_runner_cache(is_
     config = KVCacheConfig(num_blocks=3, kv_cache_tensors=[], kv_cache_groups=[])
     registration_order = []
     runner._register_sparse_kv_caches.side_effect = lambda _: registration_order.append("offload")
+
+    def resolve_mode(*args, **kwargs):
+        signature(CompilationConfig.resolve_cudagraph_mode_and_sizes).bind(runner.compilation_config, *args, **kwargs)
+        return CUDAGraphMode.NONE
+
+    runner.compilation_config.resolve_cudagraph_mode_and_sizes.side_effect = resolve_mode
 
     def register_connector(*_args):
         registration_order.append("connector")
@@ -44,15 +53,16 @@ def test_initialize_preserves_connector_containers_and_flattens_runner_cache(is_
         patch.object(upstream, "maybe_build_ubatch_runner", return_value=None),
         patch.object(upstream, "initialize_mamba_ssu_backend"),
         patch.object(upstream, "has_compiled_submodule", return_value=False),
-        patch.object(upstream, "ModelCudaGraphManager"),
+        patch.object(upstream, "ModelCudaGraphManager", autospec=True),
         patch.object(upstream, "check_attention_cp_compatibility"),
-        patch.object(upstream, "init_kv_cache", return_value=caches),
+        patch.object(upstream, "init_kv_cache", autospec=True, return_value=caches),
         patch.object(upstream, "get_kv_connector", side_effect=register_connector) as connector,
     ):
         upstream.GPUModelRunner.initialize_kv_cache(runner, config, is_profiling=is_profiling)
 
     assert [id(tensor) for tensor in runner.kv_caches] == [id(tensor) for tensor in (k, v, conv, ssm, single)]
     runner._register_sparse_kv_caches.assert_called_once_with(caches)
+    runner.model_state.initialize_kv_cache.assert_called_once_with(runner.kv_cache_config, runner.block_tables)
     if is_profiling:
         assert registration_order == ["offload"]
         connector.assert_not_called()

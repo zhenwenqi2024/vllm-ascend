@@ -149,6 +149,9 @@ class NPUPlatform(Platform):
     def is_pin_memory_available(cls):
         return True
 
+    def get_hisparse_backend_cls(self) -> str:
+        return "vllm_ascend.distributed.kv_transfer.hisparse.backend.AscendHiSparseBackend"
+
     @classmethod
     def opaque_attention_op(cls) -> bool:
         return True
@@ -350,11 +353,12 @@ class NPUPlatform(Platform):
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
         """Apply Ascend-specific defaults."""
 
-        # Upstream derives this threshold only for CUDA/XPU. Without an Ascend
-        # default, an explicit SP/MMRS request is disabled during VllmConfig
-        # validation before the graph fusion pass can observe it.
+        # Older upstream versions derive this threshold only for CUDA/XPU.
+        # Recent main removed these optional passes from PassConfig; preserve
+        # the explicit legacy request only when those fields exist.
         pass_config = vllm_config.compilation_config.pass_config
-        if (pass_config.enable_sp or pass_config.fuse_gemm_comms) and pass_config.sp_min_token_num is None:
+        sequence_pass = getattr(pass_config, "enable_sp", False) or getattr(pass_config, "fuse_gemm_comms", False)
+        if sequence_pass and getattr(pass_config, "sp_min_token_num", None) is None:
             pass_config.sp_min_token_num = 1
 
         # TODO: Remove this memory-saving capture-size override and its ceiling

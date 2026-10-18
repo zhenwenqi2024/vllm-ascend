@@ -284,7 +284,9 @@ def rejection_sample(
         expanded_local_pos,
         temperature,
         vocab_size,
-        num_speculative_steps,
+        # The upstream kernel detects each request's bonus row from the
+        # following expanded_local_pos entry, bounded by the full logit count.
+        num_logits=num_logits,
         BLOCK_SIZE=VOCAB_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,
         # TODO: Remove this workaround after the Triton Ascend AutoBlockify

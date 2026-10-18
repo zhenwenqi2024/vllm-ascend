@@ -13,8 +13,7 @@ from vllm_ascend.patch.worker.patch_v2 import patch_uva
 from vllm_ascend.worker.v2.block_table import AscendBlockTables
 
 
-def test_encoder_only_zero_cache_groups_initialize_and_compute(monkeypatch) -> None:
-    """Exercise the real block-table construction used by an encoder producer."""
+def _allow_cpu_buffers(monkeypatch) -> None:
     original_zeros = torch.zeros
 
     def zeros_without_pinning(*args, **kwargs):
@@ -37,6 +36,10 @@ def test_encoder_only_zero_cache_groups_initialize_and_compute(monkeypatch) -> N
         raising=False,
     )
 
+
+def test_encoder_only_zero_cache_groups_initialize_and_compute(monkeypatch) -> None:
+    """Exercise the real block-table construction used by an encoder producer."""
+    _allow_cpu_buffers(monkeypatch)
     block_tables = AscendBlockTables(
         block_sizes=[],
         max_num_reqs=2,
@@ -56,3 +59,30 @@ def test_encoder_only_zero_cache_groups_initialize_and_compute(monkeypatch) -> N
     assert block_tables.num_kv_cache_groups == 0
     assert block_tables._block_table_window_size == 1
     assert slot_mappings.shape == (0, 1)
+
+
+def test_current_core_keeps_manager_ids_with_smaller_kernel_pages(monkeypatch) -> None:
+    """The real Core parent must receive CP flags and retain unexpanded IDs."""
+    _allow_cpu_buffers(monkeypatch)
+    tables = AscendBlockTables(
+        block_sizes=[128],
+        max_num_reqs=2,
+        max_num_batched_tokens=8,
+        max_num_blocks_per_group=[4],
+        device=torch.device("cpu"),
+        kernel_block_sizes=[64],
+        cp_size=2,
+        cp_rank=1,
+        cp_interleave=8,
+        slot_mapping_enabled=[True],
+        dcp_sharded=[False],
+    )
+    tables.append_block_ids(0, ([3, 5],), overwrite=True)
+
+    assert (tables.cp_size, tables.cp_rank, tables.cp_interleave) == (2, 1, 8)
+    assert tables.dcp_sharded.tolist() == [False]
+    assert tables.block_tables[0].gpu.shape == (2, 4)
+    assert tables.block_tables[0]._staged_write_contents == [3, 5]
+    assert tables.num_blocks.np[0, 0] == 2
+    assert tables.kernel_block_sizes == [64]
+    assert tables.kernel_block_sizes_tensor.tolist() == [128]

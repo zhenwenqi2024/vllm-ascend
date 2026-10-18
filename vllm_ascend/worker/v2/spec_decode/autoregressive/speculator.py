@@ -35,7 +35,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import AutoRegressiveSpeculator
+from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import TargetDependentARSpeculator
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -68,7 +68,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveSpeculator):
+class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, TargetDependentARSpeculator):
     """Shared Ascend spec-decode loop for AscendEagle/AscendMTPSpeculator.
 
     GQA, MLA, DSA, and SFA draft decode state share one path. The current MTP path
@@ -325,6 +325,9 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: Any = None,
+        num_speculative_tokens: int | None = None,
+        *,
+        dp_sync_state: Any = None,
     ):
         """Override GPU EagleSpeculator.propose for Ascend NPUs,
         because npu attention metadata needs more information,
@@ -332,6 +335,10 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         generate_draft.
         """
         self.input_batch = input_batch
+        if dp_sync_state is not None:
+            if dp_sync is not None and dp_sync is not dp_sync_state:
+                raise ValueError("Specify only one draft DP synchronization state")
+            dp_sync = dp_sync_state
         # Replicated drafts use global tokens, unlike the PCP-local target.
         # Every DP rank must take the draft sync, including decode and idle ranks.
         sync_state = None if self.replicated_pcp else dp_sync
@@ -359,6 +366,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
                 skip_attn_for_dummy_run,
                 mm_inputs,
                 is_profile=is_profile,
+                num_speculative_tokens=num_speculative_tokens,
             )
 
     def set_attn(
@@ -453,7 +461,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Override AutoRegressiveSpeculator._run_model for Ascend NPUs."""
+        """Override TargetDependentARSpeculator._run_model for Ascend NPUs."""
         last_hidden_states, hidden_states = super()._run_model(
             num_tokens,
             attn_metadata,
@@ -474,10 +482,13 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        num_speculative_steps: int | None = None,
     ) -> None:
         """Thin override: delegate to upstream single-step ``_generate_draft``,
         then apply Ascend-specific attention-metadata updates required by the
         FIA operator."""
+        if num_speculative_steps is None:
+            num_speculative_steps = self.num_speculative_steps
         super()._generate_draft(
             num_reqs,
             num_tokens_padded,
@@ -485,6 +496,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
             slot_mappings,
             num_tokens_across_dp,
             cudagraph_runtime_mode,
+            num_speculative_steps,
         )
         if attn_metadata is not None:
             self._update_decode_attn_metadata(attn_metadata, 1, num_reqs)
@@ -496,6 +508,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
         seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+        num_speculative_steps: int | None = None,
     ) -> None:
         """Minimal override to handle the merged multi-step graph in FULL mode.
 
@@ -505,11 +518,19 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         ``_multi_step_decode`` which iterates over steps and calls
         ``_generate_draft`` per step.
         """
+        if num_speculative_steps is None:
+            num_speculative_steps = self.num_speculative_steps
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            # Ascend captures all draft decode steps in one graph. Replaying
+            # that graph with a different step count would produce extra KV.
+            if num_speculative_steps != self.num_speculative_steps:
+                raise ValueError("Ascend merged draft graphs require a fixed speculative-token count")
             assert self.decode_cudagraph_manager is not None
             self.decode_cudagraph_manager.run_fullgraph(batch_desc)
             return
-        super()._multi_step_decode(num_reqs, skip_attn, batch_desc, num_tokens_across_dp, seq_lens_cpu_upper_bound)
+        super()._multi_step_decode(
+            num_reqs, skip_attn, batch_desc, num_tokens_across_dp, seq_lens_cpu_upper_bound, num_speculative_steps
+        )
 
     def _prefill(
         self,
@@ -554,6 +575,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         step: int,
         causal: bool | Mapping[int, bool] = True,
         dcp_local_seq_lens: torch.Tensor | None = None,
+        slot_mappings: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         """Build Ascend draft metadata for uniform and explicit query layouts."""
         assert self.input_batch is not None
@@ -592,6 +614,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
                 step,
                 causal,
                 dcp_local_seq_lens,
+                slot_mappings=slot_mappings,
             )
         if attn_metadata is not None:
             for metadata in attn_metadata.values():

@@ -12,9 +12,9 @@ from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_engram_dp_group, get_engram_dp_size
 from vllm.forward_context import get_forward_context
 
-# Upstream #56741 normalized the V4.1 model package name.
+# The rank helper now lives with the platform-independent Engram implementation.
 from vllm.models.deepseek_v41.common.engram import DEAD_ID
-from vllm.models.deepseek_v41.nvidia.engram import (
+from vllm.models.deepseek_v41.common.engram import (
     engram_head_shard_rank as engram_head_shard_rank,
 )
 

@@ -53,7 +53,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.core.kv_cache_utils import get_kv_cache_groups, unify_hybrid_kv_cache_specs
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups, unify_hybrid_kv_cache_specs
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -111,7 +111,6 @@ from vllm_ascend.utils import (
     register_device_print,
     setup_ascend_local_comm_res,
 )
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -532,6 +531,8 @@ class NPUWorker(WorkerBase):
 
                 self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
         else:
+            from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
         if self.rank == 0:
@@ -696,6 +697,11 @@ class NPUWorker(WorkerBase):
         derives a num_blocks (and block pool) small enough for the per-layer
         buffers to fit.
         """
+        if getattr(getattr(self.vllm_config, "attention_config", None), "hisparse_config", None) is not None:
+            # HiSparse uses Core's shared-slab builder and allocator. The builder
+            # already accounts for resident pages, indexer pages and hot slots;
+            # Ascend's independent per-layer allocation correction does not apply.
+            return available_memory
         kv_cache_spec = self.get_kv_cache_spec()
         if not isinstance(kv_cache_spec, dict):
             return available_memory
