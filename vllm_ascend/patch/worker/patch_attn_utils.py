@@ -4,6 +4,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
+from vllm_ascend.distributed.kv_transfer.hisparse.binding import init_hisparse_kv_cache
 from vllm_ascend.patch.worker.patch_bind_kv_cache import (
     bind_kv_cache,
     bind_kv_cache_to_layers,
@@ -27,6 +28,8 @@ vllm.v1.worker.gpu.attn_utils._reshape_kv_cache = _reshape_kv_cache_v2
 # vLLM #51718 made this the live allocation symbol used by init_kv_cache.
 vllm.v1.worker.gpu.attn_utils.allocate_kv_cache = allocate_kv_cache_main
 gpu_model_runner_v2.init_kv_cache.__globals__["allocate_kv_cache"] = allocate_kv_cache_main
+vllm.v1.worker.gpu.attn_utils.init_hisparse_kv_cache = init_hisparse_kv_cache
+gpu_model_runner_v2.init_kv_cache.__globals__["init_hisparse_kv_cache"] = init_hisparse_kv_cache
 gpu_model_runner_v2.init_kv_cache.__globals__["bind_kv_cache"] = bind_kv_cache
 
 # vLLM #57169's packed-KV heuristic reads Ascend layerwise alias layouts
