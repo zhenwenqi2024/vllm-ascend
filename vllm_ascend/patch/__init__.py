@@ -263,6 +263,18 @@
 #    Future Plan:
 #       Remove once upstream exposes the PD role to the coordinator or
 #       removes the EAGLE last-block drop for verified prompt blocks.
+#   3. `vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator`
+#    Why:
+#       The Ascend hybrid constructor predates HiSparse source/indexer roles
+#       and would put host source pages into the ordinary device block pool.
+#    How:
+#       Delegate HiSparse configurations to the original upstream factory,
+#       preserving its host pool, specialized managers and prefix semantics.
+#    Related PR (if no, explain why):
+#       No upstream PR; this is an Ascend factory integration for HiSparse.
+#    Future Plan:
+#       Remove this bypass with the Ascend hybrid coordinator patch once its
+#       PD behavior is covered by the upstream coordinator.
 #
 # ** 10. File: platform/patch_kv_cache_utils.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1294,6 +1306,20 @@
 #    Future Plan:
 #       Remove this patch once upstream adds a backend hook for KV cache spec
 #       construction or v2 worker no longer depends on the shared v1 helper.
+#
+#   3. `vllm.v1.worker.gpu.attn_utils.init_hisparse_kv_cache`
+#    Why:
+#       HiSparse's common allocator exposes MLA indexer tensors in BHND layout;
+#       Ascend LightningIndexer consumes a dense BSND view and physical page ids.
+#    How:
+#       Keep common host/resident/hot allocation and handle binding, then expose
+#       an expanded dense indexer view. Its metadata builder applies the shared
+#       allocation's page stride to the indexer's own block table and slots.
+#    Related PR (if no, explain why):
+#       No. This is the initial Ascend implementation of upstream HiSparse.
+#    Future Plan:
+#       Remove this patch when upstream HiSparse binding supports a backend
+#       hook for indexer cache views and their physical page addressing.
 #
 # ** 23. File: worker/patch_v2/patch_block_table.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
