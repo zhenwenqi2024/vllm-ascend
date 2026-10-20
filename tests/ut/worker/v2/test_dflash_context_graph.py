@@ -3,6 +3,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,7 +15,7 @@ from vllm_ascend.worker.v2.spec_decode.dflash import speculator as module
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpeculator
 
 
-def _speculator():
+def _speculator() -> Any:
     spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
     spec.num_speculative_steps = 7
     spec.max_num_tokens = 32
@@ -123,7 +124,12 @@ def test_legacy_proposal_uses_block_table_cp_fields_and_prepares_prefix_before_q
     monkeypatch.setattr(module.dflash_speculator, "dispatch_cg_and_sync_dp", lambda *args, **kwargs: (desc, None))
     monkeypatch.setattr(module.dflash_speculator, "build_slot_mappings_by_layer", lambda *args: {})
     spec._prepare_context_kv_for_graph = lambda *args: calls.append("context")
-    spec._build_uniform_attn_metadata = lambda **kwargs: calls.append("metadata") or {}
+
+    def build_metadata(**kwargs):
+        calls.append("metadata")
+        return {}
+
+    spec._build_uniform_attn_metadata = build_metadata
     spec._prepare_eplb_forward = lambda *args: None
     spec._generate_draft = lambda *args, **kwargs: calls.append("query")
     spec.query_cudagraph_manager = SimpleNamespace(run_fullgraph=lambda *args: calls.append("query"))
@@ -164,9 +170,13 @@ def test_old_graph_capture_runs_context_prefix_before_query_forward(monkeypatch)
     monkeypatch.setattr(graph_module, "model_capture_wrapper", lambda *args: nullcontext())
     manager.capture(
         lambda *args: calls.append(("query", args[0])),
-        *([None] * 5),
-        False,
-        "Context and query",
+        input_buffers=MagicMock(),
+        block_tables=MagicMock(),
+        attn_groups=[],
+        kv_cache_config=MagicMock(),
+        max_model_len=4096,
+        causal=False,
+        progress_bar_desc="Context and query",
         precompute_context_kv=lambda n: calls.append(("context", n)),
     )
     assert calls == [("context", 2), ("query", 2)]
@@ -267,7 +277,11 @@ def test_native_capture_forwards_prefix_once_and_restores_model_on_error(monkeyp
     with pytest.raises(ValueError, match="capture failed"):
         manager.capture(
             lambda n: calls.append(("query", n)),
-            *([None] * 5),
+            input_buffers=MagicMock(),
+            block_tables=MagicMock(),
+            attn_groups=[],
+            kv_cache_config=MagicMock(),
+            max_model_len=4096,
             precompute_context_kv=lambda n: calls.append(("context", n)),
         )
     assert calls == [("context", 2), ("query", 2)]

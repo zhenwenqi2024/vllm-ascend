@@ -8,7 +8,8 @@ this mixin once all supported snapshots include the context-prefix callback.
 The backport is restricted to the standard single-card FULL DFlash path.
 """
 
-from typing import Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config.compilation import CUDAGraphMode
@@ -16,8 +17,18 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator as _DFlashContextGraphBase
+else:
+    _DFlashContextGraphBase = object
 
-class DFlashContextGraphMixin:
+
+class DFlashContextGraphMixin(_DFlashContextGraphBase):
+    # The hosting Ascend speculator supplies these capability guards. The
+    # upstream base is used for type checking only; runtime MRO stays unchanged.
+    _reuse_draft_layout: bool
+    _supports_context_graph_backport: Callable[[], bool]
+
     def capture(self) -> None:
         # Older vLLM lacks the context-prefix callback. Match the newer upstream
         # FULL-graph layout only for the standard single-card DFlash path.

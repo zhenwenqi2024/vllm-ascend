@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -82,7 +83,7 @@ def test_dflash_caches_full_metadata_after_upstream_builder_refresh(monkeypatch,
 
 
 def test_proposal_invalidates_previous_metadata_before_upstream_execution(monkeypatch):
-    speculator = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    speculator: Any = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
     speculator._prepared_draft_attn_metadata = (4, object())
     monkeypatch.setattr(dflash_module, "build_attn_metadata_wrapper", lambda: nullcontext())
     batch, result = object(), object()
@@ -158,7 +159,7 @@ def test_prefetched_lengths_wait_on_copy_event_and_clear_old_padding():
 
 
 def test_snapshot_is_started_after_grouped_input_launch():
-    spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    spec: Any = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
     spec._in_draft_proposal = spec._use_cpu_seq_lens = True
     spec._draft_inputs_prepared = False
     spec.draft_kv_cache_group_ids = [2, 5]
@@ -171,7 +172,7 @@ def test_snapshot_is_started_after_grouped_input_launch():
 
 @pytest.mark.parametrize("use_cpu_lengths", [False, True])
 def test_grouped_preparation_launches_once_per_proposal_and_refreshes_views(monkeypatch, use_cpu_lengths):
-    spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    spec: Any = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
     spec._in_draft_proposal = True
     spec._use_cpu_seq_lens = use_cpu_lengths
     spec._draft_inputs_prepared = False
@@ -370,7 +371,17 @@ def test_capture_preserves_upstream_context_kv_callback(monkeypatch, has_context
     monkeypatch.setattr(graph_module, "communicator_switch", lambda: nullcontext())
     monkeypatch.setattr(graph_module, "model_capture_wrapper", lambda *args: nullcontext())
     callback = MagicMock() if has_context_prefix else None
-    manager.capture(*([None] * 6), False, "Capture draft", precompute_context_kv=callback)
+    manager.capture(
+        MagicMock(),
+        input_buffers=MagicMock(),
+        block_tables=MagicMock(),
+        attn_groups=[],
+        kv_cache_config=MagicMock(),
+        max_model_len=4096,
+        causal=False,
+        progress_bar_desc="Capture draft",
+        precompute_context_kv=callback,
+    )
     parent.assert_called_once()
     assert parent.call_args.kwargs["progress_bar_desc"] == "Capture draft"
     if has_context_prefix:
