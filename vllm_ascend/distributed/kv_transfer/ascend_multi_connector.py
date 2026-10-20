@@ -20,11 +20,18 @@ if TYPE_CHECKING:
 
 class AscendMultiConnector(MultiConnector, SupportsHMA):
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole, kv_cache_config: "KVCacheConfig"):
+        configured_children = vllm_config.kv_transfer_config.kv_connector_extra_config.get("connectors", [])
+        child_names = [child.get("kv_connector") for child in configured_children]
+        self._has_hisparse_pd = "HiSparsePDConnector" in child_names
+        if self._has_hisparse_pd and child_names != ["HiSparseConnector", "HiSparsePDConnector"]:
+            raise ValueError("HiSparse P/D requires MultiConnector children [HiSparseConnector, HiSparsePDConnector]")
         super().__init__(
             vllm_config=vllm_config,
             role=role,
             kv_cache_config=kv_cache_config,
         )
+        if self._has_hisparse_pd:
+            self._connectors[1].bind_hisparse_sibling(self._connectors[0])
 
         transfer = vllm_config.kv_transfer_config
         self._requires_full_dspark_prompt = (
@@ -51,6 +58,23 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             )
             for connector in self._connectors
         )
+
+    def _prepare_shared_cache_release(self):
+        if not self._has_hisparse_pd:
+            return
+        # HiSparse owns mapped host allocations borrowed by the P/D child.
+        # Drain readers before *any* sibling unmaps those allocations. A failed
+        # drain must stop teardown, unlike upstream shutdown's best-effort loop.
+        # Remove this adapter when MultiConnector exposes an ordered pre-release
+        # hook; scheduler/import/completion handling remains upstream unchanged.
+        for connector in self._connectors:
+            prepare = getattr(connector, "prepare_cache_release", None)
+            if prepare is not None:
+                prepare()
+
+    def unregister_kv_caches(self):
+        self._prepare_shared_cache_release()
+        super().unregister_kv_caches()
 
     def configure_dspark_prefix_cache(self, vllm_config: "VllmConfig") -> bool:
         """Select a store that restores both target and persistent draft KV."""
@@ -95,6 +119,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             provider.wait_for_layer_reuse(layer_idx)
 
     def shutdown(self) -> None:
+        self._prepare_shared_cache_release()
         # Release provider waits before joining the store's receive threads.
         self._connectors[:] = [*self._layerwise_slot_release_providers, *self._non_slot_release_connectors]
         super().shutdown()

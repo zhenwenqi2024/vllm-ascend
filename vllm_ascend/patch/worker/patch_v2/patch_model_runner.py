@@ -22,7 +22,7 @@ def dispatch_cg_and_sync_dp(cudagraph_manager, num_reqs, num_tokens, uniform_tok
     return _dispatch_cg_and_sync_dp(cudagraph_manager, num_reqs, num_tokens, uniform_token_count, *args, **kwargs)
 
 
-# Adapted from vLLM ced6857afa GPUModelRunner.initialize_kv_cache.
+# Adapted from vLLM da9134bc89 GPUModelRunner.initialize_kv_cache.
 def initialize_kv_cache(
     self,
     kv_cache_config: KVCacheConfig,
@@ -119,13 +119,8 @@ def initialize_kv_cache(
         cp_interleave=self.cp_interleave,
         **block_tables_kwargs,
     )
-    self.pcp_manager = upstream.pcp.maybe_build_pcp_manager(
-        self.vllm_config,
-        self.device,
-        self.supports_mm_inputs,
-        self.block_tables,
-        cls=self.pcp_manager_cls,
-    )
+    if self.pcp_manager is not None:
+        self.pcp_manager.set_block_tables(self.block_tables)
     self.ubatch_runner = upstream.maybe_build_ubatch_runner(
         self.vllm_config,
         self.device,
@@ -154,7 +149,6 @@ def initialize_kv_cache(
         attn_cg_support.min_cg_attn_backend,
         self.decode_query_len,
         use_v2_model_runner=True,
-        tensor_parallel_size=self.parallel_config.tensor_parallel_size,
         kv_cache_config=self.kv_cache_config,
         max_num_reqs=self.max_num_reqs,
         is_profiling=is_profiling,
@@ -206,6 +200,7 @@ def initialize_kv_cache(
         for tensor in (cache if isinstance(cache, (tuple, list)) else (cache,))
         if tensor is not None and tensor.device == self.device
     ]
+    self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
     if is_profiling:
         self.kv_connector = upstream.NO_OP_KV_CONNECTOR
     else:

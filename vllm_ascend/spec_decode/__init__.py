@@ -27,7 +27,6 @@ from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
 from vllm_ascend.spec_decode.gemma4_proposer import AscendGemma4Proposer
-from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.multi_kv_cache_group_proposer import (
     AscendMultiKVCacheGroupMTPProposer,
     is_multi_kv_cache_group_mtp,
@@ -46,6 +45,10 @@ def get_spec_decode_method(method, vllm_config, device, runner):
     elif method == "suffix":
         return AscendSuffixDecodingProposer(vllm_config, runner)
     elif method == "medusa":
+        # Recent vLLM versions removed Medusa. Keep older-version support
+        # isolated from workers using other speculative decoding methods.
+        from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
+
         return AscendMedusaProposer(vllm_config, device)
     elif method == "dspark":
         return AscendDSparkProposer(vllm_config, device, runner)
