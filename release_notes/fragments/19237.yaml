@@ -1,0 +1,8 @@
+pr: 19237
+entries:
+  - category: performance
+    text: >-
+      DSA O-projection tensor parallelism keeps its communication buffers and
+      per-step projection work bounded by the decode capacity when the memory
+      profiling token budget is larger.
+    model: deepseek-v4
