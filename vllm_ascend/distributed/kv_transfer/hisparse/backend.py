@@ -19,6 +19,7 @@ class AscendHiSparseBackend(HiSparseBackend):
     # NPU event IPC is not implemented here. Keep private pools per TP rank;
     # the common connector still owns transfer completion and TP coordination.
     supports_shared_host_pool = False
+    supports_speculative_group_prefetch = True
     stats_dtype = torch.int64
 
     def check_available(self) -> None:

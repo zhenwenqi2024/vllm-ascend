@@ -115,3 +115,17 @@ changed IDs and payloads are included but have not run on this updated PR head.
 Historical integration evidence does not qualify this new pair. Complete test
 collection, standard CI, final-head NPU/model validation and deferred accuracy
 remain outstanding; no performance improvement is claimed.
+
+
+### Speculative Decode group prefetch
+
+The Ascend backend opts into the common runtime's
+`supports_speculative_group_prefetch` capability. A pure Decode batch may stage
+the shared index group's missing historical rows for its followers, including
+MTP verification with multiple query tokens. Prefill, mixed batches and batches
+exceeding the resolver row capacity keep the existing staging path.
+
+This eligibility is separate from the single-token resident-write and Host-mirror
+policy. Each follower retains its own completion event and writes its current
+tentative KV before attention consumes it. This change does not establish a
+measured speedup, complete attention C8 support, or full-model accuracy.
