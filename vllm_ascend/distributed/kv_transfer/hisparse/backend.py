@@ -16,8 +16,8 @@ if TYPE_CHECKING:
 
 
 class AscendHiSparseBackend(HiSparseBackend):
-    # The common shared pool currently exchanges CUDA IPC events. Private
-    # per-rank pools preserve the same scheduler and transfer completion rules.
+    # NPU event IPC is not implemented here. Keep private pools per TP rank;
+    # the common connector still owns transfer completion and TP coordination.
     supports_shared_host_pool = False
     stats_dtype = torch.int64
 
@@ -85,8 +85,64 @@ class AscendHiSparseBackend(HiSparseBackend):
         # CANN Range does not support int16 outputs. This runs only at allocation.
         return torch.arange(size, dtype=torch.int32, device=device).to(torch.int16)
 
-    def create_event(self) -> Any:
+    def create_event(self, *, interprocess: bool = False) -> Any:
+        if interprocess:
+            raise NotImplementedError(
+                "Ascend HiSparse requires private per-rank host pools; NPU event IPC is unavailable."
+            )
         return torch.npu.Event()
+
+    def export_event(self, event: Any) -> Any:
+        raise NotImplementedError("Ascend HiSparse does not export NPU IPC events.")
+
+    def import_event(self, device: torch.device, handle: Any) -> Any:
+        raise NotImplementedError("Ascend HiSparse does not import NPU IPC events.")
+
+    def gather_resident_rows(self, source: torch.Tensor, destination: torch.Tensor, row_ids: torch.Tensor) -> None:
+        """Copy packed rows as bytes, including RoPE and scale payloads in C8.
+
+        The source may have gaps between physical pages. Reinterpret FP8 views
+        before indexing because NPU advanced indexing does not support FP8.
+        No quantization, dequantization or host scalar reads occur here.
+        """
+        if source.ndim != 3 or destination.ndim != 2 or row_ids.ndim != 1:
+            raise ValueError("HiSparse resident gather expects paged source, flat destination and one row-ID vector.")
+        if source.device != destination.device or source.device != row_ids.device:
+            raise ValueError("HiSparse resident gather tensors must share one device.")
+        if destination.shape[0] != row_ids.numel() or (
+            source.shape[-1] * source.element_size() != destination.shape[-1] * destination.element_size()
+        ):
+            raise ValueError("HiSparse resident gather requires matching row counts and payload byte widths.")
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+        if source.dtype in fp8_dtypes:
+            source = source.view(torch.uint8)
+        if destination.dtype in fp8_dtypes:
+            destination = destination.view(torch.uint8)
+        rows = row_ids.to(torch.long).clamp_min(0)
+        block_size = source.shape[1]
+        payload = source[rows // block_size, rows % block_size]
+        if payload.dtype != destination.dtype:
+            payload = payload.contiguous().view(destination.dtype)
+        destination.copy_(payload)
+
+    def gather_fp8_prefill(
+        self,
+        source: torch.Tensor,
+        destination: torch.Tensor,
+        block_table: torch.Tensor,
+        workspace_starts: torch.Tensor,
+        batch_size: int,
+        *,
+        host_cache: torch.Tensor,
+        host_row_ids: torch.Tensor,
+        device_row_ids: torch.Tensor,
+    ) -> None:
+        # Native SFA stages opaque rows via gather_prefill_cache and consumes
+        # the Ascend C8 layout directly; CUDA fp8_ds_mla has a different layout.
+        raise NotImplementedError(
+            "Ascend HiSparse uses native SFA prefill with packed KV rows; "
+            "the CUDA fp8_ds_mla prefill conversion path is unsupported."
+        )
 
     def current_stream(self) -> Any:
         # HiSparse switches between model and copy streams. Query the active

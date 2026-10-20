@@ -31,7 +31,7 @@ KV preprocessing uses the same fused RMSNorm/RoPE operator as native SFA before 
 | Hardware | Ascend 950 with AIV access to registered host memory; runtime capability is checked |
 | Runner | Model Runner V2 |
 | Model path | Sparse MLA/DSA with a sparse-index group |
-| KV formats | BF16 indexer KV and unquantized main KV; model-weight quantization is independent |
+| KV formats | BF16 indexer KV; BF16 main KV or experimental native A5 attention C8 (see validation status below) |
 | Context parallelism | Prefill and decode context-parallel sizes must both be 1 |
 | Sparse selection | SFA requires top-k divisible by 128 |
 | Direct operator | BF16 latent 512 + RoPE 64, 8–64 local heads divisible by 8; selected capacity at most 32768 |
@@ -86,3 +86,45 @@ These tests compare state transitions and KV payloads with a CPU reference. They
 The prefill staging tests check resident and host rows across shared-layer cache views and different resident page sizes. The selection-order tests check interleaved padding, duplicates, empty rows, and changed selections during graph replay.
 
 The KV preprocessing tests include a fixed BF16 activation row that exposes a rounding difference between standalone and fused RMSNorm. They require native fused results to match exactly, including strided packed destinations, invalid slots, padding, and graph replay with changed inputs.
+
+
+## Platform backend integration
+
+The adapter targets vLLM PR [#62592](https://github.com/vllm-project/vllm/pull/62592),
+commit `d9f25459725c8fd9db07b7d9571a3f5be39db592`. Keep both repository
+revisions pinned when validating this draft interface.
+
+`NPUPlatform.get_hisparse_backend_cls()` selects
+`vllm_ascend.distributed.kv_transfer.hisparse.backend.AscendHiSparseBackend`.
+The common runtime retains request scheduling, TP coordination, cache allocation
+ownership and synchronization before release. The plugin implements mapped Host
+registration, DMA, resolver/gather operators, KV view binding and NPU streams/events.
+No monkey patch of the common runtime is needed for resident FP8 row indexing:
+`gather_resident_rows()` reinterprets FP8 tensors as `uint8` before indexing and
+copies the complete packed payload without numerical conversion. Physical page
+strides and layer storage offsets are preserved.
+
+Native Ascend SFA prefill calls `stage_prefill_rows()`, which combines resident
+rows through this backend hook with Host rows through `HiSparseNPUOps`.
+For native attention C8, the resulting opaque rows retain the Ascend order of
+512 NoPE bytes, 128 RoPE bytes and 16 scale bytes; SFA consumes that layout.
+The CUDA `fp8_ds_mla` prefill conversion hook uses a different layout and is
+explicitly rejected by this backend. It must not silently reinterpret Ascend C8.
+This adapter does not add another quantizer or change indexer precision.
+
+Host pools remain private per worker rank (`supports_shared_host_pool=False`).
+Local Event creation supports the common `interprocess=False` signature. NPU
+IPC Event creation/export/import explicitly reject calls until their ownership
+and completion protocol is implemented and validated. This does not affect
+ordinary local copy-stream completion events.
+
+### Validation status
+
+The existing integration evidence predates this interface update. The
+`docs/hisparse_integration_validation_20261020.json` manifest describes its
+original frozen snapshot; it does not qualify the adapter changes above.
+CPU payload tests cover BF16/E4M3/E5M2 bytes, page gaps, layer offsets, duplicate
+and padded row IDs, geometry errors and private-event behavior. The NPU prefill
+staging suite includes graph capture/replay with changed row IDs and payloads.
+These NPU cases and the full model have not yet been rerun against the paired
+vLLM revision. C8 model accuracy remains pending; no speedup is claimed here.
