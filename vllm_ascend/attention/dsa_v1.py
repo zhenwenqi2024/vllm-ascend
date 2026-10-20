@@ -1781,25 +1781,20 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             # Pad to a static exchange size so the all_to_all / reduce_scatter
             # shapes are identical across all ACL graph buckets — variable
             # shapes desync the HCCL communicator during graph replay.
-            # Profiling can use the scheduler's full token budget even when
-            # the decode capacity is smaller. Freeze the larger capacity when
-            # allocating the buffers, then reuse it for capture and replay.
+            # The no-metadata path chunks oversized profiling batches below.
+            # Only the decode capacity is resident and exchanged on every step.
             if hasattr(self, "_oproj_send_buf"):
                 exchange_num_tokens = self._oproj_send_buf.shape[1]
             else:
-                exchange_num_tokens = max(
-                    get_potential_max_tokens(),
-                    self.vllm_config.scheduler_config.max_num_batched_tokens,
-                )
+                exchange_num_tokens = get_potential_max_tokens()
             if exchange_num_tokens < num_tokens:
                 scheduler_config = self.vllm_config.scheduler_config
                 raise ValueError(
                     f"oproj static exchange capacity ({exchange_num_tokens}) must cover "
                     f"local tokens ({num_tokens}). Fine-grained oproj TP requires "
-                    "capacity >= max_num_batched_tokens. Please set --max-num-batched-"
-                    "tokens to max_num_seqs * decode_query_len "
-                    f"(currently max_num_seqs={scheduler_config.max_num_seqs}), or "
-                    "raise the largest cudagraph_capture_sizes entry."
+                    "capacity >= the largest decode graph bucket. Please raise "
+                    "the largest cudagraph_capture_sizes entry "
+                    f"(currently max_num_seqs={scheduler_config.max_num_seqs})."
                 )
             # Lazily allocate static send/recv buffers on first call. The
             # profiling run hits this path before ACL graph capture, so the
@@ -1876,9 +1871,21 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             self.turboquant._initialize(hidden_states.device)
         o_proj_input_shape = self._get_o_proj_input_shape(attn_metadata)
         if attn_metadata is None:
-            # Profiling run: run o_proj on zero input so HCCL collectives are
-            # captured by the ACL graph.  Non-OTP just zeros the output.
-            if oproj_tp_enable() or self.enable_pcp_o_proj_weight_sharding:
+            if oproj_tp_enable():
+                # Memory profiling uses the same full scheduler batch on all
+                # ranks. Chunk only this dummy projection so its static buffers
+                # and per-step work stay bounded by the decode graph capacity.
+                capacity = (
+                    self._oproj_send_buf.shape[1] if hasattr(self, "_oproj_send_buf") else get_potential_max_tokens()
+                )
+                num_tokens = o_proj_input_shape[0]
+                # Empty dummy ranks still join one exchange, like active ranks
+                # whose local decode batch fits in the fixed capacity.
+                for start in range(0, max(num_tokens, 1), capacity):
+                    chunk_tokens = min(capacity, num_tokens - start)
+                    o_proj_input = hidden_states.new_zeros((chunk_tokens, *o_proj_input_shape[1:]))
+                    self._forward_o_proj(o_proj_input, output[start : start + chunk_tokens])
+            elif self.enable_pcp_o_proj_weight_sharding:
                 o_proj_input = hidden_states.new_zeros(o_proj_input_shape)
                 self._forward_o_proj(o_proj_input, output)
             else:
