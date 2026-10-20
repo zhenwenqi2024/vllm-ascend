@@ -468,3 +468,34 @@ def test_common_prefill_staging_uses_ascend_payload_backend(dtype):
     safe = rows[0].long().clamp_min(0)
     expected = source.view(torch.uint8)[safe // 2, safe % 2]
     assert torch.equal(staged.view(torch.uint8).flatten(0, 1), expected)
+
+
+def test_ascend_speculative_prefetch_preserves_tentative_write_policy():
+    """MTP verification stages followers but writes all tentative query rows."""
+    runtime = SimpleNamespace(
+        backend=AscendHiSparseBackend(),
+        max_swap_rows=16,
+        max_num_reqs=4,
+        eager_host_mirror=False,
+        begin_forward=MagicMock(),
+    )
+    handle = HiSparseCacheHandle(runtime)
+    handle.view = SimpleNamespace(cache=object())
+    handle.slot_mapping = torch.arange(16)
+    for tokens in [16, 4, 16]:
+        metadata = SimpleNamespace(
+            num_actual_tokens=tokens,
+            num_decode_tokens=tokens,
+            num_reqs=tokens // 4,
+            max_query_len=4,
+            req_id_per_token=None,
+        )
+        handle._prepare_for_batch(metadata)
+        assert handle.prefetch_decode_group
+        assert not handle.decode_batch
+        assert handle.host_mirror_required
+        _, slots, count = handle.write_target(tokens, tokens)
+        assert count == tokens and slots.numel() == tokens
+    handle._prepare_for_batch(None)
+    assert not handle.prefetch_decode_group
+    assert not handle.host_mirror_required
