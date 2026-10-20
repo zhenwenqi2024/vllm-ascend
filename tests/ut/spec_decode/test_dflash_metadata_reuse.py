@@ -97,6 +97,38 @@ def test_proposal_invalidates_previous_metadata_before_upstream_execution(monkey
     assert speculator.propose(batch, *([None] * 10)) is result
 
 
+def test_proposal_clears_preparation_state_after_parent_failure(monkeypatch):
+    speculator: Any = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    speculator._deferred_draft_attn_metadata = object()
+    speculator._draft_inputs_prepared = True
+    monkeypatch.setattr(dflash_module, "build_attn_metadata_wrapper", lambda: nullcontext())
+
+    def propose(self, *args, **kwargs):
+        assert self._deferred_draft_attn_metadata is None
+        assert self._draft_inputs_prepared is False
+        assert self._in_draft_proposal is True
+        raise RuntimeError("proposal failed")
+
+    monkeypatch.setattr(DFlashSpeculator, "propose", propose)
+    with pytest.raises(RuntimeError, match="proposal failed"):
+        speculator.propose(object(), *([None] * 10))
+    assert speculator._in_draft_proposal is False
+
+
+def test_explicit_slot_mappings_are_forwarded_without_reusing_group_layout(monkeypatch):
+    speculator: Any = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
+    speculator._use_cpu_seq_lens = False
+    speculator._prepared_draft_attn_metadata = None
+    descriptor = SimpleNamespace(cg_mode=CUDAGraphMode.FULL, num_reqs=2)
+    slots = torch.tensor([[9, 10]], dtype=torch.int32)
+    metadata = {"draft": object()}
+    parent = MagicMock(return_value=metadata)
+    monkeypatch.setattr(DFlashSpeculator, "_build_attn_metadata", parent)
+    speculator._build_attn_metadata(2, descriptor, object(), object(), 4, slot_mappings=slots)
+    assert parent.call_args.kwargs["slot_mappings"] is slots
+    assert speculator._prepared_draft_attn_metadata == (2, metadata)
+
+
 @pytest.mark.parametrize("num_reqs,padded", [(0, 4), (1, 1), (1, 4), (2, 4)])
 def test_dflash_cpu_mirror_reads_valid_rows_and_zeroes_padding(num_reqs, padded):
     spec = AscendDFlashSpeculator.__new__(AscendDFlashSpeculator)
@@ -188,10 +220,13 @@ def test_grouped_preparation_launches_once_per_proposal_and_refreshes_views(monk
     launch = MagicMock()
     monkeypatch.setattr(dflash_module, "prepare_dflash_inputs", launch)
     prepare = dflash_module.prepare_dflash_inputs_factory(
-        128, spec._on_draft_inputs_prepared, spec._get_draft_input_groups
+        128, on_inputs_prepared=spec._on_draft_inputs_prepared, get_kv_groups=spec._get_draft_input_groups
     )
-    prepare("common_inputs")
-    prepare("common_inputs")
+    inputs = [object() for _ in range(28)]
+    inputs[17] = 128
+    inputs[-1] = False
+    prepare(*inputs)
+    prepare(*inputs)
     launch.assert_called_once()
     groups = launch.call_args.kwargs["kv_groups"]
     for index, gid in enumerate(spec.draft_kv_cache_group_ids):
@@ -203,12 +238,12 @@ def test_grouped_preparation_launches_once_per_proposal_and_refreshes_views(monk
     # A new proposal must pick up current table views and launch again.
     spec._draft_inputs_prepared = False
     spec.block_tables.input_block_tables[2] = torch.full((4, 8), 99, dtype=torch.int32)
-    prepare("next_proposal")
+    prepare(*inputs)
     assert launch.call_count == 2
     assert launch.call_args.kwargs["kv_groups"][0][2] is spec.block_tables.input_block_tables[2]
     # Dummy/standalone calls outside a proposal retain the single-group API.
     spec._in_draft_proposal = False
-    prepare("standalone")
+    prepare(*inputs)
     assert launch.call_count == 3
     assert launch.call_args.kwargs["kv_groups"] is None
 

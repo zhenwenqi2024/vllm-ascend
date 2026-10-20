@@ -55,10 +55,10 @@ else:
 
     def prepare_dflash_inputs_factory(  # type: ignore[misc]
         kv_cache_block_size: int,
+        block_tables: Any | None = None,
+        *,
         on_inputs_prepared: Callable[[], None] | None = None,
         get_kv_groups: Callable[[], tuple[DFlashKVGroup, ...] | None] | None = None,
-        *,
-        block_tables: Any | None = None,
     ) -> Callable[..., None]:
         # vLLM main (#57169) dropped ``kernel_block_sizes`` from ``BlockTables``
         # and the DFlash caller now forwards ``BlockTables.block_sizes`` (physical
@@ -359,6 +359,7 @@ class AscendDFlashSpeculator(DFlashContextGraphMixin, LmheadTPDraftSamplingMixin
         step,
         causal=True,
         dcp_local_seq_lens=None,
+        slot_mappings=None,
     ):
         if self._can_defer_draft_metadata(batch_desc):
             self._deferred_draft_attn_metadata = (
@@ -369,7 +370,7 @@ class AscendDFlashSpeculator(DFlashContextGraphMixin, LmheadTPDraftSamplingMixin
                 step,
                 causal,
                 dcp_local_seq_lens,
-            )
+            ) + ((slot_mappings,) if slot_mappings is not None else ())
             return None
         context: AbstractContextManager[Any] = nullcontext()
         template_key = None
@@ -378,7 +379,11 @@ class AscendDFlashSpeculator(DFlashContextGraphMixin, LmheadTPDraftSamplingMixin
             num_tokens = (
                 batch_desc.num_tokens if batch_desc.cg_mode == CUDAGraphMode.FULL else int(query_start_loc_np[-1])
             )
-            if getattr(self, "_reuse_draft_layout", False) and batch_desc.cg_mode == CUDAGraphMode.FULL:
+            if (
+                slot_mappings is None
+                and getattr(self, "_reuse_draft_layout", False)
+                and batch_desc.cg_mode == CUDAGraphMode.FULL
+            ):
                 template_key = (
                     num_reqs,
                     num_reqs_padded,
@@ -417,6 +422,7 @@ class AscendDFlashSpeculator(DFlashContextGraphMixin, LmheadTPDraftSamplingMixin
                 step,
                 causal,
                 dcp_local_seq_lens,
+                **({"slot_mappings": slot_mappings} if slot_mappings is not None else {}),
             )
         # Upstream builds this even for FULL replay, refreshing builder state.
         # Reuse that result when the graph manager asks again in this proposal.
@@ -493,9 +499,9 @@ class AscendDFlashSpeculator(DFlashContextGraphMixin, LmheadTPDraftSamplingMixin
         else:
             dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_factory(  # type: ignore[call-arg]
                 self.vllm_config.cache_config.block_size,
-                self._on_draft_inputs_prepared,
-                self._get_draft_input_groups,
-                block_tables=block_tables,
+                block_tables,
+                on_inputs_prepared=self._on_draft_inputs_prepared,
+                get_kv_groups=self._get_draft_input_groups,
             )
 
     # vLLM #60754 renamed the DP-sync argument to `dp_sync_state` on main, and
