@@ -1,8 +1,9 @@
 from collections.abc import Callable, Mapping
+from inspect import signature
 from typing import Any
 
 import torch
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -72,12 +73,27 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture ACL graphs for DFlash."""
-        with communicator_switch(), model_capture_wrapper(self.speculator, False):
+        with (
+            set_current_vllm_config(self.vllm_config),
+            communicator_switch(),
+            model_capture_wrapper(self.speculator, False),
+        ):
             context_kwargs = {}
             if precompute_context_kv is not None:
                 # Newer upstream captures context KV ahead of the query. Keep
                 # that compute prefix instead of dropping the callback.
-                context_kwargs["precompute_context_kv"] = precompute_context_kv
+                if "precompute_context_kv" in signature(DFlashCudaGraphManager.capture).parameters:
+                    context_kwargs["precompute_context_kv"] = precompute_context_kv
+                else:
+                    # Old snapshots have the same query-forward interface.
+                    # Run the prefix inside their capture closure, exactly once.
+                    query_forward = forward_fn
+
+                    def forward_with_context(num_reqs, *args, **kwargs):
+                        precompute_context_kv(num_reqs)
+                        return query_forward(num_reqs, *args, **kwargs)
+
+                    forward_fn = forward_with_context
             super().capture(
                 forward_fn,
                 input_buffers,
@@ -86,7 +102,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                 kv_cache_config,
                 max_model_len,
                 causal=causal,
-                precompute_context_kv=precompute_context_kv,
+                **context_kwargs,
                 progress_bar_desc=progress_bar_desc,
             )
 

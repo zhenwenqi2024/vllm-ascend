@@ -357,8 +357,16 @@ def test_deferred_build_materializes_current_proposal_once(monkeypatch):
 def test_capture_preserves_upstream_context_kv_callback(monkeypatch, has_context_prefix):
     manager = DFlashAclGraphManager.__new__(DFlashAclGraphManager)
     manager.speculator = object()
+    manager.vllm_config = object()
     parent = MagicMock()
-    monkeypatch.setattr(graph_module.DFlashCudaGraphManager, "capture", parent)
+
+    def capture(self, *args, precompute_context_kv=None, **kwargs):
+        if precompute_context_kv is not None:
+            kwargs["precompute_context_kv"] = precompute_context_kv
+        return parent(*args, **kwargs)
+
+    monkeypatch.setattr(graph_module.DFlashCudaGraphManager, "capture", capture)
+    monkeypatch.setattr(graph_module, "set_current_vllm_config", lambda config: nullcontext())
     monkeypatch.setattr(graph_module, "communicator_switch", lambda: nullcontext())
     monkeypatch.setattr(graph_module, "model_capture_wrapper", lambda *args: nullcontext())
     callback = MagicMock() if has_context_prefix else None
