@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from vllm.v1.core.kv_cache_planning import _get_kv_cache_bytes_per_block
+from vllm.v1.hisparse import binding as common_binding
 from vllm.v1.hisparse.coordinator import HiSparseCoordinator
 from vllm.v1.hisparse.layout import _build_hisparse_kv_cache_tensors, get_hisparse_kv_cache_groups
 from vllm.v1.hisparse.runtime import HiSparseCacheHandle, HiSparseRuntime
@@ -153,20 +154,24 @@ def test_group_layers_share_one_resolver_workspace(monkeypatch):
     assert all(call.args == (mapping, group.backend_state) for call in ops_type.call_args_list)
 
 
-def test_indexer_expanded_view_addresses_shared_hma_pages(monkeypatch):
+def test_indexer_expanded_view_addresses_shared_hma_pages():
     """Scaling page IDs must reach the same bytes without copying the cache."""
     spec = AscendSFAIndexerCacheSpec(block_size=4, num_kv_heads=1, head_size=4, dtype=torch.float32)
     backing = torch.arange(96, dtype=torch.float32)
     cache = torch.as_strided(backing, (3, 1, 4, 4), (32, 16, 4, 1), storage_offset=16)
-    monkeypatch.setattr(binding, "upstream_init_hisparse_kv_cache", lambda *args: {"indexer": cache})
     config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=["indexer"], kv_cache_spec=spec)])
     layer = SimpleNamespace()
 
-    caches = binding.init_hisparse_kv_cache(config, torch.device("cpu"), [4], None, {"indexer": layer}, None)
+    caches = {"indexer": cache}
+    backend = AscendHiSparseBackend()
+    backend.validate_kv_cache_config(config)
+    backend.prepare_kv_cache_views(config, caches, {"indexer": layer})
 
     expanded = caches["indexer"][0]
     assert expanded.is_contiguous()
     assert expanded.data_ptr() == cache.data_ptr()
+    assert expanded.untyped_storage().data_ptr() == backing.data_ptr()
+    assert expanded.storage_offset() == cache.storage_offset()
     assert layer.hisparse_block_stride == 2
     for block in range(3):
         torch.testing.assert_close(expanded[block * layer.hisparse_block_stride, :, 0], cache[block, 0])
@@ -337,11 +342,12 @@ def test_runtime_index_groups_drive_specs_and_physical_payloads(monkeypatch, sec
 def test_quantized_indexer_is_rejected_before_pool_allocation(monkeypatch):
     spec = AscendSFAIndexerCacheSpec(block_size=128, num_kv_heads=1, head_size=128, dtype=torch.int8, scale_dim=1)
     allocator = MagicMock()
-    monkeypatch.setattr(binding, "upstream_init_hisparse_kv_cache", allocator)
+    monkeypatch.setattr(common_binding, "get_hisparse_backend", AscendHiSparseBackend)
+    monkeypatch.setattr(common_binding, "get_hisparse_host_pool", allocator)
     config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=["indexer"], kv_cache_spec=spec)])
 
     with pytest.raises(ValueError, match="unquantized"):
-        binding.init_hisparse_kv_cache(config, torch.device("cpu"), [128], None, {}, None)
+        common_binding.init_hisparse_kv_cache(config, torch.device("cpu"), [128], None, {}, None)
 
     allocator.assert_not_called()
 
@@ -350,18 +356,115 @@ def test_invalid_indexer_stride_releases_initialized_host_pool(monkeypatch):
     spec = AscendSFAIndexerCacheSpec(block_size=4, num_kv_heads=1, head_size=4, dtype=torch.float32)
     backing = torch.empty(128)
     cache = torch.as_strided(backing, (3, 1, 4, 4), (33, 16, 4, 1))
-    monkeypatch.setattr(binding, "upstream_init_hisparse_kv_cache", lambda *args: {"indexer": cache})
+    monkeypatch.setattr(common_binding, "get_hisparse_backend", AscendHiSparseBackend)
+    monkeypatch.setattr(common_binding, "allocate_hisparse_kv_caches", lambda *args: {"indexer": cache})
     registered = torch.empty(4096, dtype=torch.int8)
     pool = SimpleNamespace(shared_region=None, registered=registered)
-    monkeypatch.setattr(binding, "get_hisparse_host_pool", lambda *args: pool)
+    monkeypatch.setattr(common_binding, "get_hisparse_host_pool", lambda *args: pool)
     release = MagicMock()
     drop = MagicMock()
-    monkeypatch.setattr(binding, "release_pinned_state", release)
-    monkeypatch.setattr(binding, "drop_hisparse_host_pool", drop)
+    monkeypatch.setattr(common_binding, "release_pinned_state", release)
+    monkeypatch.setattr(common_binding, "drop_hisparse_host_pool", drop)
+    bind = MagicMock()
+    monkeypatch.setattr(common_binding, "bind_hisparse_kv_caches", bind)
     config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=["indexer"], kv_cache_spec=spec)])
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC)
+    )
 
     with pytest.raises(ValueError, match="whole number"):
-        binding.init_hisparse_kv_cache(config, torch.device("cpu"), [4], None, {"indexer": SimpleNamespace()}, None)
+        common_binding.init_hisparse_kv_cache(
+            config, torch.device("cpu"), [4], vllm_config, {"indexer": SimpleNamespace()}, None
+        )
 
-    release.assert_called_once_with([], [registered], None)
-    drop.assert_called_once_with(None)
+    bind.assert_not_called()
+    release.assert_called_once_with([], [registered])
+    drop.assert_called_once_with(vllm_config)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2])
+def test_backend_resident_gather_preserves_packed_bytes_and_page_gaps(dtype):
+    # Include arbitrary FP8 bit patterns and RoPE/scale bytes, not FP8 numbers.
+    width = 656 if dtype != torch.bfloat16 else 576
+    page_stride = 3 * width
+    offset = width
+    storage = torch.arange((offset + 2 * page_stride) * dtype.itemsize, dtype=torch.int64).to(torch.uint8)
+    source = storage.view(dtype).as_strided((2, 2, width), (page_stride, width, 1), storage_offset=offset)
+    rows = torch.tensor([3, 0, 2, 3, -1])
+    destination = torch.empty((5, width), dtype=dtype)
+    raw_source = source.view(torch.uint8)
+    safe = rows.clamp_min(0)
+    expected = raw_source[safe // 2, safe % 2]
+    before = storage.clone()
+
+    AscendHiSparseBackend().gather_resident_rows(source, destination, rows)
+
+    assert torch.equal(destination.view(torch.uint8), expected)
+    assert torch.equal(storage, before)
+
+
+@pytest.mark.parametrize("bad_width", [False, True])
+def test_backend_resident_gather_rejects_geometry_before_writing(bad_width):
+    source = torch.ones((2, 2, 4))
+    destination = torch.full((2, 5 if bad_width else 4), 17.0)
+    rows = torch.tensor([0, 1]) if bad_width else torch.tensor([0])
+    with pytest.raises(ValueError, match="row counts and payload byte widths"):
+        AscendHiSparseBackend().gather_resident_rows(source, destination, rows)
+    assert torch.all(destination == 17)
+
+
+def test_backend_keeps_private_events_and_rejects_unsupported_ipc(monkeypatch):
+    events = MagicMock()
+    monkeypatch.setattr(torch.npu, "Event", events)
+    backend = AscendHiSparseBackend()
+    assert not backend.supports_shared_host_pool
+    assert backend.create_event() is events.return_value
+    assert backend.create_event(interprocess=False) is events.return_value
+    with pytest.raises(NotImplementedError, match="private per-rank"):
+        backend.create_event(interprocess=True)
+    with pytest.raises(NotImplementedError, match="export"):
+        backend.export_event(object())
+    with pytest.raises(NotImplementedError, match="import"):
+        backend.import_event(torch.device("cpu"), b"invalid-handle")
+    assert events.call_count == 2
+
+
+def test_backend_rejects_cuda_prefill_layout_without_touching_payloads():
+    payload = torch.arange(656, dtype=torch.int64).to(torch.uint8)
+    before = payload.clone()
+    with pytest.raises(NotImplementedError, match="native SFA prefill"):
+        AscendHiSparseBackend().gather_fp8_prefill(
+            payload,
+            payload,
+            payload,
+            payload,
+            1,
+            host_cache=payload,
+            host_row_ids=payload,
+            device_row_ids=payload,
+        )
+    assert torch.equal(payload, before)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_common_prefill_staging_uses_ascend_payload_backend(dtype):
+    width = 656 if dtype == torch.float8_e4m3fn else 576
+    source = torch.arange(4 * width * dtype.itemsize, dtype=torch.int64).to(torch.uint8).view(dtype).view(2, 2, width)
+    runtime = object.__new__(HiSparseRuntime)
+    runtime.backend = AscendHiSparseBackend()
+    runtime.cache_ops = SimpleNamespace(hisparse_gather_plan=lambda *args: None)
+    rows = torch.tensor([[3, 0, 2, -1]], dtype=torch.int32)
+    plan = SimpleNamespace(
+        block_size=2,
+        row_ids=rows,
+        gpu_row_ids=rows,
+        block_table=torch.zeros((1, 2), dtype=torch.int32),
+        dst_rows=torch.arange(4, dtype=torch.int32).view(1, 4),
+        miss_mask=torch.zeros((1, 4), dtype=torch.bool),
+    )
+
+    staged = runtime.gather_prefill_cache(source, plan, source)
+
+    safe = rows[0].long().clamp_min(0)
+    expected = source.view(torch.uint8)[safe // 2, safe % 2]
+    assert torch.equal(staged.view(torch.uint8).flatten(0, 1), expected)

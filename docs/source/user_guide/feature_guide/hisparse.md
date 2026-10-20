@@ -80,3 +80,38 @@ These tests compare state transitions and KV payloads with a CPU reference. They
 The prefill staging tests check resident and host rows across shared-layer cache views and different resident page sizes. The selection-order tests check interleaved padding, duplicates, empty rows, and changed selections during graph replay.
 
 The KV preprocessing tests include a fixed BF16 activation row that exposes a rounding difference between standalone and fused RMSNorm. They require native fused results to match exactly, including strided packed destinations, invalid slots, padding, and graph replay with changed inputs.
+
+
+## Platform backend dependency
+
+This draft targets vLLM PR [#62592](https://github.com/vllm-project/vllm/pull/62592),
+commit `d9f25459725c8fd9db07b7d9571a3f5be39db592`. Pin the paired revisions
+when validating the interface.
+
+`NPUPlatform.get_hisparse_backend_cls()` selects `AscendHiSparseBackend`.
+The common runtime owns scheduling, TP coordination, allocation rollback and
+synchronization before Host release. The plugin owns NPU operations and view
+adaptation through `validate_kv_cache_config()` and `prepare_kv_cache_views()`.
+The previous patch of `init_hisparse_kv_cache` is removed: indexer views are now
+prepared before common handle binding, inside its rollback scope.
+
+`gather_resident_rows()` copies complete payloads while preserving page strides
+and layer offsets. FP8-typed payloads use `uint8` views before indexing, avoiding
+unsupported NPU FP8 indexing without numerical conversion. This primitive does
+not add end-to-end attention C8 support to this BF16 feature PR. Native attention
+C8 integration remains a separate experimental branch. The CUDA `fp8_ds_mla`
+prefill conversion path is explicitly rejected rather than reinterpreting its
+layout as Ascend storage.
+
+Host pools remain private per worker rank. Local event creation accepts
+`interprocess=False`; NPU IPC event creation/export/import reject calls until
+that protocol is implemented and validated. Existing context-parallel and model
+restrictions remain.
+
+CPU checks for this interface update cover opaque BF16/E4M3/E5M2 payloads,
+strided pages, layer offsets, repeated/padded IDs, geometry rejection and the
+actual paired common Prefill staging entry point. NPU graph replay tests with
+changed IDs and payloads are included but have not run on this updated PR head.
+Historical integration evidence does not qualify this new pair. Complete test
+collection, standard CI, final-head NPU/model validation and deferred accuracy
+remain outstanding; no performance improvement is claimed.
