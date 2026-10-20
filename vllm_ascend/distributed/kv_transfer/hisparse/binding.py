@@ -4,18 +4,16 @@
 
 import math
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
-from vllm.config import VllmConfig
-from vllm.v1.hisparse.binding import init_hisparse_kv_cache as upstream_init_hisparse_kv_cache
-from vllm.v1.hisparse.runtime import drop_hisparse_host_pool, get_hisparse_host_pool, release_pinned_state
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
-
-if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.block_table import BlockTables
 
 
 def align_hisparse_indexer_specs(specs: dict[str, KVCacheSpec]) -> dict[str, KVCacheSpec]:
@@ -32,14 +30,10 @@ def align_hisparse_indexer_specs(specs: dict[str, KVCacheSpec]) -> dict[str, KVC
     }
 
 
-def init_hisparse_kv_cache(
+def get_hisparse_indexer_specs(
     kv_cache_config: KVCacheConfig,
-    device: torch.device,
-    kernel_block_sizes: list[int],
-    vllm_config: VllmConfig,
-    forward_context: dict[str, Any],
-    block_tables: "BlockTables",
-) -> dict[str, Any]:
+) -> dict[str, AscendSFAIndexerCacheSpec]:
+    """Validate the static indexer format before common storage allocation."""
     indexer_specs = {}
     for group in kv_cache_config.kv_cache_groups:
         for name in group.layer_names:
@@ -51,23 +45,7 @@ def init_hisparse_kv_cache(
                     raise ValueError("Ascend HiSparse currently requires an unquantized indexer cache.")
                 indexer_specs[name] = spec
 
-    kv_caches = upstream_init_hisparse_kv_cache(
-        kv_cache_config, device, kernel_block_sizes, vllm_config, forward_context, block_tables
-    )
-    try:
-        _bind_indexer_views(kv_caches, indexer_specs, forward_context)
-    except Exception:
-        pool = get_hisparse_host_pool(vllm_config, kv_cache_config)
-        runtimes = [
-            handle.runtime
-            for layer in forward_context.values()
-            if (handle := getattr(layer, "hisparse_cache", None)) is not None
-        ]
-        registered = [] if pool.shared_region is not None or pool.registered is None else [pool.registered]
-        release_pinned_state(runtimes, registered, pool.shared_region)
-        drop_hisparse_host_pool(vllm_config)
-        raise
-    return kv_caches
+    return indexer_specs
 
 
 def _bind_indexer_views(

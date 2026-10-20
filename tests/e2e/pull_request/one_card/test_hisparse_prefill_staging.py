@@ -9,6 +9,7 @@ import torch
 import torch_npu  # noqa: F401
 from vllm.v1.hisparse.runtime import HiSparseRuntime, PagedCacheView, build_hisparse_prefill_staging_plan
 
+from vllm_ascend.distributed.kv_transfer.hisparse.backend import AscendHiSparseBackend
 from vllm_ascend.ops.hisparse import HiSparseNPUOps, allocate_mapped_host, scatter_packed_kv
 
 
@@ -74,7 +75,10 @@ def test_resident_prefill_plan_shared_layers(resident_block_size, host_pages):
                 # Layers in an index group reuse the same resolved page plan.
                 assert plan.gpu_row_ids is original_rows
             actual = HiSparseRuntime.gather_prefill_cache(
-                SimpleNamespace(cache_ops=ops), host.view(-1, block_size, width), plan, view.cache
+                SimpleNamespace(cache_ops=ops, backend=AscendHiSparseBackend()),
+                host.view(-1, block_size, width),
+                plan,
+                view.cache,
             )
             expected = host.clone()
             expected[block_size:][hits] = payload[hits]
@@ -82,3 +86,30 @@ def test_resident_prefill_plan_shared_layers(resident_block_size, host_pages):
     finally:
         torch.npu.synchronize()
         host._hisparse_registration.close()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2])
+def test_backend_resident_payload_graph_replay(dtype):
+    if not torch.npu.is_available() or not torch.npu.get_device_name(0).startswith("Ascend950"):
+        pytest.skip("HiSparse resident gather currently targets Ascend 950")
+    torch.npu.set_device(0)
+    width = 656 if dtype != torch.bfloat16 else 576
+    stride = 3 * width
+    raw = torch.arange(7 * width * dtype.itemsize, dtype=torch.int64).to(torch.uint8).to("npu:0")
+    source = raw.view(dtype).as_strided((2, 2, width), (stride, width, 1), storage_offset=width)
+    rows = torch.tensor([3, 0, 2, -1], dtype=torch.int32, device="npu:0")
+    destination = torch.empty((4, width), dtype=dtype, device="npu:0")
+    backend = AscendHiSparseBackend()
+    backend.gather_resident_rows(source, destination, rows)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        backend.gather_resident_rows(source, destination, rows)
+    for values in ([3, 0, 2, -1], [0, 3, 1, 2]):
+        rows.copy_(torch.tensor(values, dtype=torch.int32, device="npu:0"))
+        raw.bitwise_xor_(1)
+        graph.replay()
+        torch.npu.synchronize()
+        safe = torch.tensor(values).clamp_min(0)
+        expected = source.view(torch.uint8).cpu()[safe // 2, safe % 2]
+        assert torch.equal(destination.view(torch.uint8).cpu(), expected)
