@@ -94,7 +94,7 @@ def compact_c8_indices(indices: torch.Tensor) -> torch.Tensor:
     return torch.gather(indices, -1, order)
 
 
-def c8_physical_attention(query, query_rope, cache, indices, scale, query_ends, key_length):
+def c8_physical_attention(query, query_rope, cache, indices, scale, query_ends, key_length, *, _prepared_indices=False):
     """Use custom quantized SFA with its LSE-enabled valid-length path.
 
     Logical causality must already be enforced by the indexer and resolver.
@@ -121,7 +121,14 @@ def c8_physical_attention(query, query_rope, cache, indices, scale, query_ends, 
         raise ValueError("HiSparse C8 requires one key length equal to the aliased physical row capacity")
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("HiSparse C8 attention scale must be finite and positive")
-    mapped = compact_c8_indices(map_c8_physical_indices(indices, block, stride_rows, capacity))
+    from vllm_ascend.ops.hisparse_c8_mapping import map_compact_c8_indices
+
+    if _prepared_indices:
+        if indices.dtype != torch.int32 or stride_rows != block or not indices.is_contiguous():
+            raise ValueError("Prepared C8 indices require contiguous int32 rows and an identity staging layout")
+        mapped = indices
+    else:
+        mapped = map_compact_c8_indices(indices, block, stride_rows, capacity)
     output = torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention_vllm(
         query=torch.cat((query, query_rope), dim=-1),
         key=view,

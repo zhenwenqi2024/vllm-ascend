@@ -636,6 +636,11 @@ class AscendConfig:
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
     kvpp_config: KVPPConfig = dataclasses.field(default_factory=KVPPConfig, kw_only=True)
 
+    # Indexer KV precision is independent of projection-weight precision.
+    # Preserve the model's layer filter by default; "all" explicitly applies
+    # the requested C8 KV format to every target/draft indexer layer.
+    sparse_li_c8_layer_policy: Literal["model", "all"] = "model"
+
     # ---- derived fields: sentinel default, after-validator overwrites ----
     enable_shared_expert_dp: bool = False
     enable_sp_by_pass: bool = False
@@ -1243,7 +1248,7 @@ class AscendConfig:
         return self._is_sparse_li_layer(
             layer_name,
             self.enable_sparse_li_c8,
-            self._sparse_li_layer_filter_enabled,
+            self._sparse_li_layer_filter_enabled and self.sparse_li_c8_layer_policy == "model",
             self._sparse_li_c8_layer_names,
             self._sparse_li_c8_layer_ids,
         )

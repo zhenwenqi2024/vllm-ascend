@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import inspect
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Any
@@ -367,6 +368,8 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
             cache_sparse_li_c8=cache_sparse_li_c8_set.pop(),
             cache_sparse_li_c4=cache_sparse_li_c4_set.pop(),
             sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size_set.pop(),
+            page_size_padded=specs[0].page_size_padded,
+            block_stride_alignment=math.lcm(*(spec.get_block_stride_alignment() for spec in specs)),
         )
 
 

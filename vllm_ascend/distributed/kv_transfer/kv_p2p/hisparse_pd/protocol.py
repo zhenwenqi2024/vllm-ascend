@@ -14,7 +14,21 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
-VERSION = 1
+VERSION = 4
+BF16_FORMAT = "bf16"
+C8_FORMAT = "ascend_sfa_e4m3fn_nope512_rope64_scale4_tile128_v1"
+INDEXER_FP8_FORMAT = "ascend_indexer_e4m3fn_key_fp32_scale_v1"
+SOURCE_TRANSPORT = "producer_hbm_stage_v1"
+STAGE_BYTES = 16 * 1024 * 1024
+
+
+def validate_wire(message: dict) -> None:
+    if not isinstance(message, dict):
+        raise ValueError("HiSparse P/D control messages must be objects")
+    if type(message.get("version")) is not int or message["version"] != VERSION:
+        raise ValueError("HiSparse P/D wire version mismatch")
+    if message.get("source_transport") != SOURCE_TRANSPORT:
+        raise ValueError("HiSparse P/D requires explicit producer HBM staging")
 
 
 def digest(value: Any) -> str:
@@ -31,10 +45,34 @@ class LayerLayout:
     base: int
     block_stride: int
     num_blocks: int
+    payload_format: str = BF16_FORMAT
+    component: str = "kv"
+    model_role: str = "target"
 
     def __post_init__(self):
         if self.role not in ("hisparse_source", "hisparse_indexer"):
             raise ValueError(f"Unsupported transfer role {self.role}")
+        if self.model_role not in ("target", "draft"):
+            raise ValueError("Unknown target/draft owner")
+        if self.payload_format not in (BF16_FORMAT, C8_FORMAT, INDEXER_FP8_FORMAT):
+            raise ValueError("Unknown HiSparse P/D payload format")
+        if any(
+            type(value) is not int
+            for value in (self.block_size, self.row_bytes, self.base, self.block_stride, self.num_blocks)
+        ):
+            raise ValueError("KV geometry must use integer byte addresses")
+        if self.payload_format == C8_FORMAT:
+            if self.role != "hisparse_source" or self.row_bytes != 656 or self.component != "kv":
+                raise ValueError("Ascend C8 SOURCE requires the declared 656-byte format")
+        elif self.payload_format == INDEXER_FP8_FORMAT:
+            if self.role != "hisparse_indexer" or self.component not in ("key", "scale"):
+                raise ValueError("FP8 INDEXER requires explicit key/scale components")
+            if self.component == "scale" and self.row_bytes % 4:
+                raise ValueError("INDEXER scales must contain complete FP32 values")
+        elif self.component != "kv" or self.row_bytes % 2:
+            raise ValueError("BF16 KV rows must contain complete two-byte values")
+        if type(self.group_id) is not int or self.group_id < 0:
+            raise ValueError("Invalid manager group ID")
         if min(self.block_size, self.row_bytes, self.base, self.block_stride, self.num_blocks) <= 0:
             raise ValueError("Invalid or empty KV address geometry")
         if self.block_stride < self.block_size * self.row_bytes:
@@ -44,7 +82,18 @@ class LayerLayout:
 
     def signature(self) -> tuple:
         # Capacities, addresses and HMA block/layer strides may differ on P/D.
-        return self.name, self.group_id, self.role, self.block_size, self.row_bytes
+        return (
+            self.name,
+            self.role,
+            self.block_size,
+            self.row_bytes,
+            self.payload_format,
+            self.component,
+            self.model_role,
+        )
+
+    def key(self) -> tuple[str, str, str]:
+        return self.name, self.component, self.model_role
 
     def address(self, block: int, offset: int = 0) -> int:
         if not 0 <= block < self.num_blocks or not 0 <= offset < self.block_size:
@@ -53,12 +102,24 @@ class LayerLayout:
 
 
 def validate_layouts(layouts: list[LayerLayout]) -> None:
-    names = [layer.name for layer in layouts]
+    names = [layer.key() for layer in layouts]
     if not names or len(names) != len(set(names)):
         raise ValueError("A transfer must contain each layer exactly once")
     roles = {layer.role for layer in layouts}
     if roles != {"hisparse_source", "hisparse_indexer"}:
         raise ValueError("Both SOURCE and INDEXER layers are required")
+    for owner in {layer.model_role for layer in layouts}:
+        if {layer.role for layer in layouts if layer.model_role == owner} != roles:
+            raise ValueError("Each target/draft owner requires SOURCE and INDEXER")
+    pairs = {}
+    for layer in layouts:
+        if layer.payload_format == INDEXER_FP8_FORMAT:
+            pairs.setdefault((layer.name, layer.model_role), []).append(layer)
+    for components in pairs.values():
+        if {layer.component for layer in components} != {"key", "scale"}:
+            raise ValueError("FP8 INDEXER publication must include both key and scale")
+        if len({(layer.group_id, layer.block_size, layer.num_blocks) for layer in components}) != 1:
+            raise ValueError("FP8 INDEXER key/scale manager geometry differs")
 
 
 def plan_reads(
@@ -70,6 +131,7 @@ def plan_reads(
     end_token: int,
     *,
     include_host: bool = True,
+    with_roles: bool = False,
 ) -> list[tuple[int, int, int]]:
     """Return (destination, source, bytes) without int32 address arithmetic.
 
@@ -80,15 +142,15 @@ def plan_reads(
     validate_layouts(destination)
     if start_token < 0 or end_token <= start_token:
         raise ValueError("The imported token interval must be nonempty")
-    remote = {layer.name: layer for layer in source}
-    if remote.keys() != {layer.name for layer in destination}:
+    remote = {layer.key(): layer for layer in source}
+    if remote.keys() != {layer.key() for layer in destination}:
         raise ValueError("Producer and consumer layer sets differ")
     result = []
     for dst in destination:
-        src = remote[dst.name]
+        src = remote[dst.key()]
         if src.signature() != dst.signature():
             raise ValueError(f"Incompatible KV layer {dst.name}")
-        source_ids = source_blocks[dst.group_id]
+        source_ids = source_blocks[src.group_id]
         destination_ids = destination_blocks[dst.group_id]
         required = (end_token + dst.block_size - 1) // dst.block_size
         if min(len(source_ids), len(destination_ids)) < required:
@@ -100,11 +162,74 @@ def plan_reads(
             src_ptr = src.address(source_ids[page], offset)
             dst_ptr = dst.address(destination_ids[page], offset)
             if include_host or dst.role != "hisparse_source":
-                result.append((dst_ptr, src_ptr, rows * dst.row_bytes))
+                entry = (dst_ptr, src_ptr, rows * dst.row_bytes)
+                result.append((*entry, dst.role, dst.key()) if with_roles else entry)
             token += rows
     if not result:
         raise ValueError("No KV payload was selected for transfer")
     return result
+
+
+def coalesce_transfers(descriptors):
+    """Merge only adjacent source/destination bytes of the same layer/role."""
+    result = []
+    for destination, source, length, role, layer in descriptors:
+        if result:
+            dst, src, count, previous_role, previous_layer = result[-1]
+            if (
+                role == previous_role
+                and layer == previous_layer
+                and dst + count == destination
+                and src + count == source
+            ):
+                result[-1] = dst, src, count + length, role, layer
+                continue
+        result.append((destination, source, length, role, layer))
+    return result
+
+
+def validate_source_range(manifest: dict, message: dict) -> None:
+    """Validate only published SOURCE bytes after the registry checks its reader."""
+    validate_wire(message)
+    if any(type(message.get(key)) is not int for key in ("rank", "world_size", "source", "length")):
+        raise ValueError("Stage geometry and rank fields must be integers")
+    source, length = message["source"], message["length"]
+    if source <= 0 or not 0 < length <= STAGE_BYTES or source + length >= 2**64:
+        raise ValueError("Invalid bounded stage source range")
+    validate_wire(manifest)
+    if (manifest["identity"], manifest["rank"], manifest["world_size"]) != (
+        message["identity"],
+        message["rank"],
+        message["world_size"],
+    ):
+        raise ValueError("Stage model, rank, or TP size mismatch")
+    layers = [LayerLayout(**item) for item in manifest["layers"] if item["name"] == message["layer"]]
+    if len(layers) != 1 or layers[0].role != "hisparse_source":
+        raise ValueError("Stage requires one declared SOURCE layer")
+    layer = layers[0]
+    blocks = manifest["blocks"].get(layer.group_id, manifest["blocks"].get(str(layer.group_id)))
+    tokens = manifest["ticket"]["num_tokens"]
+    if type(tokens) is not int or tokens <= 0 or not isinstance(blocks, list):
+        raise ValueError("Invalid published source token interval")
+    required = (tokens + layer.block_size - 1) // layer.block_size
+    if len(blocks) < required:
+        raise ValueError("Missing published source blocks")
+    intervals = []
+    for page, block in enumerate(blocks[:required]):
+        if type(block) is not int:
+            raise ValueError("Invalid published source block")
+        base = layer.address(block)
+        extent = min(layer.block_size, tokens - page * layer.block_size) * layer.row_bytes
+        intervals.append((base, base + extent))
+    covered_end = source
+    for base, end in sorted(intervals):
+        if base > covered_end:
+            break
+        if end > covered_end:
+            covered_end = end
+        if covered_end >= source + length:
+            return
+    raise ValueError("Stage range is outside the acquired lease SOURCE segments")
 
 
 class LeaseRegistry:
@@ -115,7 +240,10 @@ class LeaseRegistry:
     """
 
     def __init__(self, unclaimed_timeout: float = 300, ack_retry_window: float = 600, max_tombstones: int = 4096):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        # StageSlot shares this lock: a source claim and slot reservation are
+        # atomic with release. A failed or uncertain copy/read cannot clear it.
+        self._stage_claim: tuple[str, str] | None = None
         self._leases: dict[str, dict] = {}
         self._released: dict[str, tuple[str, float]] = {}
         self._finished: set[str] = set()
@@ -176,10 +304,32 @@ class LeaseRegistry:
             lease = self._leases.get(lease_id)
             if lease is None or lease["consumer"] != consumer or not drained:
                 raise ValueError("Only the owning, drained reader may release a lease")
+            if self._stage_claim == (lease_id, consumer):
+                raise ValueError("Producer stage is outstanding; request lease remains retained")
             self._finished.add(lease["request_id"])
             self._released[lease_id] = consumer, time.monotonic() + self.ack_retry_window
             self._prune_tombstones()
             del self._leases[lease_id]
+
+    def validate_source_claim(self, message: dict) -> None:
+        with self._lock:
+            lease = self._leases.get(message["lease_id"])
+            if lease is None or not message["consumer"] or lease["consumer"] != message["consumer"]:
+                raise ValueError("Stage requires the owning acquired lease")
+            validate_source_range(lease["manifest"], message)
+
+    def stage_position(self, lease_id, consumer):
+        with self._lock:
+            lease = self._leases[lease_id]
+            if lease["consumer"] != consumer:
+                raise ValueError("Stage reader does not own this lease")
+            return lease.get("last_stage_chunk")
+
+    def record_stage_release(self, lease_id, consumer, position):
+        with self._lock:
+            if self._stage_claim != (lease_id, consumer):
+                raise ValueError("Only the owning stage may advance its reader")
+            self._leases[lease_id]["last_stage_chunk"] = position
 
     def take_finished(self) -> set[str]:
         with self._lock:

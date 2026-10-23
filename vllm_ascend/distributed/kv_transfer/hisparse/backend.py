@@ -19,6 +19,7 @@ class AscendHiSparseBackend(HiSparseBackend):
     # The common shared pool currently exchanges CUDA IPC events. Private
     # per-rank pools preserve the same scheduler and transfer completion rules.
     supports_shared_host_pool = False
+    supports_speculative_group_prefetch = True
     stats_dtype = torch.int64
 
     def check_available(self) -> None:
@@ -77,6 +78,12 @@ class AscendHiSparseBackend(HiSparseBackend):
         from .binding import _bind_indexer_views, get_hisparse_indexer_specs
 
         _bind_indexer_views(kv_caches, get_hisparse_indexer_specs(kv_cache_config), forward_context)
+
+    def gather_resident_rows(self, source: torch.Tensor, destination: torch.Tensor, indices: torch.Tensor) -> None:
+        from vllm_ascend.ops.triton.hisparse_resident_gather import try_gather_resident_rows
+
+        if not try_gather_resident_rows(source, destination, indices):
+            super().gather_resident_rows(source, destination, indices)
 
     def create_stream(self, device: torch.device, *, generic: bool = False) -> Any:
         return torch.npu.Stream(device=device)

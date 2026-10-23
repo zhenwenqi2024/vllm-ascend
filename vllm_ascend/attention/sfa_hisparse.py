@@ -7,12 +7,59 @@ from functools import partial
 
 import torch
 import torch_npu
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import get_forward_context
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup, SparseMLAIndexGroupBuilder
 from vllm.v1.hisparse.runtime import HiSparsePrefillStagingPlan, build_hisparse_prefill_staging_plan
 from vllm.v1.worker.workspace import current_workspace_manager
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder
 from vllm_ascend.ops.hisparse_resident import begin_resident_forward, resident_topk_or_none
+from vllm_ascend.attention.hisparse_resident_state import resident_eager_transport_allowed
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+def _hisparse_uniform_mtp_group_size(
+    common_attn_metadata, metadata, vllm_config, uniform_backend: bool, draft_index: int | None,
+) -> int:
+    """Certify only the current CPU query layout for fixed MTP3 decode graphs.
+
+    Adaptive verification may change device boundaries independently of CPU
+    ones. Exclude it and non-uniform graph backends rather than transferring
+    a device scalar. This fact never includes sequence lengths or KV addresses.
+    """
+    spec = vllm_config.speculative_config
+    if (
+        not uniform_backend
+        or draft_index is not None
+        or vllm_config.model_config.enforce_eager
+        or vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
+        or spec is None
+        or spec.method != "mtp"
+        or spec.num_speculative_tokens != 3
+        or getattr(spec, "enable_adaptive_verification", False)
+        or getattr(spec, "parallel_drafting", False)
+        or metadata.num_prefills != 0
+        or common_attn_metadata.max_query_len != 4
+    ):
+        return 0
+    count = common_attn_metadata.num_reqs
+    rows = common_attn_metadata.num_actual_tokens
+    bounds = common_attn_metadata.query_start_loc_cpu
+    if (
+        rows not in (32, 64)
+        or count * 4 != rows
+        or metadata.num_input_tokens != rows
+        or not isinstance(bounds, torch.Tensor)
+        or bounds.device.type != "cpu"
+        or bounds.dtype not in (torch.int32, torch.int64)
+        or bounds.ndim != 1
+        or bounds.numel() < count + 1
+    ):
+        return 0
+    # The device check above is required: this reads an existing CPU mirror.
+    values = bounds[: count + 1].tolist()
+    return 4 if all(value == index * 4 for index, value in enumerate(values)) else 0
+
 
 # Bound the temporary D2D packing workspace independently of prefill length.
 _ATTENTION_CHUNK_ROWS = 32
@@ -27,6 +74,7 @@ class AscendHiSparsePrefillMetadata:
 class AscendHiSparseMetadata(AscendSFAMetadata):
     req_id_per_token: torch.Tensor | None = None
     num_reqs: int = 0
+    hisparse_uniform_query_group_size: int = 0
     prefill: AscendHiSparsePrefillMetadata | None = None
 
 
@@ -42,6 +90,11 @@ class AscendHiSparseMetadataBuilder(AscendSFAMetadataBuilder):
     def _build(self, common_attn_metadata, draft_index=None, pcp_context=None):
         metadata = super()._build(common_attn_metadata, draft_index, pcp_context)
         metadata.num_reqs = common_attn_metadata.num_reqs
+        metadata.hisparse_uniform_query_group_size = _hisparse_uniform_mtp_group_size(
+            common_attn_metadata, metadata, self.vllm_config,
+            self.get_cudagraph_support(self.vllm_config, self.kv_cache_spec) == AttentionCGSupport.UNIFORM_BATCH,
+            draft_index,
+        )
         rows = torch.arange(metadata.num_input_tokens, device=self.device, dtype=torch.int32)
         if draft_index not in self._request_row_buffers:
             self._request_row_buffers[draft_index] = torch.empty(
@@ -119,8 +172,10 @@ class AscendHiSparseImpl(AscendSFAImpl):
         self._packed_hisparse_attention = packed_sparse_flash_attention
         if self.vllm_config.model_config.enforce_eager and get_ascend_device_type() == AscendDeviceType.A5:
             self._packed_hisparse_attention = partial(packed_sparse_flash_attention, use_eager_compaction=True)
-        self._resident_hisparse_enabled = (
-            self.vllm_config.model_config.enforce_eager and get_ascend_device_type() == AscendDeviceType.A5
+        self._resident_hisparse_enabled = resident_eager_transport_allowed(
+            self.vllm_config.model_config.enforce_eager,
+            get_ascend_device_type() == AscendDeviceType.A5,
+            self.vllm_config.kv_transfer_config,
         )
 
     def _fused_preprocess_type(self):
@@ -195,6 +250,23 @@ class AscendHiSparseImpl(AscendSFAImpl):
             # graph capture, including dummy forwards without attention metadata.
             self._kv_workspace(hidden_states.dtype)
         self.index_group.prepare_for_batch(self.index_group_index, attn_metadata)
+        runtime = self.hisparse_cache.runtime
+        if runtime.is_group_leader and runtime.cache_ops is not None:
+            # Each captured graph owns this choice. Replay selection retains
+            # upstream uniform-query ownership; current row/state/KV values
+            # still arrive through the original group-local device buffers.
+            runtime.cache_ops.uniform_query_group_size = (
+                getattr(attn_metadata, "hisparse_uniform_query_group_size", 0)
+                if self.enable_sparse_sfa_c8
+                and (
+                    get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+                    or (
+                        get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
+                        and torch.npu.is_current_stream_capturing()
+                    )
+                )
+                else 0
+            )
         begin_resident_forward(
             self.index_group,
             self.index_group_index,
@@ -325,7 +397,7 @@ class AscendHiSparseImpl(AscendSFAImpl):
         key_length.fill_(view.shape[0])
         return query_end, key_length
 
-    def _attention_physical(self, query, query_rope, packed_cache, physical_topk, *, use_eager_compaction=False):
+    def _attention_physical(self, query, query_rope, packed_cache, physical_topk, *, use_eager_compaction=False, _c8_prepared=False):
         from vllm_ascend.ops.hisparse_direct import packed_sparse_flash_attention
 
         if self.enable_sparse_sfa_c8:
@@ -340,6 +412,7 @@ class AscendHiSparseImpl(AscendSFAImpl):
                 self.scale,
                 query_end,
                 key_length,
+                _prepared_indices=_c8_prepared,
             )
         positions, query_ends = self._direct_workspace()
         if query.shape[0] > query_ends.numel():
@@ -452,17 +525,25 @@ class AscendHiSparseImpl(AscendSFAImpl):
                 metadata,
             )
             selected = logical[num_decode:]
-            block_ids = selected.clamp_min(0).to(torch.int64) // metadata.block_size
-            request_tables = staged_table[req_ids.to(torch.int64)]
-            physical = torch.gather(request_tables, 1, block_ids) * metadata.block_size
-            physical = physical + selected.clamp_min(0) % metadata.block_size
-            physical = physical.masked_fill(selected < 0, -1).to(torch.int32)
+            physical = None
+            if self.enable_sparse_sfa_c8:
+                from vllm_ascend.ops.hisparse_c8_staged import prepare_staged_c8_indices
+
+                physical = prepare_staged_c8_indices(selected, staged_table, req_ids, staged, metadata.block_size)
+            prepared = physical is not None
+            if not prepared:
+                block_ids = selected.clamp_min(0).to(torch.int64) // metadata.block_size
+                request_tables = staged_table[req_ids.to(torch.int64)]
+                physical = torch.gather(request_tables, 1, block_ids) * metadata.block_size
+                physical = physical + selected.clamp_min(0) % metadata.block_size
+                physical = physical.masked_fill(selected < 0, -1).to(torch.int32)
             outputs.append(
                 self._attention_physical(
                     ql_nope[num_decode:],
                     q_pe[num_decode:] if q_pe is not None else None,
                     staged,
                     physical,
+                    _c8_prepared=prepared,
                 )
             )
         if not outputs:

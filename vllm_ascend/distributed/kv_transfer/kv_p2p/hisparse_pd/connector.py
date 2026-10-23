@@ -20,6 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 
 from .configuration import validate_transport_options
+from .execution import draft_state, draft_transfer_enabled, execution_contract, validate_draft_state, validate_execution
 from .protocol import VERSION, digest
 
 
@@ -43,8 +44,8 @@ class HiSparsePDConnector(KVConnectorBase_V1, SupportsHMA):
         extra = transfer.kv_connector_extra_config
         validate_transport_options(extra)
         parallel = vllm_config.parallel_config
-        if not vllm_config.model_config.enforce_eager or vllm_config.speculative_config is not None:
-            raise ValueError("HiSparse P/D currently requires eager execution without speculative decoding")
+        self.execution_mode = validate_execution(vllm_config)
+        self.transfer_draft = draft_transfer_enabled(vllm_config)
         if getattr(vllm_config, "lora_config", None) is not None:
             raise ValueError("HiSparse P/D does not yet support per-request LoRA identity")
         if any(
@@ -89,6 +90,7 @@ class HiSparsePDConnector(KVConnectorBase_V1, SupportsHMA):
                 "hf_config": hf,
                 "tp": parallel.tensor_parallel_size,
                 "version": VERSION,
+                "transfer_contract": execution_contract(vllm_config),
             }
         )
         self.exports = []
@@ -113,6 +115,8 @@ class HiSparsePDConnector(KVConnectorBase_V1, SupportsHMA):
         if type(sibling).__name__ != "HiSparseConnector":
             raise ValueError("HiSparse P/D requires the upstream HiSparseConnector sibling")
         self._composed = True
+        if self.connector_worker is not None:
+            self.connector_worker.common_worker = sibling.connector_worker
 
     def _require_composition(self):
         if not self._composed:
@@ -128,6 +132,7 @@ class HiSparsePDConnector(KVConnectorBase_V1, SupportsHMA):
             raise ValueError("Missing or incompatible HiSparse P/D ticket")
         tokens = request.prompt_token_ids or []
         count = ticket["num_tokens"]
+        validate_draft_state(ticket.get("draft_state"), count, self.transfer_draft)
         if (
             not isinstance(count, int)
             or not 0 < count <= len(tokens)
@@ -171,6 +176,8 @@ class HiSparsePDConnector(KVConnectorBase_V1, SupportsHMA):
             "num_tokens": count,
             "tokens_sha256": digest(list(request.prompt_token_ids[:count])),
         }
+        if self.transfer_draft:
+            ticket["draft_state"] = draft_state(count)
         self.exports.append(
             {
                 "request_id": request.request_id,

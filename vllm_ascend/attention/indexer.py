@@ -275,9 +275,23 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         the parallel layout of the tensors and the slot mapping; variants
         with a different cache layout should override it.
         """
+        if self.enable_sparse_li_c8 and hasattr(self.k_cache, "hisparse_block_stride"):
+            from vllm_ascend.distributed.kv_transfer.hisparse.binding import write_hisparse_indexer_c8
+
+            assert k_li_scale is not None
+            write_hisparse_indexer_c8(
+                self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT],
+                self.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT],
+                k_li, k_li_scale, slot_mapping, DeviceOperator.scatter_cache,
+            )
+            return
         indexer_k_cache = self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT]
         # float4_e2m1fn_x2 / float8_e8m0fnu are not supported by the scatter
         # kernel; view as uint8 (same 1-byte layout) for the cache write.
+        if k_li.dtype == torch.float8_e4m3fn:
+            # Preserve FP8 bits through the installed PA store's INT8 kernel.
+            indexer_k_cache = indexer_k_cache.view(torch.int8)
+            k_li = k_li.view(torch.int8)
         if k_li.dtype == torch_npu.float4_e2m1fn_x2:
             indexer_k_cache = indexer_k_cache.view(torch.uint8)
             k_li = k_li.view(torch.uint8)

@@ -9,7 +9,7 @@ import time
 import zmq
 
 from .configuration import DEFAULT_URMA_SWAP_MIB, configure_urma_staging, parse_urma_swap_mib
-from .protocol import LeaseRegistry
+from .protocol import STAGE_BYTES, LeaseRegistry, validate_wire
 
 # Failure-only process owners. Each reader serializes mutation with its lock;
 # entries disappear only after both transport teardown stages have succeeded.
@@ -22,8 +22,9 @@ class TransferCancelled(Exception):
 
 
 class LeaseServer:
-    def __init__(self, endpoint: str, registry: LeaseRegistry):
+    def __init__(self, endpoint: str, registry: LeaseRegistry, stage=None):
         self.registry = registry
+        self.stage = stage
         self.endpoint = endpoint
         self.stop = threading.Event()
         self.ready = threading.Event()
@@ -45,7 +46,13 @@ class LeaseServer:
                         continue
                     try:
                         message = socket.recv_json()
-                        if message["op"] == "acquire":
+                        validate_wire(message)
+                        if message["op"] == "lookup":
+                            lookup = getattr(self.registry, "lookup_wire", None)
+                            if lookup is None:
+                                raise ValueError("This producer does not publish shared snapshots")
+                            response = lookup(message)
+                        elif message["op"] == "acquire":
                             response = self.registry.acquire(
                                 message["lease_id"],
                                 message["consumer"],
@@ -58,9 +65,14 @@ class LeaseServer:
                                 message["lease_id"], message["consumer"], drained=message["drained"] is True
                             )
                             response = {"status": "released"}
+                        elif message["op"] in ("stage_prepare", "stage_release"):
+                            if self.stage is None:
+                                raise ValueError("Producer HBM staging is not available")
+                            method = self.stage.prepare if message["op"] == "stage_prepare" else self.stage.release
+                            response = method(message)
                         else:
                             raise ValueError("Unknown HiSparse P/D control operation")
-                    except (KeyError, TypeError, ValueError) as exc:
+                    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
                         response = {"status": "error", "error": str(exc)}
                     socket.send_json(response)
         except BaseException as exc:
@@ -103,13 +115,38 @@ def acquire(endpoint: str, message: dict, timeout_seconds: float, cancelled: thr
     raise TransferCancelled("HiSparse P/D request was cancelled before acquisition")
 
 
-class MemfabricReader:
-    """Borrow mapped aliases; never change ACL host registration ownership.
+def prepare_stage(endpoint, message, timeout_seconds):
+    """Poll a busy slot only. An uncertain prepare/reply keeps its source lease."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Producer stage remains owned; no timeout reuse is permitted")
+        response = rpc(endpoint, {"op": "stage_prepare", **message}, min(remaining, 5))
+        if response.get("status") == "ready":
+            validate_wire(response)
+            if (
+                response.get("chunk_id") != message["chunk_id"]
+                or response.get("length") != message["length"]
+                or type(response.get("generation")) is not int
+                or response["generation"] <= 0
+                or type(response.get("stage_address")) is not int
+                or response["stage_address"] <= 0
+                or response.get("capacity") != STAGE_BYTES
+            ):
+                raise ValueError("Producer stage response differs from the bounded request")
+            return response
+        if response.get("status") != "pending":
+            raise ValueError("Unexpected producer stage state")
+        time.sleep(min(remaining, 0.01))
 
-    The producer registers each whole source allocation's mapped alias once.
-    Consumer SOURCE destinations use raw host addresses and MemFabric's bounded
-    URMA staging; only consumer HBM allocations are registered. This combination
-    is awaiting hardware qualification, including payload and teardown checks.
+
+class MemfabricReader:
+    """Register only real HBM; Host SOURCE ranges never enter MemFabric.
+
+    Producer HBM staging is separate from MemFabric's own 16 MiB URMA scratch.
+    Consumer SOURCE destinations remain raw Host addresses. Whole real owners
+    remain retained until device drain plus both engine teardown stages pass.
     """
 
     def __init__(
@@ -172,7 +209,7 @@ class MemfabricReader:
                 self.session = global_memfabric_te.unique_id
                 self._teardown_methods()  # Reject incomplete APIs before registration.
                 for (address, size), role in self.regions.items():
-                    if self.producer or role != "hisparse_source":
+                    if role != "hisparse_source":
                         if self.engine.register_memory(address, size) != 0:
                             raise RuntimeError(
                                 f"MemFabric cannot register {role} allocation; no alternate source address is attempted"

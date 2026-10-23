@@ -12,6 +12,9 @@ _LATENT_DIM = 512
 _ROPE_DIM = 64
 _ROW_WIDTH = _LATENT_DIM + _ROPE_DIM
 _MAX_TOPK = 32768
+# Keep larger selections on the existing path until their vector scratch and
+# latency have been verified on hardware as well.
+_MAX_FUSED_COMPACT_TOPK = 2048
 _MAX_QUERIES = 1048576
 _INT64_MAX = (1 << 63) - 1
 _INT32_MAX = (1 << 31) - 1
@@ -82,8 +85,9 @@ def compact_physical_indices(
     """Keep valid indices in their original order, including duplicates.
 
     Bounds are checked on device. Out-of-range entries are excluded like -1,
-    so no malformed physical index can address another allocation. Unique
-    FP32 position keys preserve order without integer ArgSort on AiCPU.
+    so no malformed physical index can address another allocation. The NPU
+    prefix-scan path preserves order and duplicates without sorting. Other
+    devices and larger selections retain the FP32 position-key implementation.
     """
     if indices.ndim != 2 or indices.dtype != torch.int32 or indices.stride(1) != 1:
         raise ValueError("HiSparse physical indices must be int32 [queries, top_k] with contiguous columns")
@@ -92,6 +96,31 @@ def compact_physical_indices(
         raise ValueError("HiSparse direct attention requires top_k in [128, 32768], divisible by 128")
     if positions.shape != (1, topk) or positions.dtype != torch.float32 or positions.device != indices.device:
         raise ValueError("HiSparse position keys must be FP32 [1, top_k] on the indices device")
+    use_fused = False
+    if indices.device.type == "npu" and topk <= _MAX_FUSED_COMPACT_TOPK:
+        from vllm_ascend.device import HardwareCapability, get_current_hardware_profile
+
+        use_fused = get_current_hardware_profile().supports(HardwareCapability.HISPARSE_FUSED_INDEX_OPS)
+    if use_fused:
+        from vllm.triton_utils import triton
+
+        from vllm_ascend.ops.triton.hisparse import compact_physical_indices_kernel
+
+        rows = indices.shape[0]
+        compacted = torch.empty((rows, topk), dtype=torch.int32, device=indices.device)
+        counts = torch.empty((rows,), dtype=torch.int32, device=indices.device)
+        if rows:
+            compact_physical_indices_kernel[(rows,)](
+                indices,
+                compacted,
+                counts,
+                INPUT_STRIDE=indices.stride(0),
+                TOP_K=topk,
+                CAPACITY=capacity,
+                BLOCK=triton.next_power_of_2(topk),
+                multibuffer=False,
+            )
+        return compacted, counts
     valid = (indices >= 0) & (indices.to(torch.int64) < capacity)
     keys = positions + (~valid).to(torch.float32) * topk
     order = keys.sort(dim=-1).indices

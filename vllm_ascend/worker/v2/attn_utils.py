@@ -324,8 +324,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 continue
             cache_sparse_li_c8 = get_ascend_config().is_sparse_li_c8_layer(layer_name)
             cache_sparse_li_c4 = get_ascend_config().is_sparse_li_c4_layer(layer_name)
-            if vllm_config.attention_config.hisparse_config is not None and (cache_sparse_li_c8 or cache_sparse_li_c4):
-                raise ValueError("Ascend HiSparse currently requires an unquantized indexer KV cache")
+            if vllm_config.attention_config.hisparse_config is not None and cache_sparse_li_c4:
+                raise ValueError("Ascend HiSparse indexer C4 is not supported")
             head_dim = vllm_config.model_config.hf_text_config.index_head_dim
             kv_cache_spec[layer_name] = AscendSFAIndexerCacheSpec(
                 block_size=vllm_config.cache_config.block_size,
@@ -337,7 +337,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 if cache_sparse_li_c8
                 else vllm_config.model_config.dtype,
                 cache_dtype_str=(
-                    vllm_config.cache_config.cache_dtype
+                    vllm_config.attention_config.indexer_kv_dtype
                     if (cache_sparse_li_c8 or cache_sparse_li_c4)
                     else None
                     if use_turboquant

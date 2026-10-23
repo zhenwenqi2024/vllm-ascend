@@ -158,6 +158,9 @@ class HardwareCapability(Enum):
     SWIGLU_OAI_MX_QUANT = auto()
     # Use the Triton batch-memcpy kernel for Mamba state copies.
     TRITON_BATCH_MEMCPY = auto()
+    # Bounded HiSparse scan/scatter compaction and fused hot-LRU kernels.
+    # Other stacks retain their Torch/tiled paths pending repeated-launch validation.
+    HISPARSE_FUSED_INDEX_OPS = auto()
     # Native TurboQuant 4-bit non-causal MLA cache and SFA kernels.
     TURBOQUANT_4BIT_NC_CACHE = auto()
     # Honor MLAPO enablement on any pipeline role; other profiles limit it to decode consumers.
@@ -392,6 +395,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
                     HardwareCapability.STANDARD_WORKER_PATCHES,
                     HardwareCapability.SWIGLU_OAI_MX_QUANT,
                     HardwareCapability.TRITON_BATCH_MEMCPY,
+                    HardwareCapability.HISPARSE_FUSED_INDEX_OPS,
                     HardwareCapability.UNRESTRICTED_MLAPO,
                 }
             ),

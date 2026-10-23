@@ -24,6 +24,9 @@ from vllm_ascend.ops.triton.hisparse import (
     pack_attention_rows_kernel,
     partition_residency_kernel,
     prepare_residency_kernel,
+    protect_and_update_lru_kernel,
+    protected_lru_tile_prefix_kernel,
+    protected_lru_partition_kernel,
     protect_residency_kernel,
     residency_stats_kernel,
     scatter_packed_kv_kernel,
@@ -32,6 +35,10 @@ from vllm_ascend.ops.triton.hisparse import (
 
 _ACL_HOST_REGISTER_MAPPED = 0
 _ACL_HAC_AIV = 3
+
+
+# One int64 count per independent32-byte transfer line.
+LRU_TILE_COUNTER_STRIDE = 4
 
 
 class MappedHostTensor:
@@ -197,8 +204,12 @@ class HiSparseNPUOps:
     """Runtime-owned implementations of the upstream HiSparse operator ABI."""
 
     def __init__(self, host_mapping: MappedHostTensor, workspace: ResolverWorkspace | None = None) -> None:
+        from vllm_ascend.device import HardwareCapability, get_current_hardware_profile
+
         self.host_mapping = host_mapping
         self.workspace = workspace
+        self.uniform_query_group_size = 0
+        self.use_fused_index_ops = get_current_hardware_profile().supports(HardwareCapability.HISPARSE_FUSED_INDEX_OPS)
 
     def hisparse_resolve_residency(
         self,
@@ -352,7 +363,27 @@ class HiSparseNPUOps:
             multibuffer=False,
         )
         torch.sort(row_keys, dim=-1, out=(sorted_rows, row_sort_indices))
-        torch.sort(cache_keys, dim=-1, out=(sorted_cache, workspace.cache_sort_indices[:rows]))
+        # The metadata builder certifies a fixed four-query request layout.
+        # Only group leaders are read by classification. Keep the full scratch
+        # allocation and original first-row addressing for every other stage.
+        if (
+            self.uniform_query_group_size == 4
+            and rows in (32, 64)
+            and topk == 2048
+            and hot_size == 10240
+            and request_ids is not None
+        ):
+            torch.sort(
+                cache_keys[::4], dim=-1,
+                out=(sorted_cache[::4], workspace.cache_sort_indices[:rows:4]),
+            )
+        else:
+            torch.sort(cache_keys, dim=-1, out=(sorted_cache, workspace.cache_sort_indices[:rows]))
+        use_protected = self.use_fused_index_ops and hot_cache.dtype == torch.float8_e4m3fn and hot_cache.shape[-1] == 656
+        if use_protected:
+            # Existing group-owned scratch; refreshed for every resolver call
+            # on the same copy stream before classification publishes hits.
+            workspace.protected[:rows].zero_()
         classify_residency_kernel[(rows,)](
             row_keys,
             sorted_rows,
@@ -368,44 +399,88 @@ class HiSparseNPUOps:
             HOT_BLOCK=hot_cache.size(1),
             TABLE_STRIDE=hot_block_table.stride(0),
             BK=triton.next_power_of_2(topk),
+            protected=workspace.protected,
+            USE_PROTECTED=use_protected,
             multibuffer=False,
         )
-        protect_residency_kernel[(rows, triton.cdiv(hot_size, 256))](
-            sorted_rows,
-            workspace.metadata,
-            device_global_indices,
-            lru_slots,
-            workspace.protected,
-            TOP_K=topk,
-            HOT_SIZE=hot_size,
-            STATE_ROWS=device_global_indices.size(0),
-            BLOCK=256,
-            multibuffer=False,
-        )
-        torch.cumsum(workspace.protected[:rows], dim=-1, dtype=torch.int32, out=workspace.hit_prefix[:rows])
-        partition_residency_kernel[(rows, triton.cdiv(hot_size, 256))](
-            workspace.metadata,
-            workspace.protected,
-            workspace.hit_prefix,
-            workspace.row_stats,
-            lru_slots,
-            workspace.lru_temp,
-            workspace.errors,
-            HOT_SIZE=hot_size,
-            MAX_UNION=max_union_rows,
-            STATE_ROWS=device_global_indices.size(0),
-            BLOCK=256,
-            multibuffer=False,
-        )
-        update_lru_kernel[(rows, triton.cdiv(hot_size, 256))](
-            workspace.metadata,
-            workspace.lru_temp,
-            lru_slots,
-            workspace.errors,
-            HOT_SIZE=hot_size,
-            BLOCK=256,
-            multibuffer=False,
-        )
+        if use_protected and hot_size % LRU_TILE_COUNTER_STRIDE == 0:
+            # Per-group copy-stream scratch; cache_keys has been consumed by
+            # sort/classification and is rebuilt at the next invocation.
+            tiles = triton.cdiv(hot_size, 256)
+            protected_lru_tile_prefix_kernel[(rows, tiles)](
+                workspace.protected, workspace.metadata, workspace.row_stats,
+                lru_slots, workspace.hit_prefix, cache_keys,
+                HOT_SIZE=hot_size, STATE_ROWS=device_global_indices.size(0),
+                BLOCK=256, COUNT_STRIDE=LRU_TILE_COUNTER_STRIDE, multibuffer=False,
+            )
+            protected_lru_partition_kernel[(rows, tiles)](
+                workspace.protected, workspace.metadata, workspace.row_stats,
+                lru_slots, workspace.hit_prefix, cache_keys, workspace.lru_temp,
+                workspace.errors, HOT_SIZE=hot_size, MAX_UNION=max_union_rows,
+                STATE_ROWS=device_global_indices.size(0), BLOCK=256,
+                TILES=tiles, COUNT_BLOCK=triton.next_power_of_2(tiles),
+                COUNT_STRIDE=LRU_TILE_COUNTER_STRIDE, multibuffer=False,
+            )
+            update_lru_kernel[(rows, tiles)](
+                workspace.metadata, workspace.lru_temp, lru_slots,
+                workspace.errors, HOT_SIZE=hot_size, BLOCK=256,
+                multibuffer=False,
+            )
+        elif self.use_fused_index_ops:
+            protect_and_update_lru_kernel[(rows,)](
+                sorted_rows,
+                workspace.metadata,
+                device_global_indices,
+                lru_slots,
+                workspace.row_stats,
+                workspace.lru_temp,
+                workspace.errors,
+                TOP_K=topk,
+                HOT_SIZE=hot_size,
+                MAX_UNION=max_union_rows,
+                STATE_ROWS=device_global_indices.size(0),
+                BLOCK=256,
+                protected=workspace.protected,
+                USE_PROTECTED=use_protected,
+                multibuffer=False,
+            )
+        else:
+            protect_residency_kernel[(rows, triton.cdiv(hot_size, 256))](
+                sorted_rows,
+                workspace.metadata,
+                device_global_indices,
+                lru_slots,
+                workspace.protected,
+                TOP_K=topk,
+                HOT_SIZE=hot_size,
+                STATE_ROWS=device_global_indices.size(0),
+                BLOCK=256,
+                multibuffer=False,
+            )
+            torch.cumsum(workspace.protected[:rows], dim=-1, dtype=torch.int32, out=workspace.hit_prefix[:rows])
+            partition_residency_kernel[(rows, triton.cdiv(hot_size, 256))](
+                workspace.metadata,
+                workspace.protected,
+                workspace.hit_prefix,
+                workspace.row_stats,
+                lru_slots,
+                workspace.lru_temp,
+                workspace.errors,
+                HOT_SIZE=hot_size,
+                MAX_UNION=max_union_rows,
+                STATE_ROWS=device_global_indices.size(0),
+                BLOCK=256,
+                multibuffer=False,
+            )
+            update_lru_kernel[(rows, triton.cdiv(hot_size, 256))](
+                workspace.metadata,
+                workspace.lru_temp,
+                lru_slots,
+                workspace.errors,
+                HOT_SIZE=hot_size,
+                BLOCK=256,
+                multibuffer=False,
+            )
         assign_residency_kernel[(rows,)](
             row_keys,
             workspace.metadata,

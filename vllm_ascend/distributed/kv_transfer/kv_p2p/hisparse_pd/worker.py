@@ -10,10 +10,30 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
+from .acl_stage import ACLStageBuffer
 from .configuration import validate_transport_options
 from .layout import build_layouts
-from .protocol import VERSION, LayerLayout, LeaseRegistry, encode_layouts, plan_reads
-from .transport import LeaseServer, MemfabricReader, TransferCancelled, acquire, rpc
+from .execution import (CacheBindingGuard, assert_transfer_boundary, draft_transfer_enabled, execution_contract, export_mirror_ready, validate_completion, validate_draft_state)
+from .protocol import (
+    SOURCE_TRANSPORT,
+    STAGE_BYTES,
+    VERSION,
+    LayerLayout,
+    LeaseRegistry,
+    coalesce_transfers,
+    encode_layouts,
+    plan_reads,
+    validate_wire,
+)
+from .stage import StageSlot
+from .transport import (
+    LeaseServer,
+    MemfabricReader,
+    TransferCancelled,
+    acquire,
+    prepare_stage,
+    rpc,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +67,9 @@ class HiSparsePDWorker:
         self.registry = LeaseRegistry()
         self.server = None
         self.reader = None
+        self.stage = None
+        self.stage_buffer = None
+        self.stage_sources = {}
         self.layouts = []
         self.owners = []
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hisparse-pd-read")
@@ -54,33 +77,102 @@ class HiSparsePDWorker:
         self.futures = {}
         self.closed = False
         self.closing = False
+        self._registered_caches = None
+        self._binding_guard = None
+        self._export_generation = 0
+        self.include_draft = draft_transfer_enabled(config)
+        self.transfer_contract = execution_contract(config)
+        self.common_worker = None
 
     def register(self, kv_caches):
         if self.reader is not None or self.closing or self.closed:
             raise RuntimeError("HiSparse P/D caches can only be registered once")
+        self._registered_caches = kv_caches
         context = self.config.compilation_config.static_forward_context
         self.layouts, regions, self.owners = build_layouts(
-            kv_caches, self.kv_cache_config, context, producer=self.producer
+            kv_caches, self.kv_cache_config, context, producer=self.producer, include_draft=self.include_draft
         )
-        self.reader = MemfabricReader(
-            producer=self.producer,
-            device=self.device,
-            host=self.host,
-            protocol=self.protocol,
-            regions=regions,
-            owners=self.owners,
-            urma_swap_space_mib=self.urma_swap_space_mib,
-        )
+        self._binding_guard = CacheBindingGuard(self.layouts, regions, self.owners)
         try:
+            if self.producer:
+                self._create_stage(kv_caches, regions)
+            else:
+                # The one receive executor serializes every bounded SOURCE read.
+                # Retain this owner before allocation or registration can fail.
+                self.stage_buffer = ACLStageBuffer(self.device, torch.npu.set_device)
+                self.owners.append(self.stage_buffer)
+                self.stage_buffer.allocate()
+                regions[self.stage_buffer.address, STAGE_BYTES] = "hisparse_receive_stage"
+            self.reader = MemfabricReader(
+                producer=self.producer,
+                device=self.device,
+                host=self.host,
+                protocol=self.protocol,
+                regions=regions,
+                owners=self.owners,
+                urma_swap_space_mib=self.urma_swap_space_mib,
+            )
             self.reader.initialize()
             if self.producer:
-                self.server = LeaseServer(f"tcp://{self.host}:{self.port}", self.registry)
+                self.server = LeaseServer(f"tcp://{self.host}:{self.port}", self.registry, self.stage)
         except BaseException as initialize_error:
             try:
                 self.close()
             except BaseException as cleanup_error:
                 raise initialize_error from cleanup_error
             raise
+
+    def _create_stage(self, kv_caches, regions):
+        # Separate ACL allocation, outside the Torch caching allocator. Logical
+        # capacity/requested size are 16 MiB; the queried owner range may differ.
+        self.stage_buffer = ACLStageBuffer(self.device, torch.npu.set_device)
+        self.owners.append(self.stage_buffer)  # Retain before allocate/query can fail.
+        self.stage_buffer.allocate()
+        for layout in self.layouts:
+            if layout.role == "hisparse_source":
+                cache = kv_caches[layout.name]
+                if isinstance(cache, tuple):
+                    (cache,) = cache
+                self.stage_sources[layout.name] = cache
+        regions[self.stage_buffer.address, STAGE_BYTES] = "hisparse_stage"
+        self.stage = StageSlot(
+            self.registry,
+            self.stage_buffer.address,
+            STAGE_BYTES,
+            self._copy_source_to_stage,
+        )
+
+    def _copy_source_to_stage(self, layer, address, length):
+        """ACL restores the worker context and completes synchronous H2D."""
+        source = self.stage_sources[layer]
+        offset = address - source.data_ptr()
+        if not offset >= 0 or offset + length > source.numel() * source.element_size():
+            raise ValueError("Producer stage source is outside its retained Host layer")
+        self.stage_buffer.copy_from_host(address, length)
+
+    def _validate_transfer_bindings(self):
+        assert_transfer_boundary(
+            capturing=torch.npu.is_current_stream_capturing(),
+            closing=self.closing, closed=self.closed,
+        )
+        if self._binding_guard is None or self._registered_caches is None:
+            raise RuntimeError("HiSparse P/D cache binding is unavailable")
+        current = build_layouts(
+            self._registered_caches, self.kv_cache_config,
+            self.config.compilation_config.static_forward_context,
+            producer=self.producer, include_draft=self.include_draft,
+        )
+        self._binding_guard.validate(*current)
+
+    def _prepare_export(self):
+        self._validate_transfer_bindings()
+        # Common HiSparse finish_forward enqueues graph-era Host mirrors; its
+        # restore/import events and TP completion remain upstream-owned. Keep
+        # the conservative all-stream drain at this rare handoff boundary until
+        # scoped export fences have separate model-level evidence.
+        torch.npu.synchronize(self.device)
+        self._export_generation += 1
+        return {"contract": self.transfer_contract, "generation": self._export_generation}
 
     def queue(self, metadata):
         if self.closed or self.closing:
@@ -92,13 +184,25 @@ class HiSparsePDWorker:
             raise RuntimeError("HiSparse P/D worker is closing or has shut down")
         # Called after all MultiConnector start_load/finish_forward hooks, so
         # the existing HiSparse worker has already submitted host mirrors and
-        # host block copies. Eager-only: drain these before exporting pointers.
+        # host block copies. Publication must follow their actual completion.
+        deferred = []
         for metadata in self.pending:
-            if metadata.exports:
-                torch.npu.synchronize(self.device)
+            # Keep upstream's request/block lease alive until the next common
+            # start_step has flushed the previous proposal's draft row mirrors.
+            # Never flush another step's mapping or publish speculative lookahead.
+            if metadata.exports and not export_mirror_ready(self.common_worker, self.include_draft):
+                if metadata.imports:
+                    raise RuntimeError("A producer export must not also contain an import")
+                deferred.append(metadata)
+                continue
+            completion = self._prepare_export() if metadata.exports else None
             for export in metadata.exports:
                 manifest = {
                     "version": VERSION,
+                    "completion": completion,
+                    "source_transport": SOURCE_TRANSPORT,
+                    "stage_capacity": STAGE_BYTES,
+                    "stage_address": self.stage_buffer.address,
                     "identity": self.identity,
                     "rank": self.rank,
                     "world_size": self.world_size,
@@ -115,7 +219,7 @@ class HiSparsePDWorker:
                 cancelled = threading.Event()
                 future = self.executor.submit(self._load, job, cancelled)
                 self.futures[request_id] = future, cancelled
-        self.pending.clear()
+        self.pending = deferred
         received, failed = set(), set()
         for request_id, (future, cancelled) in list(self.futures.items()):
             if request_id in cancelled_ids:
@@ -138,10 +242,13 @@ class HiSparsePDWorker:
             raise
 
     def _load_request(self, job, cancelled):
+        self._validate_transfer_bindings()
         endpoint = f"tcp://{self.peer_host}:{self.peer_port}"
         ticket = job["ticket"]
         consumer = f"{job['request_id']}:{self.rank}:{uuid.uuid4().hex}"
         message = {
+            "version": VERSION,
+            "source_transport": SOURCE_TRANSPORT,
             "lease_id": ticket["lease_id"],
             "consumer": consumer,
             "identity": self.identity,
@@ -150,8 +257,18 @@ class HiSparsePDWorker:
         }
         try:
             manifest = acquire(endpoint, message, self.timeout, cancelled)
+            validate_wire(manifest)
+            validate_completion(manifest.get("completion"), self.transfer_contract)
+            validate_draft_state(ticket.get("draft_state"), ticket["num_tokens"], self.include_draft)
             if manifest["version"] != VERSION or manifest["ticket"] != ticket:
                 raise ValueError("Producer ticket differs from the requested prefix")
+            if type(manifest.get("stage_capacity")) is not int or manifest["stage_capacity"] != STAGE_BYTES:
+                raise ValueError("Producer HBM stage capacity differs")
+            if (
+                type(manifest.get("stage_address")) is not int
+                or not 0 < manifest["stage_address"] < 2**64 - STAGE_BYTES
+            ):
+                raise ValueError("Producer HBM stage address is invalid")
             remote = [LayerLayout(**item) for item in manifest["layers"]]
             source_blocks = {int(key): value for key, value in manifest["blocks"].items()}
             local_blocks = {int(key): value for key, value in job["blocks"].items()}
@@ -163,23 +280,55 @@ class HiSparsePDWorker:
                 job["start_token"],
                 ticket["num_tokens"],
                 include_host=not self.kv_cache_config.hisparse_shared_host_pool or self.rank == 0,
+                with_roles=True,
             )
+            descriptors = coalesce_transfers(descriptors)
         except TransferCancelled:
             return False  # No acquire was sent and no DMA could have started.
         except (TimeoutError, ValueError, KeyError, TypeError) as error:
             # Even a lost acquire reply may have claimed the producer lease.
             # No read has been submitted yet, so releasing that claim is safe.
             try:
-                rpc(endpoint, {"op": "release", **message, "drained": True}, min(self.timeout, 5))
+                rpc(
+                    endpoint,
+                    {"op": "release", **message, "drained": True},
+                    min(self.timeout, 5),
+                )
             except (TimeoutError, ValueError):
-                logger.warning("HiSparse P/D pre-read failure left an unconfirmed producer lease: %s", error)
+                logger.warning(
+                    "HiSparse P/D pre-read failure left an unconfirmed producer lease: %s",
+                    error,
+                )
             return False
         # Each call is synchronous. Only a successful return proves that its
         # remote reads no longer own the source. Do not ACK an uncertain error.
-        for first in range(0, len(descriptors), self.max_descriptors):
+        indexer_reads = []
+        for index, (destination, source, length, role, layer) in enumerate(descriptors):
             if cancelled.is_set():
                 break
-            self.reader.read(manifest["session"], descriptors[first : first + self.max_descriptors])
+            if role == "hisparse_source":
+                if indexer_reads:
+                    self.reader.read(manifest["session"], indexer_reads)
+                    indexer_reads = []
+                self._read_staged_source(
+                    endpoint,
+                    message,
+                    manifest["session"],
+                    manifest["stage_address"],
+                    index,
+                    layer[0],
+                    destination,
+                    source,
+                    length,
+                    cancelled,
+                )
+            else:
+                indexer_reads.append((destination, source, length))
+                if len(indexer_reads) == self.max_descriptors:
+                    self.reader.read(manifest["session"], indexer_reads)
+                    indexer_reads = []
+        if indexer_reads and not cancelled.is_set():
+            self.reader.read(manifest["session"], indexer_reads)
         torch.npu.synchronize(self.device)
         try:
             response = rpc(endpoint, {"op": "release", **message, "drained": True}, self.timeout)
@@ -192,6 +341,58 @@ class HiSparsePDWorker:
             logger.warning("HiSparse P/D completed its reads but could not confirm producer lease release")
             return False
         return not cancelled.is_set()
+
+    def _read_staged_source(
+        self,
+        endpoint,
+        message,
+        session,
+        stage_address,
+        index,
+        layer,
+        destination,
+        source,
+        length,
+        cancelled=None,
+    ):
+        for offset in range(0, length, STAGE_BYTES):
+            if cancelled is not None and cancelled.is_set():
+                return  # Every preceding chunk has an explicit drained release.
+            count = min(length - offset, STAGE_BYTES)
+            chunk = {
+                **message,
+                "chunk_id": f"{index}:{offset}",
+                "layer": layer,
+                "source": source + offset,
+                "length": count,
+            }
+            # From this first prepare onwards an uncertain reply may own the P
+            # stage. Errors must never enter the pre-read source-release path.
+            prepared = prepare_stage(endpoint, chunk, self.timeout)
+            if prepared["stage_address"] != stage_address:
+                raise ValueError("Prepared stage differs from the acquired producer HBM allocation")
+            if self.stage_buffer is None:
+                raise RuntimeError("Consumer has no registered receive stage")
+            self.reader.read(session, [(self.stage_buffer.address, prepared["stage_address"], count)])
+            # Both the registered D2D read and this local D2H must succeed before
+            # the source slot can be released. Errors retain both real owners.
+            self.stage_buffer.copy_to_host(destination + offset, count)
+            response = rpc(
+                endpoint,
+                {
+                    "op": "stage_release",
+                    **chunk,
+                    "generation": prepared["generation"],
+                    "drained": True,
+                },
+                self.timeout,
+            )
+            if (
+                response.get("status") != "stage_released"
+                or response.get("chunk_id") != chunk["chunk_id"]
+                or response.get("generation") != prepared["generation"]
+            ):
+                raise ValueError("Producer stage release is unconfirmed; source lease remains retained")
 
     def close(self):
         if self.closed:
@@ -215,10 +416,16 @@ class HiSparsePDWorker:
             # Failed admission leaves the ACK server operational for active
             # remote readers. Only a drained ACK can release their source lease.
             self.registry.begin_shutdown()
+            if self.stage is not None:
+                self.stage.begin_shutdown()
             if self.server is not None:
                 self.server.close()
             if self.reader is not None:
                 self.reader.close(device_drained=True)
+            if self.stage_buffer is not None:
+                # Includes failed registration: only complete transport teardown
+                # proves that the raw allocation is no longer remotely owned.
+                self.stage_buffer.close()
         except BaseException as cleanup_error:
             _retained_workers[id(self)] = self
             if transfer_error is not None:
@@ -226,6 +433,11 @@ class HiSparsePDWorker:
             raise
         self.closed = True
         self.owners.clear()
+        self._registered_caches = None
+        self._binding_guard = None
+        self.stage_sources.clear()
+        self.stage = None
+        self.stage_buffer = None
         self.pending.clear()
         self.futures.clear()
         _retained_workers.pop(id(self), None)

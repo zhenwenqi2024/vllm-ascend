@@ -62,3 +62,15 @@ class ResidentForwardState:
         if self.route is not True or self.result is None:
             raise RuntimeError("Resident mapping is unavailable for this forward")
         return self.result
+
+
+def resident_eager_transport_allowed(enforce_eager, is_a5, transfer):
+    """Reuse resident mappings only for the qualified direct connector.
+
+    Composite connectors can supply separate current metadata views per layer.
+    Their normal resolver remains the owner until shared views are qualified.
+    This does not alter resident storage, Host import, or graph execution.
+    """
+    return bool(enforce_eager and is_a5 and (
+        transfer is None or transfer.kv_connector == "HiSparseConnector"
+    ))

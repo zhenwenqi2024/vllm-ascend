@@ -51,7 +51,7 @@ def _translate(
 
 
 @triton.jit
-def _lookup(sorted_keys, value, active, N: tl.constexpr):
+def _lookup_with_position(sorted_keys, value, active, N: tl.constexpr):
     # Keys pack (nonnegative host row, original position). Lower-bound also
     # identifies the first reference when a query contains duplicate indices.
     low = tl.full(value.shape, 0, tl.int32)
@@ -65,7 +65,13 @@ def _lookup(sorted_keys, value, active, N: tl.constexpr):
         high = tl.where(left, high, middle)
     key = tl.load(sorted_keys + low, mask=active & (low < N), other=9223372036854775807)
     found = active & (low < N) & ((key >> 32) == value)
-    return (key & 4294967295).to(tl.int32), found
+    return (key & 4294967295).to(tl.int32), found, low
+
+
+@triton.jit
+def _lookup(sorted_keys, value, active, N: tl.constexpr):
+    slot, found, _ = _lookup_with_position(sorted_keys, value, active, N)
+    return slot, found
 
 
 @triton.jit
@@ -183,6 +189,8 @@ def classify_residency_kernel(
     HOT_BLOCK: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     BK: tl.constexpr,
+    protected=None,
+    USE_PROTECTED: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     request = tl.load(metadata + row * 8)
@@ -191,7 +199,27 @@ def classify_residency_kernel(
     key = tl.load(row_keys + row * TOP_K + i, mask=i < TOP_K, other=9223372036854775807)
     host = (key >> 32).to(tl.int32)
     active = (i < TOP_K) & (host != 2147483647)
-    slot, hit = _lookup(sorted_cache + first * HOT_SIZE, host, active, HOT_SIZE)
+    if USE_PROTECTED:
+        slot, hit, position = _lookup_with_position(sorted_cache + first * HOT_SIZE, host, active, HOT_SIZE)
+        # Multiple proposal rows may select the same slot. Atomic max gives
+        # the exact set union without depending on their launch order.
+        tl.atomic_max(protected + first.to(tl.int64) * HOT_SIZE + slot, 1, mask=hit, sem="relaxed")
+        # Scalar loop-carried progress avoids the Ascend compiler failure
+        # on vector while iter_args. Sorted equal IDs form a contiguous range.
+        offset = 1
+        remaining = tl.sum(hit.to(tl.int32), 0)
+        while remaining > 0:
+            cursor = position + offset
+            duplicate_key = tl.load(sorted_cache + first * HOT_SIZE + cursor,
+                mask=hit & (cursor < HOT_SIZE), other=9223372036854775807)
+            duplicate = hit & (cursor < HOT_SIZE) & ((duplicate_key >> 32).to(tl.int32) == host)
+            other_slot = (duplicate_key & 4294967295).to(tl.int32)
+            tl.atomic_max(protected + first.to(tl.int64) * HOT_SIZE + other_slot, 1,
+                mask=duplicate, sem="relaxed")
+            remaining = tl.sum(duplicate.to(tl.int32), 0)
+            offset += 1
+    else:
+        slot, hit = _lookup(sorted_cache + first * HOT_SIZE, host, active, HOT_SIZE)
     reference = tl.full((BK,), 2147483647, tl.int32)
     for query in range(first, row + 1):
         pos, found = _lookup(sorted_rows + query * TOP_K, host, active, TOP_K)
@@ -307,6 +335,160 @@ def update_lru_kernel(metadata, temp_lru, lru, errors, HOT_SIZE: tl.constexpr, B
 
 
 @triton.jit
+def protected_lru_tile_prefix_kernel(
+    protected, metadata, row_stats, lru, hit_prefix, tile_counts,
+    HOT_SIZE: tl.constexpr, STATE_ROWS: tl.constexpr, BLOCK: tl.constexpr,
+    COUNT_STRIDE: tl.constexpr = 4,
+):
+    first = tl.program_id(0)
+    tile = tl.program_id(1)
+    leader = tl.load(metadata + first * 8 + 2)
+    p = tile * BLOCK + tl.arange(0, BLOCK)
+    hit = tl.full((BLOCK,), False, tl.int1)
+    if first == leader:
+        state = tl.load(metadata + first * 8 + 1)
+        end = tl.load(metadata + first * 8 + 3)
+        references = 0
+        for row in range(first, end):
+            references |= (tl.load(row_stats + row * 4) + tl.load(row_stats + row * 4 + 1) > 0).to(tl.int32)
+        if references > 0:
+            valid = (state >= 0) & (state < STATE_ROWS) & (p < HOT_SIZE)
+            slot = tl.load(lru + state.to(tl.int64) * HOT_SIZE + p, mask=valid, other=-1).to(tl.int32)
+            hit = tl.load(protected + first.to(tl.int64) * HOT_SIZE + slot,
+                mask=valid & (slot >= 0) & (slot < HOT_SIZE), other=0) != 0
+    prefix = tl.cumsum(hit.to(tl.int32), 0)
+    tl.store(hit_prefix + first.to(tl.int64) * HOT_SIZE + p, prefix, mask=p < HOT_SIZE)
+    # cache_keys is no longer read after classification. Each tile owns one
+    # scalar here; its old packed keys are rebuilt by the next resolver call.
+    tl.store(tile_counts + first.to(tl.int64) * HOT_SIZE + tile * COUNT_STRIDE, tl.sum(hit.to(tl.int32), 0))
+
+
+@triton.jit
+def protected_lru_partition_kernel(
+    protected, metadata, row_stats, lru, hit_prefix, tile_counts, temp_lru, errors,
+    HOT_SIZE: tl.constexpr, MAX_UNION: tl.constexpr, STATE_ROWS: tl.constexpr,
+    BLOCK: tl.constexpr, TILES: tl.constexpr, COUNT_BLOCK: tl.constexpr,
+    COUNT_STRIDE: tl.constexpr = 4,
+):
+    first = tl.program_id(0)
+    tile = tl.program_id(1)
+    leader = tl.load(metadata + first * 8 + 2)
+    if first == leader:
+        state = tl.load(metadata + first * 8 + 1)
+        end = tl.load(metadata + first * 8 + 3)
+        t = tl.arange(0, COUNT_BLOCK)
+        counts = tl.load(tile_counts + first.to(tl.int64) * HOT_SIZE + t * COUNT_STRIDE, mask=t < TILES, other=0).to(tl.int32)
+        hits = tl.sum(counts, 0)
+        preceding = tl.sum(tl.where(t < tile, counts, 0), 0)
+        misses = 0
+        for row in range(first, end):
+            misses += tl.load(row_stats + row * 4 + 1).to(tl.int32)
+        union = hits + misses
+        failed = union > MAX_UNION
+        if tile == 0:
+            tl.store(metadata + first * 8 + 4, hits)
+            tl.store(metadata + first * 8 + 5, misses)
+            err = tl.arange(0, 8)
+            tl.store(errors + first * 8 + err, tl.where(failed, union, 0))
+        tl.device_assert(~failed, "HiSparse request union exceeds hot capacity")
+        if (union > 0) & ~failed:
+            p = tile * BLOCK + tl.arange(0, BLOCK)
+            valid = (state >= 0) & (state < STATE_ROWS) & (p < HOT_SIZE)
+            slot = tl.load(lru + state.to(tl.int64) * HOT_SIZE + p, mask=valid, other=-1).to(tl.int32)
+            hit = tl.load(protected + first.to(tl.int64) * HOT_SIZE + slot,
+                mask=valid & (slot >= 0) & (slot < HOT_SIZE), other=0) != 0
+            prefix = tl.load(hit_prefix + first.to(tl.int64) * HOT_SIZE + p, mask=valid, other=0) + preceding
+            temp = temp_lru + first.to(tl.int64) * HOT_SIZE
+            tl.store(temp + prefix - 1, slot, mask=valid & hit)
+            tl.store(temp + HOT_SIZE - 1 - (p - prefix), slot, mask=valid & ~hit)
+
+
+@triton.jit
+def protect_and_update_lru_kernel(
+    sorted_rows,
+    metadata,
+    dgi,
+    lru,
+    row_stats,
+    temp_lru,
+    errors,
+    TOP_K: tl.constexpr,
+    HOT_SIZE: tl.constexpr,
+    MAX_UNION: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    protected=None,
+    USE_PROTECTED: tl.constexpr = False,
+):
+    first = tl.program_id(0)
+    leader = tl.load(metadata + first * 8 + 2)
+    if first == leader:
+        state = tl.load(metadata + first * 8 + 1)
+        end = tl.load(metadata + first * 8 + 3)
+        misses = 0
+        references = 0
+        for row in range(first, end):
+            misses += tl.load(row_stats + row * 4 + 1).to(tl.int32)
+            references |= (tl.load(row_stats + row * 4) + tl.load(row_stats + row * 4 + 1) > 0).to(tl.int32)
+        hits = 0
+        p = tl.arange(0, BLOCK)
+        temp = temp_lru + first * HOT_SIZE
+        live_lru = lru + state.to(tl.int64) * HOT_SIZE
+        # Bound live lookup/scan vectors by BLOCK, independently of HOT_SIZE.
+        # Each request leader owns both passes; no inter-program barrier or
+        # in-place LRU permutation is needed.
+        if references > 0:
+            for start in range(0, HOT_SIZE, BLOCK):
+                position = start + p
+                valid = (state >= 0) & (state < STATE_ROWS) & (position < HOT_SIZE)
+                slot = tl.load(live_lru + position, mask=valid, other=-1).to(tl.int32)
+                if USE_PROTECTED:
+                    hit = tl.load(protected + first.to(tl.int64) * HOT_SIZE + slot,
+                        mask=valid & (slot >= 0) & (slot < HOT_SIZE), other=0) != 0
+                else:
+                    cached = tl.load(
+                        dgi + state.to(tl.int64) * HOT_SIZE + slot,
+                        mask=valid & (slot >= 0) & (slot < HOT_SIZE),
+                        other=-1,
+                    )
+                    hit = tl.full((BLOCK,), False, tl.int1)
+                    for row in range(first, end):
+                        _, found = _lookup(sorted_rows + row * TOP_K, cached, valid & (cached >= 0), TOP_K)
+                        hit = hit | found
+                prefix = tl.cumsum(hit.to(tl.int32), 0) + hits
+                # Hit prefix and reverse victim suffix are disjoint even
+                # before the final request-wide hit count is known.
+                tl.store(temp + prefix - 1, slot, mask=valid & hit)
+                tl.store(temp + HOT_SIZE - 1 - (position - prefix), slot, mask=valid & ~hit)
+                hits += tl.sum(hit.to(tl.int32), 0)
+        union = hits + misses
+        failed = union > MAX_UNION
+        tl.device_assert(~failed, "HiSparse request union exceeds hot capacity")
+        # An all-resident request leaves the hot map and LRU untouched.
+        if (union > 0) & ~failed:
+            remaining = HOT_SIZE - hits - misses
+            # Complete protection for the whole request before publishing
+            # any new LRU order. Assignment consumes the same victim plan.
+            for start in range(0, HOT_SIZE, BLOCK):
+                position = start + p
+                source = tl.where(
+                    position < remaining,
+                    HOT_SIZE - 1 - misses - position,
+                    tl.where(
+                        position < remaining + misses,
+                        HOT_SIZE - 1 - (position - remaining),
+                        position - remaining - misses,
+                    ),
+                )
+                updated = tl.load(temp + source, mask=position < HOT_SIZE, other=0)
+                tl.store(live_lru + position, updated, mask=position < HOT_SIZE)
+        tl.store(metadata + first * 8 + 4, hits)
+        tl.store(metadata + first * 8 + 5, misses)
+        err = tl.arange(0, 8)
+        tl.store(errors + first * 8 + err, tl.where(union > MAX_UNION, union, 0))
+
+
+@triton.jit
 def assign_residency_kernel(
     row_keys,
     metadata,
@@ -408,6 +590,29 @@ def residency_stats_kernel(row_stats, stats, ROWS: tl.constexpr, BLOCK: tl.const
     miss = tl.load(row_stats + i * 4 + 1, mask=i < ROWS, other=0)
     tl.store(stats, tl.load(stats) + tl.sum(hit, 0))
     tl.store(stats + 1, tl.load(stats + 1) + tl.sum(miss, 0))
+
+
+@triton.jit
+def compact_physical_indices_kernel(
+    indices,
+    selected,
+    counts,
+    INPUT_STRIDE: tl.constexpr,
+    TOP_K: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    value = tl.load(indices + row.to(tl.int64) * INPUT_STRIDE + col, mask=col < TOP_K, other=-1)
+    valid = (col < TOP_K) & (value >= 0) & (value.to(tl.int64) < CAPACITY)
+    prefix = tl.cumsum(valid.to(tl.int32), 0)
+    count = tl.sum(valid.to(tl.int32), 0)
+    # Valid entries own [0, count); tail padding owns [count, TOP_K).
+    # Disjoint stores preserve both selection order and duplicate entries.
+    tl.store(selected + row.to(tl.int64) * TOP_K + prefix - 1, value, mask=valid)
+    tl.store(selected + row.to(tl.int64) * TOP_K + col, -1, mask=(col >= count) & (col < TOP_K))
+    tl.store(counts + row, count)
 
 
 @triton.jit
