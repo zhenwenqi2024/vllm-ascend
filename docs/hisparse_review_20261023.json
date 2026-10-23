@@ -1,0 +1,457 @@
+{
+  "created_at": "2026-10-23T09:34:42.175001+00:00",
+  "runtime": "hisparse_pd_candidate_395",
+  "parent": "90719bf705b3cc9e17acd352cdc685b847ac044c",
+  "source_files": [
+    {
+      "path": "vllm_ascend/ascend_config.py",
+      "sha256": "83defbf43fa30c7899807bca88a22ab63150877291d4803569367fcff9a71646"
+    },
+    {
+      "path": "vllm_ascend/attention/hisparse_resident_state.py",
+      "sha256": "22ba5b0a7147311205607e2e296b2e507f8214f0cfce65f192a2d12ebed0aeba"
+    },
+    {
+      "path": "vllm_ascend/attention/indexer.py",
+      "sha256": "69b21bad036af86c73c47ce6491b769acfdefe9fb9cb1d009ed0cb606c389db8"
+    },
+    {
+      "path": "vllm_ascend/attention/sfa_hisparse.py",
+      "sha256": "91ae61fd0ef874a9703a1091bf161bb2b144c46d4b2501de3c4e394561acb883"
+    },
+    {
+      "path": "vllm_ascend/core/kv_cache_interface.py",
+      "sha256": "918b82a88b318cbb466ff1bc6541946006937216cc6aa779616d51581a459f73"
+    },
+    {
+      "path": "vllm_ascend/device/hardware_profile.py",
+      "sha256": "920e9473572dff6ee796009811173126f9ec43014166d5c0ae89e4e7edef55bd"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/backend.py",
+      "sha256": "5f108df9e34021e3a4b859aa197b1372d18a8d47052ac862665355fa0b849f0f"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/binding.py",
+      "sha256": "347c5478fbd2ee4a53a3a5e48f57df886c157d25b4a8f59c056bea3ce3afc6d6"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/configuration.py",
+      "sha256": "38a6e39314e2d2beebeeaaf9eec87136944e6f2aec7a5e4e375cbfc801dc52c9"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/connector.py",
+      "sha256": "b2340f7a1cc94151bbe759cb41b1d9de2d933d5e72fe2d21d15324e29795d03d"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/layout.py",
+      "sha256": "3ce29875e5ffa5e6c708598b15a54da4e4a9064644a47ae33125f4ee8ef1915f"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/protocol.py",
+      "sha256": "fdfd6477a17e6818a2af4b5223bde43c042af3a73edce41ff56c23c8cfc31b1d"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/transport.py",
+      "sha256": "9bbecd5472f3643653c3b2b84b98a8b487edf112ae3ed9d1d65649d03f24fcb5"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/worker.py",
+      "sha256": "570a7f181ffcccfedbb23a841a4a3508f549497bafb337e5ef384818e6f08684"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/acl_stage.py",
+      "sha256": "0daca17737f53a3fc53bff362fc7a3883fb1bf503047879a5b6faf82a90708cc"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/client.py",
+      "sha256": "c03eccb58ea85362ea69e7b863c0857ce2b8794749c098ca4abef04981256ca7"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/import_session.py",
+      "sha256": "133d7863d9757d73b029eb31f0d2ee0ad9688c95cfdfbffd4c93ff25a4534463"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/pool.py",
+      "sha256": "af38a745bd319fe7139ab98cc650212933b6fb0cfd4ac98001a89ca4239ef2bd"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/stage.py",
+      "sha256": "cbd8f9acfcb6e425d252708a73c36e610fa7b63444c3c7cde502776e29d945d5"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/topology.py",
+      "sha256": "8044942d858d7452da0d1414c819911b5cce73a3abb6eabaf4b5a64eb53b1bef"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/transfer.py",
+      "sha256": "8828d7d0603659de0f985f81f1d6c3e832895c9a05c822f3bb61d35d1616ae50"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/execution.py",
+      "sha256": "cad3d983645d2898e742e36f97f6921fe620338364d528cf8b9559e0806ea4bd"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/owners.py",
+      "sha256": "1ee1c4913d243d683c3e98118ea9c872418986d17db66ec79b46aea71b602165"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse.py",
+      "sha256": "510c440801e41c2ea1aefa24470783622b2ec2d52ea52edabe0f4ecf728669ae"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_c8.py",
+      "sha256": "75f2aeb2aba92d01b51ac44c9f430d833318870df09a414170995b3d30113ae0"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_direct.py",
+      "sha256": "d9a1ce3650152fa6dccddb47cf42bdd733c1ca8fb2996d2273ae8aa0366e6c72"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_c8_mapping.py",
+      "sha256": "2f08ae6d3308f014360993beeb6e495a9c746f9331ce63a15a84a5caa0b9ad80"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_c8_staged.py",
+      "sha256": "9e26d0d4adc1bd85e116d55b7c7097dc8138a8216c9c6f9e6deb4d10ee6d8268"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse.py",
+      "sha256": "b8fb38993dcde267dae9beebafb94a35f58f4e928cd38405120ec81ed27ba025"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_resident_gather.py",
+      "sha256": "6fce7887ec04a2dbcd261a612de0867bae24306ba46e9e501600a9ee13920f53"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/attn_utils.py",
+      "sha256": "95195c8de2a5f251f744728925b10f0183abc5cbeff9b341e7990b2476c2cb2d"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/model_runner.py",
+      "sha256": "7a62a2f717b0ea6ca260540f138e3c1a67812ac2b19636eecd5c1453036c3d44"
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/hisparse_pd/test_graph_mtp_contract.py",
+      "sha256": "9824cd572db1a384508bbc77212fac55caf39c20bf182d4c065733ffd5c80bd2"
+    }
+  ],
+  "raw_runtime_hashes": [
+    {
+      "path": "vllm_ascend/ascend_config.py",
+      "sha256": "83defbf43fa30c7899807bca88a22ab63150877291d4803569367fcff9a71646"
+    },
+    {
+      "path": "vllm_ascend/attention/hisparse_resident_state.py",
+      "sha256": "13600d621e5abc58574d6892b80481e8769d7529d7457cfe45febd3d9822193f"
+    },
+    {
+      "path": "vllm_ascend/attention/indexer.py",
+      "sha256": "69b21bad036af86c73c47ce6491b769acfdefe9fb9cb1d009ed0cb606c389db8"
+    },
+    {
+      "path": "vllm_ascend/attention/sfa_hisparse.py",
+      "sha256": "46f9b4eeec2ddde8177b6120573b249af40dd17d112ed88563ac64ed5fe54d2f"
+    },
+    {
+      "path": "vllm_ascend/core/kv_cache_interface.py",
+      "sha256": "918b82a88b318cbb466ff1bc6541946006937216cc6aa779616d51581a459f73"
+    },
+    {
+      "path": "vllm_ascend/device/hardware_profile.py",
+      "sha256": "920e9473572dff6ee796009811173126f9ec43014166d5c0ae89e4e7edef55bd"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/backend.py",
+      "sha256": "5f108df9e34021e3a4b859aa197b1372d18a8d47052ac862665355fa0b849f0f"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/binding.py",
+      "sha256": "9238fbb44fcf9f6fab359d499ec921a2c13e62d4970429ecf5d750b8e70ef329"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/configuration.py",
+      "sha256": "99e2de2dcd8067f46d6d8abc3354c5db8331732690be2462773e3f2099c3a6de"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/connector.py",
+      "sha256": "7725e71b1f1b6cec386f709895ca871a0392b18f148cf170097f510c3233aee1"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/layout.py",
+      "sha256": "90119b5cde678a49359a1b0ec00bf388e916e1c251d2f840fc0a55ac58a646a2"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/protocol.py",
+      "sha256": "f767010513fe33f4af47cb8cc99fb37a71304149e7942eb14b44a7be3d8f10b7"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/transport.py",
+      "sha256": "9bbecd5472f3643653c3b2b84b98a8b487edf112ae3ed9d1d65649d03f24fcb5"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/worker.py",
+      "sha256": "d8921641f327f42d3a04f8b91573c382993d4989677a223165cc2bdb9d6f9bb9"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/acl_stage.py",
+      "sha256": "50ebf4133b223b9b6a33a46116143a77193e781c367929685247c0d7eef180e5"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/client.py",
+      "sha256": "c03eccb58ea85362ea69e7b863c0857ce2b8794749c098ca4abef04981256ca7"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/import_session.py",
+      "sha256": "133d7863d9757d73b029eb31f0d2ee0ad9688c95cfdfbffd4c93ff25a4534463"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/pool.py",
+      "sha256": "af38a745bd319fe7139ab98cc650212933b6fb0cfd4ac98001a89ca4239ef2bd"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/stage.py",
+      "sha256": "cbd8f9acfcb6e425d252708a73c36e610fa7b63444c3c7cde502776e29d945d5"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/topology.py",
+      "sha256": "8044942d858d7452da0d1414c819911b5cce73a3abb6eabaf4b5a64eb53b1bef"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/transfer.py",
+      "sha256": "8828d7d0603659de0f985f81f1d6c3e832895c9a05c822f3bb61d35d1616ae50"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/execution.py",
+      "sha256": "3f207b2fca9f5d4e03fbf6899eeba8f67613147f68a30ab8fe87a55093c125fd"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/owners.py",
+      "sha256": "c97c5e579e5a830d620a71e19492628890b6ee3163073e47cc70f336a41ed08c"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse.py",
+      "sha256": "510c440801e41c2ea1aefa24470783622b2ec2d52ea52edabe0f4ecf728669ae"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_c8.py",
+      "sha256": "75f2aeb2aba92d01b51ac44c9f430d833318870df09a414170995b3d30113ae0"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_direct.py",
+      "sha256": "d9a1ce3650152fa6dccddb47cf42bdd733c1ca8fb2996d2273ae8aa0366e6c72"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_c8_mapping.py",
+      "sha256": "2f08ae6d3308f014360993beeb6e495a9c746f9331ce63a15a84a5caa0b9ad80"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_c8_staged.py",
+      "sha256": "9e26d0d4adc1bd85e116d55b7c7097dc8138a8216c9c6f9e6deb4d10ee6d8268"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse.py",
+      "sha256": "b8fb38993dcde267dae9beebafb94a35f58f4e928cd38405120ec81ed27ba025"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_resident_gather.py",
+      "sha256": "6fce7887ec04a2dbcd261a612de0867bae24306ba46e9e501600a9ee13920f53"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/attn_utils.py",
+      "sha256": "95195c8de2a5f251f744728925b10f0183abc5cbeff9b341e7990b2476c2cb2d"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/model_runner.py",
+      "sha256": "3dc114d7c3f52332b4360d5e39c9944dc094428f102f059525bd70658f4a7737"
+    }
+  ],
+  "native_extension_sha256": "b1efc1e43554f0ca03337ea1ca1d8d1734f42309ffaa665b3a6986c17b544122",
+  "native_rebuilt": false,
+  "normalization": "LF only",
+  "python_AST_passed": true,
+  "ruff_exit": 1,
+  "ruff_findings": {
+    "I001": 8,
+    "E501": 11,
+    "UP034": 3
+  },
+  "ruff_format_exit": 1,
+  "CPU_tests": {
+    "total": 118,
+    "passed": 79,
+    "failed": 39,
+    "new_graph_MTP_contracts": {
+      "passed": 8,
+      "failed": 0
+    },
+    "failures": [
+      {
+        "test": "test_cleanup::test_registration_failure_retains_assigned_reader_and_real_owners[False]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'speculative_config'"
+      },
+      {
+        "test": "test_cleanup::test_registration_failure_retains_assigned_reader_and_real_owners[True]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'speculative_config'"
+      },
+      {
+        "test": "test_cleanup::test_worker_close_failure_retains_owners_until_device_and_transport_drained[device]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'speculative_config'"
+      },
+      {
+        "test": "test_cleanup::test_worker_close_failure_retains_owners_until_device_and_transport_drained[destroy]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'speculative_config'"
+      },
+      {
+        "test": "test_cleanup::test_worker_close_failure_retains_owners_until_device_and_transport_drained[unInitialize]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'speculative_config'"
+      },
+      {
+        "test": "test_cleanup::test_active_source_lease_keeps_ack_server_usable",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'speculative_config'"
+      },
+      {
+        "test": "test_cleanup::test_future_error_preserved_after_safe_teardown_or_as_cleanup_cause[False]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'speculative_config'"
+      },
+      {
+        "test": "test_cleanup::test_future_error_preserved_after_safe_teardown_or_as_cleanup_cause[True]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'speculative_config'"
+      },
+      {
+        "test": "test_cleanup::test_background_read_failure_keeps_worker_without_drained_ack[False]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'speculative_config'"
+      },
+      {
+        "test": "test_cleanup::test_background_read_failure_keeps_worker_without_drained_ack[True]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'speculative_config'"
+      },
+      {
+        "test": "test_cleanup::test_server_close_failure_retains_worker_until_retry",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'speculative_config'"
+      },
+      {
+        "test": "test_pd::test_real_zmq_worker_read_then_ack_or_retain_on_dma_error[False-False]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'is_current_stream_capturing'"
+      },
+      {
+        "test": "test_pd::test_real_zmq_worker_read_then_ack_or_retain_on_dma_error[True-False]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'is_current_stream_capturing'"
+      },
+      {
+        "test": "test_pd::test_real_zmq_worker_read_then_ack_or_retain_on_dma_error[False-True]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'is_current_stream_capturing'"
+      },
+      {
+        "test": "test_pd::test_reject_unsupported_configuration[<lambda>0]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'compilation_config'"
+      },
+      {
+        "test": "test_pd::test_reject_unsupported_configuration[<lambda>1]",
+        "reason": "AttributeError: 'object' object has no attribute 'method'"
+      },
+      {
+        "test": "test_pd::test_real_tensor_binding_and_storage_registration_dedup",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'draft_layer'"
+      },
+      {
+        "test": "test_pd::test_safe_failures_before_dma_do_not_crash_worker[cancelled]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'is_current_stream_capturing'"
+      },
+      {
+        "test": "test_pd::test_safe_failures_before_dma_do_not_crash_worker[invalid_manifest]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'is_current_stream_capturing'"
+      },
+      {
+        "test": "test_pd::test_drained_read_with_lost_ack_is_failed_request",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'is_current_stream_capturing'"
+      },
+      {
+        "test": "test_transport_config::test_configure_before_loading_records_version_hash_and_units[None]",
+        "reason": "AssertionError: assert {'configured_... '1.3.0', ...} == {'configured_... '1.3.0', ...}"
+      },
+      {
+        "test": "test_transport_config::test_configure_before_loading_records_version_hash_and_units[16]",
+        "reason": "AssertionError: assert {'configured_... '1.3.0', ...} == {'configured_... '1.3.0', ...}"
+      },
+      {
+        "test": "test_transport_config::test_already_loaded_cannot_be_repaired_by_environment[None-package]",
+        "reason": "ValueError: URMA configuration changed after its verified pre-load setup"
+      },
+      {
+        "test": "test_transport_config::test_already_loaded_cannot_be_repaired_by_environment[None-submodule]",
+        "reason": "ValueError: URMA configuration changed after its verified pre-load setup"
+      },
+      {
+        "test": "test_transport_config::test_already_loaded_cannot_be_repaired_by_environment[None-extension]",
+        "reason": "ValueError: URMA configuration changed after its verified pre-load setup"
+      },
+      {
+        "test": "test_transport_config::test_already_loaded_cannot_be_repaired_by_environment[None-maps_without_modules]",
+        "reason": "ValueError: URMA configuration changed after its verified pre-load setup"
+      },
+      {
+        "test": "test_transport_config::test_already_loaded_cannot_be_repaired_by_environment[16-package]",
+        "reason": "Failed: DID NOT RAISE <class 'RuntimeError'>"
+      },
+      {
+        "test": "test_transport_config::test_already_loaded_cannot_be_repaired_by_environment[16-submodule]",
+        "reason": "Failed: DID NOT RAISE <class 'RuntimeError'>"
+      },
+      {
+        "test": "test_transport_config::test_already_loaded_cannot_be_repaired_by_environment[16-extension]",
+        "reason": "Failed: DID NOT RAISE <class 'RuntimeError'>"
+      },
+      {
+        "test": "test_transport_config::test_already_loaded_cannot_be_repaired_by_environment[16-maps_without_modules]",
+        "reason": "Failed: DID NOT RAISE <class 'RuntimeError'>"
+      },
+      {
+        "test": "test_transport_config::test_real_configuration_precedes_engine_registration[True]",
+        "reason": "ValueError: URMA configuration changed after its verified pre-load setup"
+      },
+      {
+        "test": "test_transport_config::test_real_configuration_precedes_engine_registration[False]",
+        "reason": "ValueError: URMA configuration changed after its verified pre-load setup"
+      },
+      {
+        "test": "test_transport_config::test_role_addresses_offsets_multilayer_stride_and_actual_owners[True]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'draft_layer'"
+      },
+      {
+        "test": "test_transport_config::test_role_addresses_offsets_multilayer_stride_and_actual_owners[False]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'draft_layer'"
+      },
+      {
+        "test": "test_transport_config::test_source_mapping_must_still_be_live_for_both_addresses[True]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'draft_layer'"
+      },
+      {
+        "test": "test_transport_config::test_source_mapping_must_still_be_live_for_both_addresses[False]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'draft_layer'"
+      },
+      {
+        "test": "test_transport_config::test_cpu_indexer_remains_test_only_and_bf16_required",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'draft_layer'"
+      },
+      {
+        "test": "test_transport_config::test_role_layout_partial_transfer_preserves_entire_backing[0]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'draft_layer'"
+      },
+      {
+        "test": "test_transport_config::test_role_layout_partial_transfer_preserves_entire_backing[37]",
+        "reason": "AttributeError: 'types.SimpleNamespace' object has no attribute 'draft_layer'"
+      }
+    ],
+    "uses_real_CPU_torch": true,
+    "unrelated_imports_AST_isolated": true,
+    "full_standard_pytest": false,
+    "NPU_context_started": false
+  },
+  "full_model_PD_verified": false,
+  "full_model_smoke_requests": 0,
+  "broad_accuracy": "deferred",
+  "publication_head_NPU_retest": false,
+  "AI_assistance": "OpenAI Codex; human review pending",
+  "generated_build_metadata_excluded": true
+}

@@ -21,14 +21,13 @@ def _parent_init(
     max_num_batched_tokens,
     max_num_blocks_per_group,
     device,
-    kernel_block_sizes,
     cp_size,
     cp_rank,
     cp_interleave,
     slot_mapping_enabled=None,
+    dcp_sharded=None,
 ):
     self.block_sizes = block_sizes
-    self.kernel_block_sizes = kernel_block_sizes
     self.num_kv_cache_groups = len(block_sizes)
     self.max_num_batched_tokens = max_num_batched_tokens
     self.device = device
@@ -188,7 +187,7 @@ def test_compute_slot_mappings_passes_enabled_mask_on_newer_vllm():
     assert kwargs["slot_mapping_enabled"] is enabled
 
 
-def test_init_block_table_layout_tensors_builds_distinct_sizes():
+def test_init_block_table_layout_tensors_uses_manager_sizes_for_slots():
     tables = AscendBlockTables.__new__(AscendBlockTables)
     tables.block_sizes = [16, 32]
     tables.kernel_block_sizes = [8, 8]
@@ -198,7 +197,8 @@ def test_init_block_table_layout_tensors_builds_distinct_sizes():
     tables._slot_mapping_enabled = [True, False]
     tables.init_block_table_layout_tensors()
 
-    assert torch.equal(tables.kernel_block_sizes_tensor, torch.tensor([8, 8], dtype=torch.int32))
+    assert tables.kernel_block_sizes == [8, 8]
+    assert tables.kernel_block_sizes_tensor is tables.block_sizes_tensor
     assert torch.equal(tables.block_sizes_tensor, torch.tensor([16, 32], dtype=torch.int32))
     assert tables.block_sizes_tensor.device.type == "cpu"
 
@@ -216,4 +216,4 @@ def test_init_block_table_layout_tensors_keeps_main_contract():
         tables.init_block_table_layout_tensors()
 
     assert tables.block_sizes_tensor is original
-    assert not hasattr(tables, "kernel_block_sizes_tensor")
+    assert tables.kernel_block_sizes_tensor is original

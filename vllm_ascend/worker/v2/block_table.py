@@ -48,6 +48,7 @@ class AscendBlockTables(BlockTables):
     ):
         if kernel_block_sizes is None:
             kernel_block_sizes = block_sizes
+        self.kernel_block_sizes = kernel_block_sizes
         # Forward the per-group sharding selection when supplied by the caller.
         super_kwargs: dict[str, list[bool]] = {}
         if dcp_sharded is not None:
@@ -58,10 +59,9 @@ class AscendBlockTables(BlockTables):
             max_num_batched_tokens,
             max_num_blocks_per_group,
             device,
-            kernel_block_sizes,
-            cp_size,
-            cp_rank,
-            cp_interleave,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            cp_interleave=cp_interleave,
             slot_mapping_enabled=slot_mapping_enabled,
             **super_kwargs,
         )
@@ -88,6 +88,13 @@ class AscendBlockTables(BlockTables):
             dtype=torch.int32,
             device=self.device,
         )
+
+    def init_block_table_layout_tensors(self) -> None:
+        super().init_block_table_layout_tensors()
+        # Core now stores manager block IDs without expanding them into kernel
+        # blocks. Slot addresses must use that same manager page size; attention
+        # metadata handles any smaller kernel-page view separately.
+        self.kernel_block_sizes_tensor = self.block_sizes_tensor
 
     def compute_slot_mappings(
         self,

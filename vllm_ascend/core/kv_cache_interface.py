@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import inspect
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Any
@@ -37,13 +38,10 @@ def get_storage_block_size(kv_cache_spec: KVCacheSpec) -> int:
         storage_block_sizes = {get_storage_block_size(spec) for spec in kv_cache_spec.kv_cache_specs.values()}
         assert len(storage_block_sizes) == 1, "All specs in one KV cache group must use the same storage block size."
         return storage_block_sizes.pop()
-    # vLLM #53906 added an optional MLA storage-view override. It is not
-    # Ascend's derived number of physical rows per logical block.
-    if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
-        return kv_cache_spec.block_size // kv_cache_spec.tokens_per_state
     if isinstance(kv_cache_spec, MLAAttentionSpec):
-        storage_block_size = kv_cache_spec.storage_block_size
-        return kv_cache_spec.block_size if storage_block_size is None else storage_block_size
+        # Upstream expresses physical MLA rows as stored states, including
+        # compressed MLA and uncompressed SFA indexer pages.
+        return kv_cache_spec.num_states
     return getattr(kv_cache_spec, "storage_block_size", kv_cache_spec.block_size)
 
 
@@ -370,6 +368,8 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
             cache_sparse_li_c8=cache_sparse_li_c8_set.pop(),
             cache_sparse_li_c4=cache_sparse_li_c4_set.pop(),
             sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size_set.pop(),
+            page_size_padded=specs[0].page_size_padded,
+            block_stride_alignment=math.lcm(*(spec.get_block_stride_alignment() for spec in specs)),
         )
 
 
