@@ -113,7 +113,61 @@
         "lease_acquired": false,
         "host_state_sha256": "11c9dda09c8a55d8ba7265d5290081e7cb9cfb087d2c01f84a43a785956292da"
       }
-    ]
+    ],
+    "real_module_NPU_metadata_and_resolver": {
+      "session": "71b8a82b32a4483f880a043f93efd280",
+      "source_tree_sha256": "9cff9b2a9c69a2767f6d4e054dd529d91822b6219ca8d0dca669401746efc0c5",
+      "passed": true,
+      "qualification_scope": "Real-module NPU metadata and resolver ABI/graph regression",
+      "actual_cases": 120,
+      "counts": {
+        "prefill_mapping": 6,
+        "grouped_invalidation": 6,
+        "stage_graph_contract": 54,
+        "actual_runtime_resolver": 54
+      },
+      "actual_resolver_graph_owners": 3,
+      "actual_resolver_replays_per_owner": 18,
+      "hit_kinds": [
+        "all Resident",
+        "Hot hits",
+        "miss",
+        "mixed"
+      ],
+      "actual_resolver_shapes": {
+        "topk": 2048,
+        "hot": 10240,
+        "payload_bytes_per_row": 656,
+        "target_rows": 32,
+        "target_query_group": 4,
+        "draft_rows": 8
+      },
+      "all_Resident_swap_counts_zero": true,
+      "all_Resident_Hot_LRU_unchanged": true,
+      "native_errors_zero": true,
+      "production_AST_import_isolation": false,
+      "CPU_reference_AST_isolated": true,
+      "actual_runtime_constructor_executed": false,
+      "Host_payload_gather_or_DMA_tested": false,
+      "actual_connector_serving_installed": false,
+      "model_qualified": false,
+      "PD_qualified": false,
+      "performance_qualified": false,
+      "production_deployed": false,
+      "host_waited_reaped": true,
+      "inside_waited_reaped": true,
+      "owned_workers_released": true,
+      "resources_released": true,
+      "global_lease_released": true,
+      "common_new_source_changes": 0,
+      "source_files_changed_by_test": false,
+      "result_sha256": "0dbcce1a6485db4ecf17a6dd70cf70cb7baf217dcde7e2547c099db2872bfe9c",
+      "host_state_sha256": "f6459dc91b579cddb26984d816cd28b970f0d9b0cf84ad84120f95b46485edc2",
+      "inside_state_sha256": "76a908b77685274716bda341d499462b23f38322a225e229a4f826e423a7df80",
+      "carrier_sha256": "1e2786f547dccc4ec91ee1146f45283487ab723b03b2eeb25188d2536a53cbb5",
+      "harness_sha256": "5c74ed837ba577243602f04855cd87c1fdfb765826db41d45f74559d4ec85707",
+      "actual_module_harness_sha256": "be9af8b3988e3cceac635cf20736b262788c91cfd1f2c5bd7c7fca5e3c23abfe"
+    }
   },
   "historical_single_D_N2": {
     "OFF_TPS": 567.5952,

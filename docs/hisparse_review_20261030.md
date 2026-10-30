@@ -11,8 +11,8 @@ vLLM 公共侧和 Ascend 插件必须按本次配套快照使用。
 后端为每个 NPU runtime 绑定自身的 resolver/stage/invalidate 方法；Prefill plan 和 Host mirror 的两个调用点使用校验源码版本的 NPU 专用包装，其他设备走原函数。
 这些是暂时的插件适配点，不应误称为上游已经提供的完整公共 hook；上游提供等价 hook 后移除。
 
-本轮适配器已通过 15 项隔离 CPU 合同检查，另有 66 项部分 NPU 合同的设备输出逐项一致；完整 resolver、connector 安装、模型和 P/D 尚未通过资格检查，也未部署。
-下面性能与 NPU 记录均来自先前 API12/API15 实测，并不自动资格化本轮重构后的 Git head。
+本轮适配器已通过 15 项隔离 CPU 合同、5 项真实包导入/绑定检查，以及新一轮 120 项 NPU 元数据与 resolver ABI/图回放检查；完整 runtime 构造、Host payload 搬运、模型和 P/D 尚待验证，也未部署。
+下面历史性能与原生算子记录来自先前 API12/API15 实测；新一轮元数据 NPU 检查另列，二者均不能自动证明完整模型通过。
 
 ## 公共侧来源与历史变化
 
@@ -68,6 +68,19 @@ native primitive 已完成 3 个图 owner、每 owner 18 次变化回放；gener
 - Hot 预留及共享块对齐带来的 Resident 容量损失已有分配与运行证据；尚未改变分配策略。
 - profiling 仅部分 rank 有有效包，缺少同 shape 完整 OFF 对照，不能把累计 API/各流耗时相加解释 wall time。
 
+## 新一轮真实模块 NPU 检查
+
+新 session 已整轮完成：6 项 Prefill 映射、6 项 grouped invalidate、54 项事件/图阶段检查，以及 54 项真实 C8 resolver ABI/图回放，共 120 项输出逐项一致。
+这一轮正常导入候选源码中的生产模块，未用 AST 隔离生产函数；Prefill 的 CPU 参考定义仍通过 AST 提取。
+实际链路为 Ascend runtime 绑定方法 → `HiSparseNPUOps` → C8 native resolver，与直接 native 调用逐项对照。
+target、first draft、later draft 三类 owner 各 18 次变化回放，覆盖全 Resident、Hot 命中、miss、混合命中和有效行数变化。
+TopK 为 2048，Hot 为 10240，C8 行宽为 656 字节；全 Resident 的 swap count 为 0、Hot LRU 不变，native error 为 0。
+本轮回执、Host/容器子进程实际 wait/reap、worker/资源/全局 lease 释放均已核实。
+
+该测试显式提供元数据并以 `__new__` 创建 runtime 骨架，没有执行完整构造函数、Host 注册/写回/gather、真实 attention 或完整模型。
+这些结果证明本轮后端迁移的元数据和 resolver 参数/图回放回归通过，不能代替完整模型、P/D、吞吐或数据集精度结论。
+之前缺少回执字段的失败及外部占用拦截仍保留；本轮通过不回写旧轮状态。
+
 ## Native 源码与复现边界
 
 `csrc/hisparse_runtime/build.py --cann-root CANN_ROOT --output NEW_BUILD_DIR`
@@ -90,7 +103,7 @@ Human line-by-line review and personally executed final validation are not asser
   测试通过 AST 隔离生产函数；graph-stage 的 resolver 使用 tensor-copy 替身，因此没有验证完整 resolver 或 connector 安装。
   首轮设备输出一致，但测试载体因结果缺少 `all_checks` 字段而判定失败；该轮失败与实际 wait/reap、资源和 lease 释放证据全部保留。
   修复回执后的两次新 session 均被新出现的外部 CPU 模型挡在启动门禁，未初始化 NPU、未创建本轮设备子进程或取得 lease。
-  因此不能把这些部分检查写成整轮通过，也不能写成最终适配器、完整模型、P/D 或性能通过。
+  上述早期轮次不能写成整轮通过；后续 120 项检查已独立整轮完成，仍不能写成完整模型、P/D 或性能通过。
 - 对 PR62592 的 13 个公共集成文件逐项比较：源码内容一致，11 个文件仅 Windows CRLF 与 Git LF 不同；`runtime.py`、connector `worker.py` 连字节也一致。
 - vLLM fork PR #1 未更新；配套依赖仍是冻结官方基线加 PR62592。
 
