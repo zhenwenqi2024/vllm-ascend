@@ -11,7 +11,7 @@ vLLM 公共侧和 Ascend 插件必须按本次配套快照使用。
 后端为每个 NPU runtime 绑定自身的 resolver/stage/invalidate 方法；Prefill plan 和 Host mirror 的两个调用点使用校验源码版本的 NPU 专用包装，其他设备走原函数。
 这些是暂时的插件适配点，不应误称为上游已经提供的完整公共 hook；上游提供等价 hook 后移除。
 
-本轮新适配器只通过 15 项隔离 CPU 合同检查，使用实际生产函数定义和真实 CPU torch；未证明 NPU 图或模型正确性，也未部署。
+本轮适配器已通过 15 项隔离 CPU 合同检查，另有 66 项部分 NPU 合同的设备输出逐项一致；完整 resolver、connector 安装、模型和 P/D 尚未通过资格检查，也未部署。
 下面性能与 NPU 记录均来自先前 API12/API15 实测，并不自动资格化本轮重构后的 Git head。
 
 ## 公共侧来源与历史变化
@@ -86,7 +86,12 @@ Human line-by-line review and personally executed final validation are not asser
 - `tests/ut/distributed/kv_transfer/test_hisparse_runtime_adapter.py`：15 passed。
   该套件通过 AST 隔离与设备边界替身执行实际函数定义和真实 CPU torch，不能替代标准全量收集或 NPU 验证。
 - `bash format.sh ci` 已尝试，在安装 actionlint 的 pre-commit 环境时达到 45 秒限时；完整检查未通过。
-- 新的 Ascend-owned adapter 尚未执行 NPU 图、完整模型、P/D 或性能资格检查。
+- 部分 NPU 合同实际执行了 6 项 Prefill 映射、6 项 grouped invalidate、3 个 graph owner 各 18 次变化回放，共 66 项输出逐项一致。
+  测试通过 AST 隔离生产函数；graph-stage 的 resolver 使用 tensor-copy 替身，因此没有验证完整 resolver 或 connector 安装。
+  首轮设备输出一致，但测试载体因结果缺少 `all_checks` 字段而判定失败；该轮失败与实际 wait/reap、资源和 lease 释放证据全部保留。
+  修复回执后的两次新 session 均被新出现的外部 CPU 模型挡在启动门禁，未初始化 NPU、未创建本轮设备子进程或取得 lease。
+  因此不能把这些部分检查写成整轮通过，也不能写成最终适配器、完整模型、P/D 或性能通过。
+- 对 PR62592 的 13 个公共集成文件逐项比较：源码内容一致，11 个文件仅 Windows CRLF 与 Git LF 不同；`runtime.py`、connector `worker.py` 连字节也一致。
 - vLLM fork PR #1 未更新；配套依赖仍是冻结官方基线加 PR62592。
 
 可复现的 CPU 合同检查（先准备对应 vLLM 源码/依赖）：

@@ -78,7 +78,42 @@
     "full_format_sh_ci_blocker": "45s timeout installing the actionlint pre-commit environment",
     "new_adapter_NPU_qualified": false,
     "new_adapter_model_qualified": false,
-    "deployed": false
+    "deployed": false,
+    "partial_NPU_contracts": {
+      "passed_cases": 66,
+      "prefill_mapping": 6,
+      "grouped_invalidation": 6,
+      "graph_owners": 3,
+      "changing_graph_replays": 54,
+      "AST_import_isolation": true,
+      "graph_stage_resolver": "Tensor-copy substitute; does not test the full resolver",
+      "full_resolver_or_connector_installation_tested": false,
+      "round_phase": "failed",
+      "round_failure": "Primitive outputs exact; carrier rejected missing all_checks result field",
+      "owned_children_waited_reaped": true,
+      "owned_resources_and_lease_released": true,
+      "result_sha256": "57d0227ef3b70a35fee2e8ad8079dd4842d34e823f26a8bf053888ac931d1461"
+    },
+    "corrected_harness_retries": [
+      {
+        "session": "80632895642b41a684c6fed03cf377f7",
+        "phase": "admission_blocked",
+        "NPU_initialized": false,
+        "model_started": false,
+        "owned_child_created": false,
+        "lease_acquired": false,
+        "host_state_sha256": "7603d006c7d35665539dd02b98dc47b55d6221ef11af4f94f56356551ec1506d"
+      },
+      {
+        "session": "28445155421d4f93818220ac6e381cd6",
+        "phase": "admission_blocked",
+        "NPU_initialized": false,
+        "model_started": false,
+        "owned_child_created": false,
+        "lease_acquired": false,
+        "host_state_sha256": "11c9dda09c8a55d8ba7265d5290081e7cb9cfb087d2c01f84a43a785956292da"
+      }
+    ]
   },
   "historical_single_D_N2": {
     "OFF_TPS": 567.5952,
@@ -93,5 +128,10 @@
     "unresolved_output_divergence": true
   },
   "lazy_mirror_model_test_pending": true,
-  "PD_testing_blocked_by_external_23": true
+  "PD_testing_blocked_by_external_23": true,
+  "common_baseline_audit": {
+    "common_integration_files_checked": 13,
+    "common_integration_source_changes": 0,
+    "common_comparison": "LF-normalized; runtime.py and connector worker.py also byte-exact"
+  }
 }
