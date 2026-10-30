@@ -12,14 +12,23 @@ import torch
 
 from .acl_stage import ACLStageBuffer
 from .configuration import validate_transport_options
+from .execution import (
+    CacheBindingGuard,
+    assert_transfer_boundary,
+    draft_transfer_enabled,
+    execution_contract,
+    export_mirror_ready,
+    validate_completion,
+    validate_draft_state,
+)
 from .layout import build_layouts
-from .execution import (CacheBindingGuard, assert_transfer_boundary, draft_transfer_enabled, execution_contract, export_mirror_ready, validate_completion, validate_draft_state)
 from .protocol import (
     SOURCE_TRANSPORT,
     STAGE_BYTES,
     VERSION,
     LayerLayout,
     LeaseRegistry,
+    batch_source_transfers,
     coalesce_transfers,
     encode_layouts,
     plan_reads,
@@ -29,8 +38,10 @@ from .stage import StageSlot
 from .transport import (
     LeaseServer,
     MemfabricReader,
+    RpcClient,
     TransferCancelled,
     acquire,
+    advance_stage,
     prepare_stage,
     rpc,
 )
@@ -99,7 +110,7 @@ class HiSparsePDWorker:
             else:
                 # The one receive executor serializes every bounded SOURCE read.
                 # Retain this owner before allocation or registration can fail.
-                self.stage_buffer = ACLStageBuffer(self.device, torch.npu.set_device)
+                self.stage_buffer = ACLStageBuffer(self.device, host_owners=tuple(self.owners))
                 self.owners.append(self.stage_buffer)
                 self.stage_buffer.allocate()
                 regions[self.stage_buffer.address, STAGE_BYTES] = "hisparse_receive_stage"
@@ -123,9 +134,9 @@ class HiSparsePDWorker:
             raise
 
     def _create_stage(self, kv_caches, regions):
-        # Separate ACL allocation, outside the Torch caching allocator. Logical
-        # capacity/requested size are 16 MiB; the queried owner range may differ.
-        self.stage_buffer = ACLStageBuffer(self.device, torch.npu.set_device)
+        # PTA owns the bounded tensor and stream. Retain it until device drain
+        # and both transport teardown stages have completed.
+        self.stage_buffer = ACLStageBuffer(self.device, host_owners=tuple(self.owners))
         self.owners.append(self.stage_buffer)  # Retain before allocate/query can fail.
         self.stage_buffer.allocate()
         for layout in self.layouts:
@@ -140,27 +151,39 @@ class HiSparsePDWorker:
             self.stage_buffer.address,
             STAGE_BYTES,
             self._copy_source_to_stage,
+            self._copy_sources_to_stage,
         )
 
     def _copy_source_to_stage(self, layer, address, length):
-        """ACL restores the worker context and completes synchronous H2D."""
+        """PTA selects the worker device and waits for the copy completion event."""
         source = self.stage_sources[layer]
         offset = address - source.data_ptr()
         if not offset >= 0 or offset + length > source.numel() * source.element_size():
             raise ValueError("Producer stage source is outside its retained Host layer")
         self.stage_buffer.copy_from_host(address, length)
 
+    def _copy_sources_to_stage(self, layer, segments):
+        source = self.stage_sources[layer]
+        base, extent = source.data_ptr(), source.numel() * source.element_size()
+        for address, length in segments:
+            if address < base or address + length > base + extent:
+                raise ValueError("Packed producer segment escapes its retained Host layer")
+        self.stage_buffer.copy_from_host_segments(segments)
+
     def _validate_transfer_bindings(self):
         assert_transfer_boundary(
             capturing=torch.npu.is_current_stream_capturing(),
-            closing=self.closing, closed=self.closed,
+            closing=self.closing,
+            closed=self.closed,
         )
         if self._binding_guard is None or self._registered_caches is None:
             raise RuntimeError("HiSparse P/D cache binding is unavailable")
         current = build_layouts(
-            self._registered_caches, self.kv_cache_config,
+            self._registered_caches,
+            self.kv_cache_config,
             self.config.compilation_config.static_forward_context,
-            producer=self.producer, include_draft=self.include_draft,
+            producer=self.producer,
+            include_draft=self.include_draft,
         )
         self._binding_guard.validate(*current)
 
@@ -179,6 +202,53 @@ class HiSparsePDWorker:
             raise RuntimeError("HiSparse P/D worker is closing")
         self.pending.append(metadata)
 
+    def _publish_metadata_exports(self, metadata):
+        completion = self._prepare_export()
+        for export in metadata.exports:
+            manifest = {
+                "version": VERSION,
+                "completion": completion,
+                "source_transport": SOURCE_TRANSPORT,
+                "stage_capacity": STAGE_BYTES,
+                "stage_control_version": 2,
+                "stage_address": self.stage_buffer.address,
+                "identity": self.identity,
+                "rank": self.rank,
+                "world_size": self.world_size,
+                "session": self.reader.session,
+                "ticket": export["ticket"],
+                "blocks": export["blocks"],
+                "layers": encode_layouts(self.layouts),
+            }
+            self.registry.publish(export["ticket"]["lease_id"], export["request_id"], manifest)
+
+    def publish_ready_exports(self):
+        """Publish completed prefixes before an unrelated producer forward.
+
+        The common sibling's start_step has submitted the previous draft
+        mirrors. Keep the original completion fence and all source leases;
+        regular poll still owns sending/receiving completion accounting.
+        """
+        if self.closed or self.closing:
+            raise RuntimeError("HiSparse P/D worker is closing")
+        if not self.producer or not any(metadata.exports for metadata in self.pending):
+            return
+        # A reversed/unknown sibling order retains the original poll path.
+        # This is a CPU phase flag, never a device scalar extraction.
+        if not getattr(self.common_worker, "_forward_mirror_active", False):
+            return
+        if not export_mirror_ready(self.common_worker, self.include_draft):
+            return
+        retained = []
+        for metadata in self.pending:
+            if not metadata.exports:
+                retained.append(metadata)
+                continue
+            if metadata.imports:
+                raise RuntimeError("A producer export must not also contain an import")
+            self._publish_metadata_exports(metadata)
+        self.pending = retained
+
     def poll(self, cancelled_ids: set[str]):
         if self.closed or self.closing:
             raise RuntimeError("HiSparse P/D worker is closing or has shut down")
@@ -195,23 +265,8 @@ class HiSparsePDWorker:
                     raise RuntimeError("A producer export must not also contain an import")
                 deferred.append(metadata)
                 continue
-            completion = self._prepare_export() if metadata.exports else None
-            for export in metadata.exports:
-                manifest = {
-                    "version": VERSION,
-                    "completion": completion,
-                    "source_transport": SOURCE_TRANSPORT,
-                    "stage_capacity": STAGE_BYTES,
-                    "stage_address": self.stage_buffer.address,
-                    "identity": self.identity,
-                    "rank": self.rank,
-                    "world_size": self.world_size,
-                    "session": self.reader.session,
-                    "ticket": export["ticket"],
-                    "blocks": export["blocks"],
-                    "layers": encode_layouts(self.layouts),
-                }
-                self.registry.publish(export["ticket"]["lease_id"], export["request_id"], manifest)
+            if metadata.exports:
+                self._publish_metadata_exports(metadata)
             for job in metadata.imports:
                 request_id = job["request_id"]
                 if request_id in self.futures:
@@ -242,6 +297,11 @@ class HiSparsePDWorker:
             raise
 
     def _load_request(self, job, cancelled):
+        endpoint = f"tcp://{self.peer_host}:{self.peer_port}"
+        with RpcClient(endpoint) as control:
+            return self._load_with_control(job, cancelled, control)
+
+    def _load_with_control(self, job, cancelled, control):
         self._validate_transfer_bindings()
         endpoint = f"tcp://{self.peer_host}:{self.peer_port}"
         ticket = job["ticket"]
@@ -256,7 +316,7 @@ class HiSparsePDWorker:
             "world_size": self.world_size,
         }
         try:
-            manifest = acquire(endpoint, message, self.timeout, cancelled)
+            manifest = acquire(endpoint, message, self.timeout, cancelled, client=control)
             validate_wire(manifest)
             validate_completion(manifest.get("completion"), self.transfer_contract)
             validate_draft_state(ticket.get("draft_state"), ticket["num_tokens"], self.include_draft)
@@ -293,6 +353,7 @@ class HiSparsePDWorker:
                     endpoint,
                     {"op": "release", **message, "drained": True},
                     min(self.timeout, 5),
+                    client=control,
                 )
             except (TimeoutError, ValueError):
                 logger.warning(
@@ -302,36 +363,13 @@ class HiSparsePDWorker:
             return False
         # Each call is synchronous. Only a successful return proves that its
         # remote reads no longer own the source. Do not ACK an uncertain error.
-        indexer_reads = []
-        for index, (destination, source, length, role, layer) in enumerate(descriptors):
-            if cancelled.is_set():
-                break
-            if role == "hisparse_source":
-                if indexer_reads:
-                    self.reader.read(manifest["session"], indexer_reads)
-                    indexer_reads = []
-                self._read_staged_source(
-                    endpoint,
-                    message,
-                    manifest["session"],
-                    manifest["stage_address"],
-                    index,
-                    layer[0],
-                    destination,
-                    source,
-                    length,
-                    cancelled,
-                )
-            else:
-                indexer_reads.append((destination, source, length))
-                if len(indexer_reads) == self.max_descriptors:
-                    self.reader.read(manifest["session"], indexer_reads)
-                    indexer_reads = []
-        if indexer_reads and not cancelled.is_set():
-            self.reader.read(manifest["session"], indexer_reads)
-        torch.npu.synchronize(self.device)
+        self._read_batches(descriptors, manifest, endpoint, message, cancelled, control)
+        # Every URMA read above is synchronous. SOURCE unpack also waits for
+        # its own copy-stream event before reusing D or releasing the request.
+        # Draining the whole device here would include unrelated live Decode
+        # graphs, mirrors and collectives on this rank.
         try:
-            response = rpc(endpoint, {"op": "release", **message, "drained": True}, self.timeout)
+            response = rpc(endpoint, {"op": "release", **message, "drained": True}, self.timeout, client=control)
             if response["status"] != "released":
                 raise ValueError("Producer did not acknowledge drained transfer")
         except (TimeoutError, ValueError):
@@ -341,6 +379,107 @@ class HiSparsePDWorker:
             logger.warning("HiSparse P/D completed its reads but could not confirm producer lease release")
             return False
         return not cancelled.is_set()
+
+    @staticmethod
+    def _source_chunk(message, index, layer, parts):
+        segments = [[source, length] for destination, source, length in parts]
+        count = sum(length for source, length in segments)
+        return {
+            **message,
+            "chunk_id": f"{index}:0",
+            "layer": layer,
+            "source": segments[0][0],
+            "length": count,
+            "segments": segments,
+        }
+
+    def _release_stage_chunk(self, endpoint, chunk, prepared, control):
+        released = {"op": "stage_release", **chunk, "generation": prepared["generation"], "drained": True}
+        response = rpc(endpoint, released, self.timeout, client=control)
+        if (
+            response.get("status") != "stage_released"
+            or response.get("chunk_id") != chunk["chunk_id"]
+            or response.get("generation") != prepared["generation"]
+        ):
+            raise ValueError("Packed stage release is unconfirmed; source lease remains retained")
+
+    def _read_batches(self, descriptors, manifest, endpoint, message, cancelled, control):
+        batches = iter(enumerate(batch_source_transfers(descriptors)))
+        current, prepared, indexer_reads = next(batches, None), None, []
+        while current is not None:
+            index, (role, layer, parts) = current
+            if cancelled.is_set():
+                if prepared is not None:
+                    # The combined control already prepared this block, but no
+                    # read has used it. Release its exact generation before the
+                    # outer request lease can be returned.
+                    chunk = self._source_chunk(message, index, layer[0], parts)
+                    self._release_stage_chunk(endpoint, chunk, prepared, control)
+                break
+            following = next(batches, None)
+            if role == "hisparse_source":
+                if indexer_reads:
+                    self.reader.read(manifest["session"], indexer_reads)
+                    indexer_reads = []
+                next_chunk = None
+                if (
+                    manifest.get("stage_control_version") == 2
+                    and following is not None
+                    and following[1][0] == "hisparse_source"
+                ):
+                    j, (_, next_layer, next_parts) = following
+                    next_chunk = self._source_chunk(message, j, next_layer[0], next_parts)
+                prepared = self._read_staged_batch(
+                    endpoint,
+                    message,
+                    manifest["session"],
+                    manifest["stage_address"],
+                    index,
+                    layer[0],
+                    parts,
+                    control,
+                    prepared=prepared,
+                    next_chunk=next_chunk,
+                )
+            else:
+                indexer_reads.extend(parts)
+                if len(indexer_reads) == self.max_descriptors:
+                    self.reader.read(manifest["session"], indexer_reads)
+                    indexer_reads = []
+            current = following
+        if indexer_reads and not cancelled.is_set():
+            self.reader.read(manifest["session"], indexer_reads)
+
+    def _read_staged_batch(
+        self, endpoint, message, session, stage_address, index, layer, parts, control, *, prepared=None, next_chunk=None
+    ):
+        chunk = self._source_chunk(message, index, layer, parts)
+        count = chunk["length"]
+        if prepared is None:
+            prepared = prepare_stage(endpoint, chunk, self.timeout, client=control)
+        if prepared["stage_address"] != stage_address or self.stage_buffer is None:
+            raise ValueError("Packed read stage differs from its registered owner")
+        self.reader.read(session, [(self.stage_buffer.address, stage_address, count)])
+        destinations = [(destination, length) for destination, source, length in parts]
+        if next_chunk is not None and getattr(self, "_overlap_stage_copy", True):
+            # The synchronous URMA read has drained the P source slot. D2H
+            # uses the separate D receive slot, so P can prepare its successor
+            # while the existing D copy stream completes. Never reuse the D
+            # slot, its descriptors or Host owners before this exact fence.
+            token = self.stage_buffer.begin_copy_to_host_segments(destinations)
+            try:
+                released = {**chunk, "generation": prepared["generation"], "drained": True}
+                return advance_stage(endpoint, released, next_chunk, self.timeout, client=control)
+            finally:
+                # Also drain a submitted local copy when control fails. The
+                # outer source lease stays retained on either uncertain error.
+                self.stage_buffer.finish_copy_to_host(token)
+        self.stage_buffer.copy_to_host_segments(destinations)
+        if next_chunk is not None:
+            released = {**chunk, "generation": prepared["generation"], "drained": True}
+            return advance_stage(endpoint, released, next_chunk, self.timeout, client=control)
+        self._release_stage_chunk(endpoint, chunk, prepared, control)
+        return None
 
     def _read_staged_source(
         self,
@@ -354,6 +493,7 @@ class HiSparsePDWorker:
         source,
         length,
         cancelled=None,
+        control=None,
     ):
         for offset in range(0, length, STAGE_BYTES):
             if cancelled is not None and cancelled.is_set():
@@ -368,7 +508,7 @@ class HiSparsePDWorker:
             }
             # From this first prepare onwards an uncertain reply may own the P
             # stage. Errors must never enter the pre-read source-release path.
-            prepared = prepare_stage(endpoint, chunk, self.timeout)
+            prepared = prepare_stage(endpoint, chunk, self.timeout, client=control)
             if prepared["stage_address"] != stage_address:
                 raise ValueError("Prepared stage differs from the acquired producer HBM allocation")
             if self.stage_buffer is None:
@@ -386,6 +526,7 @@ class HiSparsePDWorker:
                     "drained": True,
                 },
                 self.timeout,
+                client=control,
             )
             if (
                 response.get("status") != "stage_released"
@@ -425,7 +566,7 @@ class HiSparsePDWorker:
             if self.stage_buffer is not None:
                 # Includes failed registration: only complete transport teardown
                 # proves that the raw allocation is no longer remotely owned.
-                self.stage_buffer.close()
+                self.stage_buffer.close(device_drained=True, transport_closed=True)
         except BaseException as cleanup_error:
             _retained_workers[id(self)] = self
             if transfer_error is not None:

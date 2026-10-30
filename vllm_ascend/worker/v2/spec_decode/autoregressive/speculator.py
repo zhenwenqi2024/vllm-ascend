@@ -546,6 +546,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, TargetDependent
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        skip_sample: bool = False,
     ) -> None:
         attn_metadata, slot_mappings = self._prepare_replicated_prefill_attn(
             attn_metadata,
@@ -569,6 +570,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, TargetDependent
             num_tokens_across_dp,
             cudagraph_runtime_mode,
             mm_inputs,
+            skip_sample=skip_sample,
         )
 
     def _build_attn_metadata(  # type: ignore[misc]

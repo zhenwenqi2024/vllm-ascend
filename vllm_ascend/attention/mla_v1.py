@@ -1138,23 +1138,21 @@ class AscendMLAImpl(MLAAttentionImpl):
         # scenario the graph is captured once, so every later weight update
         # reload has to refresh the stored tensors in place instead of
         # rebinding the attributes to freshly allocated tensors.
-        # `replace_parameter(..., prefer_copy=True)` does exactly that: it
+        # `replace_parameter(...)` does exactly that: it
         # copies into the existing storage while the new value stays
-        # compatible, and rebinds only when shape/dtype/device actually
-        # changes. This mirrors how upstream vLLM refreshes
+        # compatible, and rebinds its data when shape/stride/dtype/device
+        # changes, preserving the parameter object. Upstream refreshes
         # `MLAAttention.W_UV`/`W_UK_T`, and unlike a plain `copy_` it cannot
         # raise on a shape mismatch.
         replace_parameter(
             self,
             "W_UV",
             W_UV.transpose(0, 1).contiguous(),  # (L, N, V) -> (N, L, V)
-            prefer_copy=True,
         )
         replace_parameter(
             self,
             "W_UK_T",
             W_UK.permute(1, 2, 0).contiguous(),  # (L, N, P) -> (N, P, L)
-            prefer_copy=True,
         )
         self.mlapo_W_UK_T = self.W_UK_T
 

@@ -8,7 +8,6 @@ and payload copies stay on the NPU, including during ACL graph replay.
 
 from __future__ import annotations
 
-import ctypes
 import math
 import mmap
 
@@ -20,25 +19,23 @@ from vllm_ascend.ops.triton.hisparse import (
     classify_residency_kernel,
     finish_residency_kernel,
     gather_rows_kernel,
-    invalidate_kernel,
     pack_attention_rows_kernel,
     partition_residency_kernel,
     prepare_residency_kernel,
     protect_and_update_lru_kernel,
-    protected_lru_tile_prefix_kernel,
-    protected_lru_partition_kernel,
     protect_residency_kernel,
+    protected_lru_partition_kernel,
+    protected_lru_tile_prefix_kernel,
     residency_stats_kernel,
     scatter_packed_kv_kernel,
     update_lru_kernel,
 )
 
-_ACL_HOST_REGISTER_MAPPED = 0
-_ACL_HAC_AIV = 3
-
-
 # One int64 count per independent32-byte transfer line.
 LRU_TILE_COUNTER_STRIDE = 4
+
+
+_retained_mappings2511 = {}
 
 
 class MappedHostTensor:
@@ -52,41 +49,24 @@ class MappedHostTensor:
         if tensor.device.type != "cpu" or not tensor.is_contiguous():
             raise ValueError("HiSparse host mapping requires a contiguous CPU tensor")
         self.tensor = tensor
-        self._lib = ctypes.CDLL("libascendcl.so")
-        self._lib.aclrtHostRegister.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint64,
-            ctypes.c_int,
-            ctypes.POINTER(ctypes.c_void_p),
-        ]
-        self._lib.aclrtHostRegister.restype = ctypes.c_int
-        self._lib.aclrtHostUnregister.argtypes = [ctypes.c_void_p]
-        self._lib.aclrtHostUnregister.restype = ctypes.c_int
-        self._lib.aclrtHostMemMapCapabilities.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
-        self._lib.aclrtHostMemMapCapabilities.restype = ctypes.c_int
+        from pathlib import Path
+
+        extension = Path(__file__).with_name("hisparse_pta_host2511.so")
+        if not hasattr(torch.ops.hisparse_pta_host2511, "register_host"):
+            torch.ops.load_library(str(extension))
         device_index = torch.npu.current_device()
         self.device = torch.device("npu", device_index)
-        capability = ctypes.c_int()
-        status = self._lib.aclrtHostMemMapCapabilities(device_index, _ACL_HAC_AIV, ctypes.byref(capability))
-        if status or not capability.value:
-            raise RuntimeError(
-                f"HiSparse requires AIV host-memory mapping: status={status}, capability={capability.value}"
-            )
-        # The upstream host-pool allocator supplies an aligned subview of a
-        # larger backing allocation. Register that range, not its unaligned
-        # storage base; retained tensor ownership still retains the backing.
         self.host_address = tensor.data_ptr()
         self.nbytes = tensor.numel() * tensor.element_size()
         if not self.nbytes:
             raise ValueError("Cannot register an empty HiSparse host allocation")
-        mapped = ctypes.c_void_p()
-        status = self._lib.aclrtHostRegister(
-            self.host_address, self.nbytes, _ACL_HOST_REGISTER_MAPPED, ctypes.byref(mapped)
-        )
-        if status:
-            raise RuntimeError(f"aclrtHostRegister for HiSparse failed: {status}")
-        self.device_ptr = int(mapped.value)
         self.closed = False
+        _retained_mappings2511[id(self)] = self
+        self._registered = False
+        status, self.device_ptr = torch.ops.hisparse_pta_host2511.register_host(tensor, device_index)
+        self._registered = status == 0
+        if status or not self.device_ptr:
+            raise RuntimeError(f"PTA mapped Host registration failed: status={status}; CPU owner retained")
 
     def address_of(self, tensor: torch.Tensor) -> int:
         offset = tensor.data_ptr() - self.host_address
@@ -99,10 +79,13 @@ class MappedHostTensor:
 
     def close(self) -> None:
         if not self.closed:
-            status = self._lib.aclrtHostUnregister(self.host_address)
+            if not self._registered:
+                raise RuntimeError("Retain uncertain Host registration until explicitly resolved")
+            status = torch.ops.hisparse_pta_host2511.unregister_host(self.tensor, self.device.index)
             if status:
-                raise RuntimeError(f"aclrtHostUnregister for HiSparse failed: {status}")
+                raise RuntimeError(f"PTA Host unregister failed: {status}; owner retained")
             self.closed = True
+            _retained_mappings2511.pop(id(self), None)
 
 
 def allocate_mapped_host(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
@@ -238,6 +221,7 @@ class HiSparseNPUOps:
         resident_block_table,
         resident_block_size,
         resident_null_block,
+        num_valid_rows=None,
     ) -> None:
         workspace = self.workspace
         if workspace is None:
@@ -271,6 +255,10 @@ class HiSparseNPUOps:
         ):
             if tensor is not None:
                 _check_tensor(tensor, name, device, (torch.int32,), shape=(rows, topk))
+        if num_valid_rows is not None:
+            _check_tensor(num_valid_rows, "num_valid_rows", device, (torch.int32,))
+            if num_valid_rows.numel() != 1 or request_ids is None:
+                raise ValueError("HiSparse valid-row count requires one int32 device scalar and request IDs")
         if request_ids is not None:
             _check_tensor(request_ids, "request_ids", device, (torch.int32,), shape=(rows,))
         if request_state_indices is not None:
@@ -318,6 +306,12 @@ class HiSparseNPUOps:
             != 1
         ):
             raise ValueError("All three compact HiSparse swap outputs are required together")
+        # Preserve the validated resolver ABI; other cache types use the
+        # existing implementation below. Gather/event ordering is unchanged.
+        from vllm_ascend.ops.hisparse_ascendc import try_resolve
+
+        if try_resolve(self, locals()):
+            return
         row_keys = workspace.row_keys[: rows * topk].view(rows, topk)
         sorted_rows = workspace.sorted_rows[: rows * topk].view(rows, topk)
         row_sort_indices = workspace.row_sort_indices[: rows * topk].view(rows, topk)
@@ -336,6 +330,8 @@ class HiSparseNPUOps:
             row_keys,
             cache_keys,
             workspace.metadata,
+            num_valid_rows if num_valid_rows is not None else dummy,
+            HAS_VALID_ROWS=num_valid_rows is not None,
             ROWS=rows,
             TOP_K=topk,
             HOT_SIZE=hot_size,
@@ -368,18 +364,21 @@ class HiSparseNPUOps:
         # allocation and original first-row addressing for every other stage.
         if (
             self.uniform_query_group_size == 4
-            and rows in (32, 64)
+            and rows in (16, 32, 64)
             and topk == 2048
             and hot_size == 10240
             and request_ids is not None
         ):
             torch.sort(
-                cache_keys[::4], dim=-1,
+                cache_keys[::4],
+                dim=-1,
                 out=(sorted_cache[::4], workspace.cache_sort_indices[:rows:4]),
             )
         else:
             torch.sort(cache_keys, dim=-1, out=(sorted_cache, workspace.cache_sort_indices[:rows]))
-        use_protected = self.use_fused_index_ops and hot_cache.dtype == torch.float8_e4m3fn and hot_cache.shape[-1] == 656
+        use_protected = (
+            self.use_fused_index_ops and hot_cache.dtype == torch.float8_e4m3fn and hot_cache.shape[-1] == 656
+        )
         if use_protected:
             # Existing group-owned scratch; refreshed for every resolver call
             # on the same copy stream before classification publishes hits.
@@ -408,22 +407,43 @@ class HiSparseNPUOps:
             # sort/classification and is rebuilt at the next invocation.
             tiles = triton.cdiv(hot_size, 256)
             protected_lru_tile_prefix_kernel[(rows, tiles)](
-                workspace.protected, workspace.metadata, workspace.row_stats,
-                lru_slots, workspace.hit_prefix, cache_keys,
-                HOT_SIZE=hot_size, STATE_ROWS=device_global_indices.size(0),
-                BLOCK=256, COUNT_STRIDE=LRU_TILE_COUNTER_STRIDE, multibuffer=False,
+                workspace.protected,
+                workspace.metadata,
+                workspace.row_stats,
+                lru_slots,
+                workspace.hit_prefix,
+                cache_keys,
+                HOT_SIZE=hot_size,
+                STATE_ROWS=device_global_indices.size(0),
+                BLOCK=256,
+                COUNT_STRIDE=LRU_TILE_COUNTER_STRIDE,
+                multibuffer=False,
             )
             protected_lru_partition_kernel[(rows, tiles)](
-                workspace.protected, workspace.metadata, workspace.row_stats,
-                lru_slots, workspace.hit_prefix, cache_keys, workspace.lru_temp,
-                workspace.errors, HOT_SIZE=hot_size, MAX_UNION=max_union_rows,
-                STATE_ROWS=device_global_indices.size(0), BLOCK=256,
-                TILES=tiles, COUNT_BLOCK=triton.next_power_of_2(tiles),
-                COUNT_STRIDE=LRU_TILE_COUNTER_STRIDE, multibuffer=False,
+                workspace.protected,
+                workspace.metadata,
+                workspace.row_stats,
+                lru_slots,
+                workspace.hit_prefix,
+                cache_keys,
+                workspace.lru_temp,
+                workspace.errors,
+                HOT_SIZE=hot_size,
+                MAX_UNION=max_union_rows,
+                STATE_ROWS=device_global_indices.size(0),
+                BLOCK=256,
+                TILES=tiles,
+                COUNT_BLOCK=triton.next_power_of_2(tiles),
+                COUNT_STRIDE=LRU_TILE_COUNTER_STRIDE,
+                multibuffer=False,
             )
             update_lru_kernel[(rows, tiles)](
-                workspace.metadata, workspace.lru_temp, lru_slots,
-                workspace.errors, HOT_SIZE=hot_size, BLOCK=256,
+                workspace.metadata,
+                workspace.lru_temp,
+                lru_slots,
+                workspace.errors,
+                HOT_SIZE=hot_size,
+                BLOCK=256,
                 multibuffer=False,
             )
         elif self.use_fused_index_ops:
@@ -582,7 +602,35 @@ class HiSparseNPUOps:
                 raise ValueError("HiSparse attention block stride must cover a physical block")
         if rows == 0:
             return
-        gather_rows_kernel[(rows, topk)](
+        # The qualified C8 compact gather has no attention/state side outputs.
+        # Retain the original kernel for all other geometries and modes.
+        persistent = (
+            row_bytes == 656
+            and block_size == 128
+            and hot_stride == 419840
+            and topk == 2048
+            and rows <= 128
+            and counts is not None
+            and state is None
+            and attention is None
+        )
+        kernel = gather_rows_kernel
+        extra = {}
+        columns = topk
+        global_workers = getattr(self, "prefetch_gather_global_workers", 0) if persistent else 0
+        if global_workers:
+            from vllm_ascend.ops.triton.hisparse_gather_global import gather_compact_global_kernel
+
+            kernel = gather_compact_global_kernel
+            extra = dict(ROWS=rows)
+        elif persistent:
+            from vllm_ascend.ops.triton.hisparse_gather_persistent import gather_rows_persistent_kernel
+
+            kernel = gather_rows_persistent_kernel
+            columns = 256
+            extra = dict(TILE_ROWS=256)
+        grid = (global_workers,) if global_workers else (rows, columns)
+        kernel[grid](
             self.host_mapping.address_of(host_cache),
             hot_cache.view(torch.uint8),
             source,
@@ -603,34 +651,27 @@ class HiSparseNPUOps:
             HAS_STATE=state is not None,
             BLOCK=min(1024, triton.next_power_of_2(row_bytes)),
             multibuffer=False,
+            **extra,
         )
 
     @staticmethod
     def hisparse_invalidate_written_slots(
-        device_global_indices, request_state_indices, req_id_per_token, written_slots
+        device_global_indices_ptrs,
+        request_state_indices,
+        req_id_per_token,
+        written_slots,
+        num_state_rows,
+        region_stride,
     ) -> None:
-        device = device_global_indices.device
-        if device.type != "npu":
-            raise ValueError("HiSparse invalidation requires NPU state")
-        _check_tensor(device_global_indices, "device_global_indices", device, (torch.int32,), ndim=2)
-        _check_tensor(request_state_indices, "request_state_indices", device, (torch.int32,), ndim=1)
-        _check_tensor(written_slots, "written_slots", device, (torch.int32, torch.int64), ndim=1)
-        _check_tensor(req_id_per_token, "req_id_per_token", device, (torch.int32,), shape=written_slots.shape)
-        if written_slots.numel() == 0:
-            return
-        region = device_global_indices.size(1)
-        if region == 0:
-            return
-        invalidate_kernel[(written_slots.numel(), triton.cdiv(region, 256))](
-            device_global_indices,
+        from vllm_ascend.ops.triton.hisparse_invalidate_groups import invalidate_written_groups
+
+        invalidate_written_groups(
+            device_global_indices_ptrs,
             request_state_indices,
             req_id_per_token,
             written_slots,
-            REQUESTS=request_state_indices.numel(),
-            STATE_ROWS=device_global_indices.size(0),
-            REGION=region,
-            BLOCK=256,
-            multibuffer=False,
+            num_state_rows,
+            region_stride,
         )
 
 

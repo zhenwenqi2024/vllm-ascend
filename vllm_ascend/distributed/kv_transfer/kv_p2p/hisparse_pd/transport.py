@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import threading
 import time
 
 import zmq
+from zmq.utils import jsonapi
 
 from .configuration import DEFAULT_URMA_SWAP_MIB, configure_urma_staging, parse_urma_swap_mib
 from .protocol import STAGE_BYTES, LeaseRegistry, validate_wire
@@ -45,7 +49,8 @@ class LeaseServer:
                     if not socket.poll(100):
                         continue
                     try:
-                        message = socket.recv_json()
+                        raw_message = socket.recv()
+                        message = jsonapi.loads(raw_message)
                         validate_wire(message)
                         if message["op"] == "lookup":
                             lookup = getattr(self.registry, "lookup_wire", None)
@@ -65,15 +70,33 @@ class LeaseServer:
                                 message["lease_id"], message["consumer"], drained=message["drained"] is True
                             )
                             response = {"status": "released"}
-                        elif message["op"] in ("stage_prepare", "stage_release"):
+                        elif message["op"] in ("stage_prepare", "stage_release", "stage_advance"):
                             if self.stage is None:
                                 raise ValueError("Producer HBM staging is not available")
-                            method = self.stage.prepare if message["op"] == "stage_prepare" else self.stage.release
+                            method = {
+                                "stage_prepare": self.stage.prepare,
+                                "stage_release": self.stage.release,
+                                "stage_advance": self.stage.advance,
+                            }[message["op"]]
                             response = method(message)
                         else:
                             raise ValueError("Unknown HiSparse P/D control operation")
                     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
                         response = {"status": "error", "error": str(exc)}
+                        if isinstance(exc, json.JSONDecodeError):
+                            # Preserve the failing control bytes before any
+                            # subsequent receive can obscure their provenance.
+                            start = max(0, exc.pos - 64)
+                            response["wire_failure"] = {
+                                "bytes": len(raw_message),
+                                "sha256": hashlib.sha256(raw_message).hexdigest(),
+                                "position": exc.pos,
+                                "context_start": start,
+                                "context_base64": base64.b64encode(raw_message[start : start + 192]).decode(),
+                                "raw_base64": base64.b64encode(raw_message).decode()
+                                if len(raw_message) <= 4096
+                                else None,
+                            }
                     socket.send_json(response)
         except BaseException as exc:
             self.error = exc
@@ -86,27 +109,118 @@ class LeaseServer:
             raise RuntimeError("HiSparse P/D control server did not stop")
 
 
-def rpc(endpoint: str, message: dict, timeout_seconds: float) -> dict:
-    with zmq.Context() as context, context.socket(zmq.REQ) as socket:
-        socket.setsockopt(zmq.LINGER, 0)
-        socket.setsockopt(zmq.MAXMSGSIZE, 64 * 1024 * 1024)
-        socket.connect(endpoint)
-        socket.send_json(message)
-        if not socket.poll(max(1, int(timeout_seconds * 1000))):
-            raise TimeoutError("HiSparse P/D control request timed out; source lease remains retained")
+class RpcClient:
+    """One request's control connection, exclusively owned by its receive thread.
+
+    Only a matching reply permits reuse. Any failure discards that REQ socket;
+    a later explicit operation can open a fresh socket, never retry this one.
+    The request's context manager closes everything on the same thread.
+    """
+
+    def __init__(self, endpoint: str, *, on_stall=None):
+        self.endpoint = endpoint
+        self.on_stall = on_stall
+        self._owner = threading.get_ident()
+        self._context = None
+        self._socket = None
+        self._closed = False
+
+    def _check_owner(self):
+        if threading.get_ident() != self._owner:
+            raise RuntimeError("HiSparse control connection belongs to a different thread")
+        if self._closed:
+            raise RuntimeError("HiSparse control connection is closed")
+
+    def __enter__(self):
+        self._check_owner()
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def _discard_socket(self):
+        if self._socket is not None:
+            self._socket.close(linger=0)
+            self._socket = None
+
+    def call(self, message: dict, timeout_seconds: float) -> dict:
+        self._check_owner()
+        try:
+            if self._context is None:
+                self._context = zmq.Context()
+            if self._socket is None:
+                self._socket = self._context.socket(zmq.REQ)
+                self._socket.setsockopt(zmq.LINGER, 0)
+                self._socket.setsockopt(zmq.MAXMSGSIZE, 64 * 1024 * 1024)
+                self._socket.connect(self.endpoint)
+            return self._exchange(self._socket, message, timeout_seconds)
+        except BaseException:
+            self._discard_socket()
+            raise
+
+    def close(self):
+        if self._closed:
+            return
+        self._check_owner()
+        self._discard_socket()
+        if self._context is not None:
+            self._context.term()
+            self._context = None
+        self._closed = True
+
+    def _exchange(self, socket, message, timeout_seconds):
+        # Preserve the actual encoded bytes before sending.
+        # The old failure path re-encoded the dict after the error arrived.
+        wire = jsonapi.dumps(message)
+        sent_sha256_before = hashlib.sha256(wire).hexdigest()
+        sent_base64_before = base64.b64encode(wire).decode() if len(wire) <= 4096 else None
+        socket.send(wire, copy=True)
+        deadline = time.monotonic() + timeout_seconds
+        captured = False
+        while True:
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            interval = remaining_ms if self.on_stall is None else min(1000, remaining_ms)
+            if socket.poll(interval):
+                break
+            if self.on_stall is not None and not captured and time.monotonic() >= deadline - timeout_seconds + 5:
+                self.on_stall(self.endpoint, message, wire, sent_sha256_before, sent_base64_before)
+                captured = True
+            if time.monotonic() >= deadline:
+                raise TimeoutError("HiSparse P/D control request timed out; source lease remains retained")
         result = socket.recv_json()
         if result.get("status") == "error":
+            evidence = result.get("wire_failure")
+            if evidence is not None:
+                expected = wire
+                details = {
+                    "received": evidence,
+                    "sent_bytes": len(expected),
+                    "sent_sha256": sent_sha256_before,
+                    "send_buffer_sha256_after": hashlib.sha256(expected).hexdigest(),
+                    "send_buffer_unchanged": hashlib.sha256(expected).hexdigest() == sent_sha256_before,
+                    "sent_base64": sent_base64_before,
+                }
+                raise ValueError(result["error"] + "; control_wire=" + json.dumps(details, sort_keys=True))
             raise ValueError(result["error"])
         return result
 
 
-def acquire(endpoint: str, message: dict, timeout_seconds: float, cancelled: threading.Event) -> dict:
+def rpc(endpoint: str, message: dict, timeout_seconds: float, *, client=None) -> dict:
+    if client is not None:
+        if endpoint != client.endpoint:
+            raise ValueError("Control connection endpoint differs from this request")
+        return client.call(message, timeout_seconds)
+    with RpcClient(endpoint) as temporary:
+        return temporary.call(message, timeout_seconds)
+
+
+def acquire(endpoint: str, message: dict, timeout_seconds: float, cancelled: threading.Event, *, client=None) -> dict:
     deadline = time.monotonic() + timeout_seconds
     while not cancelled.is_set():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Producer did not publish its completed KV before the deadline")
-        result = rpc(endpoint, {"op": "acquire", **message}, min(remaining, 5))
+        result = rpc(endpoint, {"op": "acquire", **message}, remaining, client=client)
         if result["status"] == "ready":
             return result["manifest"]
         if result["status"] != "pending":
@@ -115,27 +229,55 @@ def acquire(endpoint: str, message: dict, timeout_seconds: float, cancelled: thr
     raise TransferCancelled("HiSparse P/D request was cancelled before acquisition")
 
 
-def prepare_stage(endpoint, message, timeout_seconds):
-    """Poll a busy slot only. An uncertain prepare/reply keeps its source lease."""
+def validate_prepared_stage(response, message):
+    validate_wire(response)
+    if (
+        response.get("status") != "ready"
+        or response.get("chunk_id") != message["chunk_id"]
+        or response.get("length") != message["length"]
+        or type(response.get("generation")) is not int
+        or response["generation"] <= 0
+        or type(response.get("stage_address")) is not int
+        or response["stage_address"] <= 0
+        or response.get("capacity") != STAGE_BYTES
+    ):
+        raise ValueError("Producer stage response differs from the bounded request")
+    return response
+
+
+def advance_stage(endpoint, released, following, timeout_seconds, *, client=None):
+    response = rpc(
+        endpoint,
+        {**released, "op": "stage_advance", "released": released, "next": following},
+        timeout_seconds,
+        client=client,
+    )
+    ack = response.get("released", {})
+    if (
+        response.get("status") != "stage_advanced"
+        or ack.get("status") != "stage_released"
+        or ack.get("generation") != released["generation"]
+        or ack.get("chunk_id") != released["chunk_id"]
+    ):
+        raise ValueError("Stage advance has no matching drained release acknowledgement")
+    return validate_prepared_stage(response.get("prepared", {}), following)
+
+
+def prepare_stage(endpoint, message, timeout_seconds, *, client=None):
+    """Poll a busy slot within the caller's transfer deadline.
+
+    The control server also completes synchronous H2D copies. A five-second
+    polling interval must not shorten its response budget during another
+    request's prefill. Uncertain replies still retain the source lease.
+    """
     deadline = time.monotonic() + timeout_seconds
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Producer stage remains owned; no timeout reuse is permitted")
-        response = rpc(endpoint, {"op": "stage_prepare", **message}, min(remaining, 5))
+        response = rpc(endpoint, {"op": "stage_prepare", **message}, remaining, client=client)
         if response.get("status") == "ready":
-            validate_wire(response)
-            if (
-                response.get("chunk_id") != message["chunk_id"]
-                or response.get("length") != message["length"]
-                or type(response.get("generation")) is not int
-                or response["generation"] <= 0
-                or type(response.get("stage_address")) is not int
-                or response["stage_address"] <= 0
-                or response.get("capacity") != STAGE_BYTES
-            ):
-                raise ValueError("Producer stage response differs from the bounded request")
-            return response
+            return validate_prepared_stage(response, message)
         if response.get("status") != "pending":
             raise ValueError("Unexpected producer stage state")
         time.sleep(min(remaining, 0.01))

@@ -165,8 +165,8 @@ def _record_cos_and_sin_cache_interleaved(owner: "torch.nn.Module", cos_sin_cach
         return
     hidden_dim = cos_sin_cache.shape[-1] // 2
     cos_cache, sin_cache = cos_sin_cache.view(-1, 2, hidden_dim).repeat(1, 1, 2).chunk(2, dim=1)
-    _cos_cache = cos_cache.squeeze(1)
-    _sin_cache = sin_cache.squeeze(1)
+    _cos_cache = cos_cache.squeeze(1).contiguous()
+    _sin_cache = sin_cache.squeeze(1).contiguous()
     owner.register_buffer("_rope_derived_cos_cache", _cos_cache, persistent=False)
     owner.register_buffer("_rope_derived_sin_cache", _sin_cache, persistent=False)
 

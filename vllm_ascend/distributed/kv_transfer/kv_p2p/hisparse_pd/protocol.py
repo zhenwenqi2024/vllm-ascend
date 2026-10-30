@@ -7,6 +7,8 @@ contract. They do not allocate KV blocks or implement a second cache manager.
 
 from __future__ import annotations
 
+import bisect
+import copy
 import hashlib
 import json
 import threading
@@ -14,7 +16,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
-VERSION = 4
+VERSION = 5
 BF16_FORMAT = "bf16"
 C8_FORMAT = "ascend_sfa_e4m3fn_nope512_rope64_scale4_tile128_v1"
 INDEXER_FP8_FORMAT = "ascend_indexer_e4m3fn_key_fp32_scale_v1"
@@ -184,52 +186,77 @@ def coalesce_transfers(descriptors):
             ):
                 result[-1] = dst, src, count + length, role, layer
                 continue
+            # Two descending adjacent runs preserve the same byte mapping
+            # when copied together from their lower physical addresses.
+            # Restrict this reordering to SOURCE; INDEXER keeps its D2D path.
+            if (
+                role == previous_role == "hisparse_source"
+                and layer == previous_layer
+                and destination + length == dst
+                and source + length == src
+            ):
+                result[-1] = destination, source, count + length, role, layer
+                continue
         result.append((destination, source, length, role, layer))
     return result
 
 
-def validate_source_range(manifest: dict, message: dict) -> None:
-    """Validate only published SOURCE bytes after the registry checks its reader."""
+def build_source_range_index(manifest: dict) -> dict:
+    """Snapshot published SOURCE coverage once for this request lease.
+
+    The immutable interval tuples describe only this publication. They retain
+    no KV allocation and disappear with the existing request lease.
+    """
+    validate_wire(manifest)
+    tokens = manifest["ticket"]["num_tokens"]
+    if type(tokens) is not int or tokens <= 0:
+        raise ValueError("Invalid published source token interval")
+    coverage = {}
+    for item in manifest["layers"]:
+        if item["role"] != "hisparse_source":
+            continue
+        layer = LayerLayout(**item)
+        if layer.name in coverage:
+            raise ValueError("Stage requires one declared SOURCE layer")
+        blocks = manifest["blocks"].get(layer.group_id, manifest["blocks"].get(str(layer.group_id)))
+        required = (tokens + layer.block_size - 1) // layer.block_size
+        if not isinstance(blocks, list) or len(blocks) < required:
+            raise ValueError("Missing published source blocks")
+        intervals = []
+        for page, block in enumerate(blocks[:required]):
+            if type(block) is not int:
+                raise ValueError("Invalid published source block")
+            base = layer.address(block)
+            extent = min(layer.block_size, tokens - page * layer.block_size) * layer.row_bytes
+            intervals.append((base, base + extent))
+        merged = []
+        for base, end in sorted(intervals):
+            if merged and base <= merged[-1][1]:
+                merged[-1] = merged[-1][0], max(end, merged[-1][1])
+            else:
+                merged.append((base, end))
+        coverage[layer.name] = tuple(x[0] for x in merged), tuple(x[1] for x in merged)
+    return dict(identity=(manifest["identity"], manifest["rank"], manifest["world_size"]), coverage=coverage)
+
+
+def validate_source_range(manifest: dict, message: dict, *, range_index=None) -> None:
+    """Validate only published bytes, using a request-owned interval snapshot."""
     validate_wire(message)
     if any(type(message.get(key)) is not int for key in ("rank", "world_size", "source", "length")):
         raise ValueError("Stage geometry and rank fields must be integers")
     source, length = message["source"], message["length"]
     if source <= 0 or not 0 < length <= STAGE_BYTES or source + length >= 2**64:
         raise ValueError("Invalid bounded stage source range")
-    validate_wire(manifest)
-    if (manifest["identity"], manifest["rank"], manifest["world_size"]) != (
-        message["identity"],
-        message["rank"],
-        message["world_size"],
-    ):
+    index = build_source_range_index(manifest) if range_index is None else range_index
+    if index["identity"] != (message["identity"], message["rank"], message["world_size"]):
         raise ValueError("Stage model, rank, or TP size mismatch")
-    layers = [LayerLayout(**item) for item in manifest["layers"] if item["name"] == message["layer"]]
-    if len(layers) != 1 or layers[0].role != "hisparse_source":
+    coverage = index["coverage"].get(message["layer"])
+    if coverage is None:
         raise ValueError("Stage requires one declared SOURCE layer")
-    layer = layers[0]
-    blocks = manifest["blocks"].get(layer.group_id, manifest["blocks"].get(str(layer.group_id)))
-    tokens = manifest["ticket"]["num_tokens"]
-    if type(tokens) is not int or tokens <= 0 or not isinstance(blocks, list):
-        raise ValueError("Invalid published source token interval")
-    required = (tokens + layer.block_size - 1) // layer.block_size
-    if len(blocks) < required:
-        raise ValueError("Missing published source blocks")
-    intervals = []
-    for page, block in enumerate(blocks[:required]):
-        if type(block) is not int:
-            raise ValueError("Invalid published source block")
-        base = layer.address(block)
-        extent = min(layer.block_size, tokens - page * layer.block_size) * layer.row_bytes
-        intervals.append((base, base + extent))
-    covered_end = source
-    for base, end in sorted(intervals):
-        if base > covered_end:
-            break
-        if end > covered_end:
-            covered_end = end
-        if covered_end >= source + length:
-            return
-    raise ValueError("Stage range is outside the acquired lease SOURCE segments")
+    starts, ends = coverage
+    position = bisect.bisect_right(starts, source) - 1
+    if position < 0 or source + length > ends[position]:
+        raise ValueError("Stage range is outside the acquired lease SOURCE segments")
 
 
 class LeaseRegistry:
@@ -267,9 +294,14 @@ class LeaseRegistry:
             self._prune_tombstones()
             if lease_id in self._leases or lease_id in self._released:
                 raise ValueError("Duplicate export lease")
+            # Freeze publication metadata before indexing its leased extents.
+            # Later caller mutation cannot widen this lease's allowed bytes.
+            manifest = copy.deepcopy(manifest)
+            range_index = build_source_range_index(manifest)
             self._leases[lease_id] = {
                 "request_id": request_id,
                 "manifest": manifest,
+                "source_range_index": range_index,
                 "consumer": None,
                 "expires": time.monotonic() + self.unclaimed_timeout,
             }
@@ -316,7 +348,7 @@ class LeaseRegistry:
             lease = self._leases.get(message["lease_id"])
             if lease is None or not message["consumer"] or lease["consumer"] != message["consumer"]:
                 raise ValueError("Stage requires the owning acquired lease")
-            validate_source_range(lease["manifest"], message)
+            validate_source_range(lease["manifest"], message, range_index=lease["source_range_index"])
 
     def stage_position(self, lease_id, consumer):
         with self._lock:
@@ -353,3 +385,33 @@ class LeaseRegistry:
 def encode_layouts(layouts: list[LayerLayout]) -> list[dict]:
     validate_layouts(layouts)
     return [asdict(layer) for layer in layouts]
+
+
+def batch_source_transfers(descriptors):
+    """Pack logical SOURCE fragments within one 16 MiB, 256-segment slot.
+
+    Source/destination block allocation and logical ordering are unchanged.
+    INDEXER descriptors keep their original D2D path and relative ordering.
+    """
+    parts, byte_count, owner = [], 0, None
+    for destination, source, length, role, layer in descriptors:
+        if role != "hisparse_source":
+            if parts:
+                yield "hisparse_source", owner, parts
+                parts, byte_count, owner = [], 0, None
+            yield role, layer, [(destination, source, length)]
+            continue
+        if parts and owner != layer:
+            yield "hisparse_source", owner, parts
+            parts, byte_count = [], 0
+        owner = layer
+        while length:
+            count = min(length, STAGE_BYTES - byte_count)
+            parts.append((destination, source, count))
+            byte_count += count
+            destination, source, length = destination + count, source + count, length - count
+            if byte_count == STAGE_BYTES or len(parts) == 256:
+                yield "hisparse_source", owner, parts
+                parts, byte_count = [], 0
+    if parts:
+        yield "hisparse_source", owner, parts

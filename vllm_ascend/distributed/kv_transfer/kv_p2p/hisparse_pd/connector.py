@@ -214,6 +214,8 @@ class HiSparsePDConnector(KVConnectorBase_V1, SupportsHMA):
         if not isinstance(metadata, HiSparsePDMetadata):
             raise TypeError("HiSparse P/D received the wrong child metadata")
         self.connector_worker.queue(metadata)
+        if self.producer:
+            self.connector_worker.publish_ready_exports()
 
     def get_transfer_results(self, finished_req_ids):
         sending, receiving, failed = self.connector_worker.poll(finished_req_ids)

@@ -94,7 +94,9 @@ def compact_c8_indices(indices: torch.Tensor) -> torch.Tensor:
     return torch.gather(indices, -1, order)
 
 
-def c8_physical_attention(query, query_rope, cache, indices, scale, query_ends, key_length, *, _prepared_indices=False):
+def c8_physical_attention(
+    query, query_rope, cache, indices, scale, query_ends, key_length, *, _prepared_indices=False, _mapping_scope=None
+):
     """Use custom quantized SFA with its LSE-enabled valid-length path.
 
     Logical causality must already be enforced by the indexer and resolver.
@@ -123,14 +125,48 @@ def c8_physical_attention(query, query_rope, cache, indices, scale, query_ends, 
         raise ValueError("HiSparse C8 attention scale must be finite and positive")
     from vllm_ascend.ops.hisparse_c8_mapping import map_compact_c8_indices
 
+    packed_query = None
     if _prepared_indices:
         if indices.dtype != torch.int32 or stride_rows != block or not indices.is_contiguous():
             raise ValueError("Prepared C8 indices require contiguous int32 rows and an identity staging layout")
         mapped = indices
     else:
-        mapped = map_compact_c8_indices(indices, block, stride_rows, capacity)
+        # The existing group scope certifies one current captured producer.
+        # Followers reuse only its mapped indices; each packs its own query.
+        fused = None
+        if (
+            _mapping_scope is not None
+            and rows in (8, 16)
+            and _mapping_scope.context() is not None
+            and torch.npu.is_current_stream_capturing()
+        ):
+            binding = _mapping_scope.binding(indices, block, stride_rows, capacity)
+            if binding is not None and _mapping_scope.result is None:
+                from vllm_ascend.ops.triton.hisparse_c8_map_pack import map_pack
+
+                fused = map_pack(
+                    indices,
+                    block,
+                    stride_rows,
+                    _mapping_scope.physical_bound,
+                    query,
+                    query_rope,
+                    query_ends,
+                    key_length,
+                    view.shape[0],
+                )
+                _mapping_scope.key = binding
+                _mapping_scope.result = fused[0]
+        if fused is None:
+            mapped = map_compact_c8_indices(indices, block, stride_rows, capacity, _scope=_mapping_scope)
+        else:
+            mapped, packed_query = fused
+    from vllm_ascend.ops.triton.hisparse_c8_fused import pack_c8_query_lengths
+
+    if packed_query is None:
+        packed_query = pack_c8_query_lengths(query, query_rope, query_ends, key_length, view.shape[0])
     output = torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention_vllm(
-        query=torch.cat((query, query_rope), dim=-1),
+        query=packed_query,
         key=view,
         value=view,
         sparse_indices=mapped.unsqueeze(1),
@@ -151,4 +187,6 @@ def c8_physical_attention(query, query_rope, cache, indices, scale, query_ends, 
     )
     if isinstance(output, tuple):
         output = output[0]
-    return output.masked_fill(~(mapped >= 0).any(dim=-1)[:, None, None], 0)
+    # The pinned LSE-enabled C8 kernel clears all outputs before
+    # skipping empty valid prefixes. Preserve that raw output.
+    return output

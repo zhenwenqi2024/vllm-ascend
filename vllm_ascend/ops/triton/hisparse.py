@@ -88,6 +88,8 @@ def prepare_residency_kernel(
     row_keys,
     cache_keys,
     metadata,
+    num_valid_rows,
+    HAS_VALID_ROWS: tl.constexpr,
     ROWS: tl.constexpr,
     TOP_K: tl.constexpr,
     HOT_SIZE: tl.constexpr,
@@ -114,20 +116,22 @@ def prepare_residency_kernel(
     BK: tl.constexpr,
 ):
     row = tl.program_id(0)
+    valid_rows = tl.maximum(0, tl.minimum(ROWS, tl.load(num_valid_rows))) if HAS_VALID_ROWS else ROWS
     request = tl.load(requests + row) if HAS_REQUESTS else row
+    request = tl.where(row < valid_rows, request, -1)
     first = row
     end = row + 1
     if HAS_REQUESTS:
-        searching = first > 0
+        searching = (first > 0) & (row < valid_rows)
         while searching:
             same = tl.load(requests + first - 1, mask=first > 0, other=-2147483648) == request
             same = same & (first > 0)
             first -= same.to(tl.int32)
             searching = same
-        searching = end < ROWS
+        searching = end < valid_rows
         while searching:
-            same = tl.load(requests + end, mask=end < ROWS, other=-2147483648) == request
-            same = same & (end < ROWS)
+            same = tl.load(requests + end, mask=end < valid_rows, other=-2147483648) == request
+            same = same & (end < valid_rows)
             end += same.to(tl.int32)
             searching = same
     state = tl.load(states + request, mask=(request >= 0) & (request < STATE_COUNT), other=-1) if HAS_STATE else request
@@ -210,12 +214,12 @@ def classify_residency_kernel(
         remaining = tl.sum(hit.to(tl.int32), 0)
         while remaining > 0:
             cursor = position + offset
-            duplicate_key = tl.load(sorted_cache + first * HOT_SIZE + cursor,
-                mask=hit & (cursor < HOT_SIZE), other=9223372036854775807)
+            duplicate_key = tl.load(
+                sorted_cache + first * HOT_SIZE + cursor, mask=hit & (cursor < HOT_SIZE), other=9223372036854775807
+            )
             duplicate = hit & (cursor < HOT_SIZE) & ((duplicate_key >> 32).to(tl.int32) == host)
             other_slot = (duplicate_key & 4294967295).to(tl.int32)
-            tl.atomic_max(protected + first.to(tl.int64) * HOT_SIZE + other_slot, 1,
-                mask=duplicate, sem="relaxed")
+            tl.atomic_max(protected + first.to(tl.int64) * HOT_SIZE + other_slot, 1, mask=duplicate, sem="relaxed")
             remaining = tl.sum(duplicate.to(tl.int32), 0)
             offset += 1
     else:
@@ -336,8 +340,15 @@ def update_lru_kernel(metadata, temp_lru, lru, errors, HOT_SIZE: tl.constexpr, B
 
 @triton.jit
 def protected_lru_tile_prefix_kernel(
-    protected, metadata, row_stats, lru, hit_prefix, tile_counts,
-    HOT_SIZE: tl.constexpr, STATE_ROWS: tl.constexpr, BLOCK: tl.constexpr,
+    protected,
+    metadata,
+    row_stats,
+    lru,
+    hit_prefix,
+    tile_counts,
+    HOT_SIZE: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
+    BLOCK: tl.constexpr,
     COUNT_STRIDE: tl.constexpr = 4,
 ):
     first = tl.program_id(0)
@@ -354,8 +365,14 @@ def protected_lru_tile_prefix_kernel(
         if references > 0:
             valid = (state >= 0) & (state < STATE_ROWS) & (p < HOT_SIZE)
             slot = tl.load(lru + state.to(tl.int64) * HOT_SIZE + p, mask=valid, other=-1).to(tl.int32)
-            hit = tl.load(protected + first.to(tl.int64) * HOT_SIZE + slot,
-                mask=valid & (slot >= 0) & (slot < HOT_SIZE), other=0) != 0
+            hit = (
+                tl.load(
+                    protected + first.to(tl.int64) * HOT_SIZE + slot,
+                    mask=valid & (slot >= 0) & (slot < HOT_SIZE),
+                    other=0,
+                )
+                != 0
+            )
     prefix = tl.cumsum(hit.to(tl.int32), 0)
     tl.store(hit_prefix + first.to(tl.int64) * HOT_SIZE + p, prefix, mask=p < HOT_SIZE)
     # cache_keys is no longer read after classification. Each tile owns one
@@ -365,9 +382,20 @@ def protected_lru_tile_prefix_kernel(
 
 @triton.jit
 def protected_lru_partition_kernel(
-    protected, metadata, row_stats, lru, hit_prefix, tile_counts, temp_lru, errors,
-    HOT_SIZE: tl.constexpr, MAX_UNION: tl.constexpr, STATE_ROWS: tl.constexpr,
-    BLOCK: tl.constexpr, TILES: tl.constexpr, COUNT_BLOCK: tl.constexpr,
+    protected,
+    metadata,
+    row_stats,
+    lru,
+    hit_prefix,
+    tile_counts,
+    temp_lru,
+    errors,
+    HOT_SIZE: tl.constexpr,
+    MAX_UNION: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    TILES: tl.constexpr,
+    COUNT_BLOCK: tl.constexpr,
     COUNT_STRIDE: tl.constexpr = 4,
 ):
     first = tl.program_id(0)
@@ -377,7 +405,9 @@ def protected_lru_partition_kernel(
         state = tl.load(metadata + first * 8 + 1)
         end = tl.load(metadata + first * 8 + 3)
         t = tl.arange(0, COUNT_BLOCK)
-        counts = tl.load(tile_counts + first.to(tl.int64) * HOT_SIZE + t * COUNT_STRIDE, mask=t < TILES, other=0).to(tl.int32)
+        counts = tl.load(tile_counts + first.to(tl.int64) * HOT_SIZE + t * COUNT_STRIDE, mask=t < TILES, other=0).to(
+            tl.int32
+        )
         hits = tl.sum(counts, 0)
         preceding = tl.sum(tl.where(t < tile, counts, 0), 0)
         misses = 0
@@ -395,8 +425,14 @@ def protected_lru_partition_kernel(
             p = tile * BLOCK + tl.arange(0, BLOCK)
             valid = (state >= 0) & (state < STATE_ROWS) & (p < HOT_SIZE)
             slot = tl.load(lru + state.to(tl.int64) * HOT_SIZE + p, mask=valid, other=-1).to(tl.int32)
-            hit = tl.load(protected + first.to(tl.int64) * HOT_SIZE + slot,
-                mask=valid & (slot >= 0) & (slot < HOT_SIZE), other=0) != 0
+            hit = (
+                tl.load(
+                    protected + first.to(tl.int64) * HOT_SIZE + slot,
+                    mask=valid & (slot >= 0) & (slot < HOT_SIZE),
+                    other=0,
+                )
+                != 0
+            )
             prefix = tl.load(hit_prefix + first.to(tl.int64) * HOT_SIZE + p, mask=valid, other=0) + preceding
             temp = temp_lru + first.to(tl.int64) * HOT_SIZE
             tl.store(temp + prefix - 1, slot, mask=valid & hit)
@@ -443,8 +479,14 @@ def protect_and_update_lru_kernel(
                 valid = (state >= 0) & (state < STATE_ROWS) & (position < HOT_SIZE)
                 slot = tl.load(live_lru + position, mask=valid, other=-1).to(tl.int32)
                 if USE_PROTECTED:
-                    hit = tl.load(protected + first.to(tl.int64) * HOT_SIZE + slot,
-                        mask=valid & (slot >= 0) & (slot < HOT_SIZE), other=0) != 0
+                    hit = (
+                        tl.load(
+                            protected + first.to(tl.int64) * HOT_SIZE + slot,
+                            mask=valid & (slot >= 0) & (slot < HOT_SIZE),
+                            other=0,
+                        )
+                        != 0
+                    )
                 else:
                     cached = tl.load(
                         dgi + state.to(tl.int64) * HOT_SIZE + slot,

@@ -16,10 +16,14 @@ if TYPE_CHECKING:
 
 
 class AscendHiSparseBackend(HiSparseBackend):
+    def __init__(self, *, dma_lifetime: Any | None = None) -> None:
+        from .backend_dma import HostDMALifetime
+
+        self._host_dma = HostDMALifetime() if dma_lifetime is None else dma_lifetime
+
     # The common shared pool currently exchanges CUDA IPC events. Private
     # per-rank pools preserve the same scheduler and transfer completion rules.
     supports_shared_host_pool = False
-    supports_speculative_group_prefetch = True
     stats_dtype = torch.int64
 
     def check_available(self) -> None:
@@ -44,25 +48,40 @@ class AscendHiSparseBackend(HiSparseBackend):
         from vllm_ascend.ops.hisparse import MappedHostTensor
 
         tensor._hisparse_registration = MappedHostTensor(tensor)
+        self._host_dma.retain_host(tensor)
 
     def unpin_tensor(self, tensor: torch.Tensor) -> None:
+        self._host_dma.drain()
         registration = tensor._hisparse_registration
         registration.close()
+        self._host_dma.release_host(tensor)
         del tensor._hisparse_registration
 
     def create_cache_ops(self, runtime: HiSparseRuntime) -> Any:
         from vllm_ascend.ops.hisparse import HiSparseNPUOps, ResolverWorkspace
+        from vllm_ascend.patch.worker.patch_hisparse_invalidation import install
 
+        install()
         group = runtime.index_group
-        if group.backend_state is None:
-            group.backend_state = ResolverWorkspace(
+        if runtime is group.leader:
+            workspace = ResolverWorkspace(
                 max_rows=runtime.max_swap_rows,
                 hot_size=runtime.region_stride,
                 max_union_rows=runtime.max_union_rows,
                 device=runtime.device,
             )
+        else:
+            leader_ops = group.leader.cache_ops
+            if not isinstance(leader_ops, HiSparseNPUOps):
+                raise RuntimeError("Bind the HiSparse leader before follower caches.")
+            workspace = leader_ops.workspace
         mapping = runtime.registered_host_pool._hisparse_registration
-        return HiSparseNPUOps(mapping, group.backend_state)
+        ops = HiSparseNPUOps(mapping, workspace)
+        ops.prefetch_gather_global_workers = 56
+        from .runtime_adapter import bind_runtime
+
+        bind_runtime(runtime)
+        return ops
 
     def validate_kv_cache_config(self, kv_cache_config: KVCacheConfig) -> None:
         from .binding import get_hisparse_indexer_specs
@@ -75,25 +94,55 @@ class AscendHiSparseBackend(HiSparseBackend):
         kv_caches: dict[str, Any],
         forward_context: dict[str, Any],
     ) -> None:
+        from vllm_ascend.kv_cache_dtype import prepare_native_hisparse_view_dtypes
+
         from .binding import _bind_indexer_views, get_hisparse_indexer_specs
 
+        prepare_native_hisparse_view_dtypes(forward_context, kv_caches)
+
+        def device_tensors(value):
+            if isinstance(value, torch.Tensor):
+                if value.device.type == "npu":
+                    yield value
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    yield from device_tensors(item)
+
+        self._host_dma.replace_device_owners(tensor for value in kv_caches.values() for tensor in device_tensors(value))
         _bind_indexer_views(kv_caches, get_hisparse_indexer_specs(kv_cache_config), forward_context)
 
-    def gather_resident_rows(self, source: torch.Tensor, destination: torch.Tensor, indices: torch.Tensor) -> None:
+    def gather_resident_rows(self, source: torch.Tensor, destination: torch.Tensor, row_ids: torch.Tensor) -> None:
         from vllm_ascend.ops.triton.hisparse_resident_gather import try_gather_resident_rows
 
-        if not try_gather_resident_rows(source, destination, indices):
-            super().gather_resident_rows(source, destination, indices)
+        if try_gather_resident_rows(source, destination, row_ids):
+            return
+        if source.dtype == destination.dtype and source.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            source = source.view(torch.uint8)
+            destination = destination.view(torch.uint8)
+        super().gather_resident_rows(source, destination, row_ids)
+
+    def create_ipc_event(self) -> Any:
+        raise NotImplementedError("Ascend HiSparse requires private per-rank Host pools.")
+
+    def export_event(self, event: Any) -> Any:
+        raise NotImplementedError("Ascend HiSparse does not export NPU IPC events.")
+
+    def import_event(self, device: torch.device, handle: Any) -> Any:
+        raise NotImplementedError("Ascend HiSparse does not import NPU IPC events.")
 
     def create_stream(self, device: torch.device, *, generic: bool = False) -> Any:
-        return torch.npu.Stream(device=device)
+        from vllm_ascend.patch.worker.patch_hisparse_streams import HiSparseStream
+
+        return HiSparseStream(device=device)
 
     def create_lru_init(self, size: int, device: torch.device) -> torch.Tensor:
         # CANN Range does not support int16 outputs. This runs only at allocation.
         return torch.arange(size, dtype=torch.int32, device=device).to(torch.int16)
 
     def create_event(self) -> Any:
-        return torch.npu.Event()
+        from vllm_ascend.patch.worker.patch_hisparse_streams import create_event
+
+        return create_event()
 
     def current_stream(self) -> Any:
         # HiSparse switches between model and copy streams. Query the active
@@ -110,4 +159,4 @@ class AscendHiSparseBackend(HiSparseBackend):
         torch.npu.synchronize()
 
     def swap_blocks_batch(self, src: torch.Tensor, dst: torch.Tensor, sizes: torch.Tensor) -> None:
-        torch.ops._C_ascend.swap_blocks_batch(src, dst, sizes, 1)
+        self._host_dma.submit(src, dst, sizes)

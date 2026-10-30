@@ -13,13 +13,19 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup, SparseMLAIndexGroupBuilder
 from vllm.v1.hisparse.runtime import HiSparsePrefillStagingPlan, build_hisparse_prefill_staging_plan
 from vllm.v1.worker.workspace import current_workspace_manager
+
+from vllm_ascend.attention.hisparse_resident_state import resident_eager_transport_allowed
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder
 from vllm_ascend.ops.hisparse_resident import begin_resident_forward, resident_topk_or_none
-from vllm_ascend.attention.hisparse_resident_state import resident_eager_transport_allowed
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
+
 def _hisparse_uniform_mtp_group_size(
-    common_attn_metadata, metadata, vllm_config, uniform_backend: bool, draft_index: int | None,
+    common_attn_metadata,
+    metadata,
+    vllm_config,
+    uniform_backend: bool,
+    draft_index: int | None,
 ) -> int:
     """Certify only the current CPU query layout for fixed MTP3 decode graphs.
 
@@ -46,7 +52,7 @@ def _hisparse_uniform_mtp_group_size(
     rows = common_attn_metadata.num_actual_tokens
     bounds = common_attn_metadata.query_start_loc_cpu
     if (
-        rows not in (32, 64)
+        rows not in (16, 32, 64)
         or count * 4 != rows
         or metadata.num_input_tokens != rows
         or not isinstance(bounds, torch.Tensor)
@@ -91,18 +97,25 @@ class AscendHiSparseMetadataBuilder(AscendSFAMetadataBuilder):
         metadata = super()._build(common_attn_metadata, draft_index, pcp_context)
         metadata.num_reqs = common_attn_metadata.num_reqs
         metadata.hisparse_uniform_query_group_size = _hisparse_uniform_mtp_group_size(
-            common_attn_metadata, metadata, self.vllm_config,
+            common_attn_metadata,
+            metadata,
+            self.vllm_config,
             self.get_cudagraph_support(self.vllm_config, self.kv_cache_spec) == AttentionCGSupport.UNIFORM_BATCH,
             draft_index,
         )
-        rows = torch.arange(metadata.num_input_tokens, device=self.device, dtype=torch.int32)
         if draft_index not in self._request_row_buffers:
             self._request_row_buffers[draft_index] = torch.empty(
                 self._row_capacity, device=self.device, dtype=torch.int32
             )
         metadata.req_id_per_token = self._request_row_buffers[draft_index][: metadata.num_input_tokens]
-        metadata.req_id_per_token.copy_(torch.searchsorted(metadata.query_start_loc[1:].contiguous(), rows, right=True))
-        metadata.req_id_per_token.clamp_(max=max(metadata.num_reqs - 1, 0))
+        from vllm_ascend.ops.triton.hisparse_request_rows import try_build_request_rows
+
+        if not try_build_request_rows(metadata.query_start_loc, metadata.req_id_per_token, metadata.num_reqs):
+            rows = torch.arange(metadata.num_input_tokens, device=self.device, dtype=torch.int32)
+            metadata.req_id_per_token.copy_(
+                torch.searchsorted(metadata.query_start_loc[1:].contiguous(), rows, right=True)
+            )
+            metadata.req_id_per_token.clamp_(max=max(metadata.num_reqs - 1, 0))
         if metadata.num_prefills:
             seq_lens_cpu = metadata.seq_lens_cpu
             if seq_lens_cpu is None:
@@ -147,6 +160,9 @@ class AscendHiSparseImpl(AscendSFAImpl):
             if self.topk_indices_buffer is None:
                 raise ValueError("Ascend HiSparse requires a model sparse-index group")
             builder = SparseMLAIndexGroupBuilder(self.topk_indices_buffer)
+        from vllm_ascend.patch.worker.patch_hisparse_streams import install
+
+        install()
         self.index_group, self.index_group_index = builder.register_layer(
             self.has_indexer and not self.skip_topk,
             self.vllm_config,
@@ -179,10 +195,75 @@ class AscendHiSparseImpl(AscendSFAImpl):
         )
 
     def _fused_preprocess_type(self):
-        # Fused prologs write the ordinary split cache directly. HiSparse owns
-        # both the resident destination and optional host-mirror staging. This
-        # also keeps quantized linear weight layout under its normal owner.
+        # Only the native A5 packed C8 contract has a Prolog bridge. Keep the
+        # parent's eligibility/weight preparation and the original BF16 path.
+        if self.enable_sparse_sfa_c8:
+            return super()._fused_preprocess_type()
         return None
+
+    def _prolog_c8_workspace(self):
+        # Layers on the same workspace lane use the compute stream in order.
+        # Scatter consumes this scratch before another layer can overwrite it;
+        # Host mirroring reads the final resident cache, never this scratch.
+        # The workspace manager isolates concurrent ubatches/lanes. No token
+        # values, resident slots, or layer-local cache addresses are cached.
+        key = ("ascend_hisparse_prolog_c8", self._kv_staging_capacity)
+
+        def allocate():
+            device = self.index_group.logical_topk_indices.device
+            return (
+                torch.empty(
+                    (self._kv_staging_capacity // 128, 128, 1, 656),
+                    device=device,
+                    dtype=torch.float8_e4m3fn,
+                ),
+                torch.arange(self._kv_staging_capacity, device=device, dtype=torch.int64),
+            )
+
+        return current_workspace_manager().get_persistent_resource(key, allocate)
+
+    def _sfa_preprocess_prolog_v3(
+        self,
+        hidden_states,
+        kv_cache,
+        cos,
+        sin,
+        slot_mapping,
+        *,
+        attn_metadata=None,
+    ):
+        from vllm_ascend.ops.hisparse import scatter_packed_kv
+
+        if not self.enable_sparse_sfa_c8 or attn_metadata is None:
+            raise RuntimeError("HiSparse Prolog requires current C8 attention metadata")
+        rows = hidden_states.shape[0]
+        if rows > self._kv_staging_capacity:
+            raise ValueError("HiSparse Prolog exceeds its profiled token capacity")
+        staging, local_slots = self._prolog_c8_workspace()
+        result = super()._sfa_preprocess_prolog_v3(
+            hidden_states,
+            (staging,),
+            cos,
+            sin,
+            local_slots[:rows],
+            attn_metadata=attn_metadata,
+        )
+        # Prolog emits the existing opaque 656-byte C8 row. Preserve FP8 NoPE,
+        # BF16 RoPE, and FP32 scales byte for byte when writing the current
+        # layer's strided Resident destination. Device valid_rows masks graph
+        # padding at replay; local Prolog indices are always safe scratch rows.
+        payload = staging.view(torch.uint8).view(-1, 656)
+        cache = self.hisparse_cache
+        destination, mapping, count = cache.write_target(rows, slot_mapping.numel())
+        scatter_packed_kv(
+            payload[:count, :512],
+            payload[:count, 512:],
+            destination.view(torch.uint8),
+            mapping,
+            attn_metadata.query_start_loc[-1:],
+        )
+        cache.finish_kv_update()
+        return result
 
     def _compose_sfa_kv_cache(self, kv_cache):
         return (kv_cache,)
@@ -242,15 +323,27 @@ class AscendHiSparseImpl(AscendSFAImpl):
         return current_workspace_manager().get_persistent_resource(key, allocate)
 
     def forward(self, layer_name, hidden_states, kv_cache, attn_metadata, output=None):
-        self._direct_workspace()
+        if not self.enable_sparse_sfa_c8:
+            self._direct_workspace()
         if self.enable_sparse_sfa_c8:
             self._c8_length_workspace()
+            if self.preprocess_type.name == "PROLOG_V3":
+                self._prolog_c8_workspace()
         if self.qk_rope_head_dim and not self.enable_sparse_sfa_c8:
             # Include preprocessing scratch in profiling and allocate it before
             # graph capture, including dummy forwards without attention metadata.
             self._kv_workspace(hidden_states.dtype)
         self.index_group.prepare_for_batch(self.index_group_index, attn_metadata)
         runtime = self.hisparse_cache.runtime
+        if runtime.is_group_leader:
+            from vllm_ascend.ops.hisparse_c8_scope import begin_c8_mapping_scope
+
+            begin_c8_mapping_scope(
+                runtime.index_group,
+                get_forward_context(),
+                enabled=self.enable_sparse_sfa_c8 and attn_metadata is not None and attn_metadata.num_prefills == 0,
+                cache_handles=self.index_group.caches,
+            )
         if runtime.is_group_leader and runtime.cache_ops is not None:
             # Each captured graph owns this choice. Replay selection retains
             # upstream uniform-query ownership; current row/state/KV values
@@ -281,7 +374,7 @@ class AscendHiSparseImpl(AscendSFAImpl):
         assert self.kv_a_layernorm is not None
         if self.enable_sparse_sfa_c8:
             from vllm_ascend.attention.sfa_v1 import custom_kv_rmsnorm_rope
-            from vllm_ascend.ops.hisparse_c8 import pack_c8_components
+            from vllm_ascend.ops.triton.hisparse_c8_fused import scatter_c8_components
 
             # Match the normal SFA owner: the native RoPE path consumes BNSD.
             values = kv_no_split.reshape(-1, self.num_kv_heads, 1, self.kv_lora_rank + self.qk_rope_head_dim)
@@ -297,12 +390,13 @@ class AscendHiSparseImpl(AscendSFAImpl):
                 tile_size=self.sfa_qsfa_tile_size,
             )
             # Native A5 exposes RoPE/scale as opaque FP8-typed byte views.
-            payload = pack_c8_components(latent, rope, scales)
-            destination, mapping, count = self.hisparse_cache.write_target(payload.shape[0], slots.numel())
-            scatter_packed_kv(
-                payload[:count, : self.kv_lora_rank],
-                payload[:count, self.kv_lora_rank :],
-                destination.view(torch.uint8),
+            rows = latent.numel() // self.kv_lora_rank
+            destination, mapping, count = self.hisparse_cache.write_target(rows, slots.numel())
+            scatter_c8_components(
+                latent.reshape(rows, -1)[:count].contiguous(),
+                rope.view(torch.uint8).reshape(rows, 128)[:count].contiguous(),
+                scales.view(torch.uint8).reshape(rows, 16)[:count].contiguous(),
+                destination,
                 mapping,
                 attn_metadata.query_start_loc[-1:],
             )
@@ -384,20 +478,26 @@ class AscendHiSparseImpl(AscendSFAImpl):
         return current_workspace_manager().get_persistent_resource(key, allocate)
 
     def _c8_attention_metadata(self, cache, rows):
-        from vllm_ascend.ops.hisparse_c8 import c8_storage_view
-
-        view, _, _, _ = c8_storage_view(cache)
         if not 0 <= rows <= self._kv_staging_capacity:
             raise ValueError("HiSparse C8 attention exceeds its profiled query capacity")
         query_end, key_length = self._c8_length_workspace()
         # The upstream manager separates ubatches/lanes; each instance owns its
         # two scalars. Same-lane consumers follow the compute stream order.
-        # Capture includes these fills so replay restores its current lengths.
-        query_end.fill_(rows)
-        key_length.fill_(view.shape[0])
+        # Query packing writes the current lengths in its own captured kernel,
+        # before the same-stream SFA consumer. No additional fills are needed.
         return query_end, key_length
 
-    def _attention_physical(self, query, query_rope, packed_cache, physical_topk, *, use_eager_compaction=False, _c8_prepared=False):
+    def _attention_physical(
+        self,
+        query,
+        query_rope,
+        packed_cache,
+        physical_topk,
+        *,
+        use_eager_compaction=False,
+        _c8_prepared=False,
+        _mapping_scope=None,
+    ):
         from vllm_ascend.ops.hisparse_direct import packed_sparse_flash_attention
 
         if self.enable_sparse_sfa_c8:
@@ -413,6 +513,7 @@ class AscendHiSparseImpl(AscendSFAImpl):
                 query_end,
                 key_length,
                 _prepared_indices=_c8_prepared,
+                _mapping_scope=_mapping_scope,
             )
         positions, query_ends = self._direct_workspace()
         if query.shape[0] > query_ends.numel():
@@ -482,8 +583,13 @@ class AscendHiSparseImpl(AscendSFAImpl):
         logical = topk_indices.squeeze(1) if topk_indices.ndim == 3 else topk_indices
         assert metadata.req_id_per_token is not None
         assert metadata.query_start_loc is not None
-        rows = torch.arange(logical.shape[0], dtype=torch.int32, device=logical.device)
-        logical = torch.where(rows[:, None] < metadata.query_start_loc[-1], logical, -1)
+        # The pure C8 Decode resolver masks request IDs after waiting for
+        # logical_topk_ready, on its existing copy stream. A second full TopK
+        # mask per layer has no consumer in this path. Retain it for Prefill,
+        # mixed batches, BF16 and the eager resident shortcut.
+        if not (self.enable_sparse_sfa_c8 and metadata.num_prefills == 0 and not self._resident_hisparse_enabled):
+            rows = torch.arange(logical.shape[0], dtype=torch.int32, device=logical.device)
+            logical = torch.where(rows[:, None] < metadata.query_start_loc[-1], logical, -1)
         self.index_group.set_logical_topk_ready(self.index_group_index)
         outputs = []
         num_decode = metadata.num_decode_tokens
@@ -500,6 +606,7 @@ class AscendHiSparseImpl(AscendSFAImpl):
                 logical[:num_decode],
                 enforce_eager=self._resident_hisparse_enabled and metadata.num_prefills == 0 and num_decode <= 64,
             )
+            mapping_scope = None
             if physical is None:
                 physical = cache.swap_in(
                     metadata.req_id_per_token[:num_decode],
@@ -508,6 +615,10 @@ class AscendHiSparseImpl(AscendSFAImpl):
                     block_size=metadata.block_size,
                     num_valid_rows=metadata.query_start_loc[-1:],
                 )
+                if metadata.num_prefills == 0:
+                    from vllm_ascend.ops.hisparse_c8_scope import current_c8_mapping_scope
+
+                    mapping_scope = current_c8_mapping_scope(cache.runtime.index_group, get_forward_context())
             outputs.append(
                 self._attention_physical(
                     ql_nope[:num_decode],
@@ -515,6 +626,7 @@ class AscendHiSparseImpl(AscendSFAImpl):
                     self.index_group.physical_kv_cache(self.index_group_index),
                     physical,
                     use_eager_compaction=metadata.num_prefills == 0,
+                    _mapping_scope=mapping_scope,
                 )
             )
         if metadata.num_prefills:
