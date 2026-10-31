@@ -6,9 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import AutoRegressiveSpeculator
+from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
+    TargetDependentARSpeculator as AutoRegressiveSpeculator,
+)
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend
@@ -194,17 +197,19 @@ def test_run_model_broadcasts_replicated_hidden_states():
 def test_generate_draft_updates_attn_metadata():
     """Test updating attention metadata during draft generation."""
     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+    speculator.num_speculative_steps = 3
     attn_metadata = {"layer.0": MagicMock()}
     speculator._update_decode_attn_metadata = MagicMock()
     with patch.object(AutoRegressiveSpeculator, "_generate_draft") as parent_generate:
         speculator._generate_draft(2, 4, attn_metadata, None, None)
-    parent_generate.assert_called_once_with(2, 4, attn_metadata, None, None, CUDAGraphMode.NONE)
+    parent_generate.assert_called_once_with(2, 4, attn_metadata, None, None, CUDAGraphMode.NONE, 3)
     speculator._update_decode_attn_metadata.assert_called_once_with(attn_metadata, 1, 2)
 
 
 def test_generate_draft_skips_update_without_attn_metadata():
     """Test skipping metadata updates when attention metadata is absent."""
     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+    speculator.num_speculative_steps = 3
     speculator._update_decode_attn_metadata = MagicMock()
     with patch.object(AutoRegressiveSpeculator, "_generate_draft"):
         speculator._generate_draft(2, 4, None, None, None)
@@ -214,6 +219,7 @@ def test_generate_draft_skips_update_without_attn_metadata():
 def test_multi_step_decode_full_graph():
     """Test multi-step decode with full graph execution."""
     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+    speculator.num_speculative_steps = 3
     speculator.decode_cudagraph_manager = MagicMock()
     batch_desc = SimpleNamespace(cg_mode=CUDAGraphMode.FULL)
     with patch.object(AutoRegressiveSpeculator, "_multi_step_decode") as parent_decode:
@@ -225,11 +231,21 @@ def test_multi_step_decode_full_graph():
 def test_multi_step_decode_non_full_graph():
     """Test multi-step decode without full graph execution."""
     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+    speculator.num_speculative_steps = 3
     batch_desc = SimpleNamespace(cg_mode=CUDAGraphMode.NONE)
     seq_lens_cpu_upper_bound = torch.tensor([10, 20], dtype=torch.int32)
     with patch.object(AutoRegressiveSpeculator, "_multi_step_decode") as parent_decode:
         speculator._multi_step_decode(2, False, batch_desc, None, seq_lens_cpu_upper_bound)
-    parent_decode.assert_called_once_with(2, False, batch_desc, None, seq_lens_cpu_upper_bound)
+    parent_decode.assert_called_once_with(2, False, batch_desc, None, seq_lens_cpu_upper_bound, 3)
+
+
+def test_merged_draft_graph_rejects_different_step_count():
+    speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+    speculator.num_speculative_steps = 3
+    speculator.decode_cudagraph_manager = MagicMock()
+    with pytest.raises(ValueError, match="fixed speculative-token count"):
+        speculator._multi_step_decode(2, False, SimpleNamespace(cg_mode=CUDAGraphMode.FULL), None, None, 2)
+    speculator.decode_cudagraph_manager.run_fullgraph.assert_not_called()
 
 
 def test_prefill_filters_target_only_metadata():
@@ -628,6 +644,25 @@ def test_propose_replicated_pcp_disables_dp_sync():
     assert speculator.input_batch is input_batch
     assert parent_propose.call_args.args[11] is None
     assert result is expected
+
+
+@pytest.mark.parametrize("state_keyword", ["dp_sync", "dp_sync_state"])
+def test_propose_forwards_upstream_step_count_and_sync(state_keyword):
+    speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+    speculator.replicated_pcp = False
+    input_batch, sync_state = object(), object()
+    args = [object() for _ in range(10)]
+    module = "vllm_ascend.worker.v2.spec_decode.autoregressive.speculator"
+    with (
+        patch(f"{module}.disable_target_pcp_for_replicated_draft", return_value=nullcontext()),
+        patch(f"{module}.build_attn_metadata_wrapper", return_value=nullcontext()),
+        patch(f"{module}.torch_gather_wrapper", return_value=nullcontext()),
+        patch.object(AutoRegressiveSpeculator, "propose", autospec=True) as parent_propose,
+    ):
+        speculator.propose(input_batch, *args, **{state_keyword: sync_state}, num_speculative_tokens=2)
+    # autospec binds the real latest-main ABI, including self.
+    assert parent_propose.call_args.args[12] is sync_state
+    assert parent_propose.call_args.kwargs["num_speculative_tokens"] == 2
 
 
 def test_propose_consumes_restored_global_inputs():

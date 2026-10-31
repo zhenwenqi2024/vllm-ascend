@@ -263,6 +263,18 @@
 #    Future Plan:
 #       Remove once upstream exposes the PD role to the coordinator or
 #       removes the EAGLE last-block drop for verified prompt blocks.
+#   3. `vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator`
+#    Why:
+#       The Ascend hybrid constructor predates HiSparse source/indexer roles
+#       and would put host source pages into the ordinary device block pool.
+#    How:
+#       Delegate HiSparse configurations to the original upstream factory,
+#       preserving its host pool, specialized managers and prefix semantics.
+#    Related PR (if no, explain why):
+#       No upstream PR; this is an Ascend factory integration for HiSparse.
+#    Future Plan:
+#       Remove this bypass with the Ascend hybrid coordinator patch once its
+#       PD behavior is covered by the upstream coordinator.
 #
 # ** 10. File: platform/patch_kv_cache_utils.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -282,6 +294,19 @@
 #    Future Plan:
 #       Remove this patch once upstream vLLM supports hybrid KV cache + CP for
 #       non-CUDA backends, or exposes a platform hook for this behavior.
+#   2. `vllm.v1.core.kv_cache_planning` grouping and placement hooks
+#    Why:
+#       Latest main split planning out of kv_cache_utils and passes the config
+#       and selected builder to byte accounting. Ascend's existing specialized
+#       layouts must use those live hooks and signatures.
+#    How:
+#       Patch the planning module, forward config/builder on generic paths, and
+#       let Core annotate draft groups after global grouping.
+#    Related PR:
+#       Local main compatibility work; no submitted PR.
+#    Future Plan:
+#       Move specialized layouts into the upstream KVCacheConfigBuilder API
+#       and remove these module-level replacements.
 #
 # ** 11. File: platform/patch_mamba_block_aligned_split.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

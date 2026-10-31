@@ -303,6 +303,33 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 metadata.finish()
 
 
+@contextmanager
+def _suspend_hisparse_mirrors_for_capture(model: nn.Module):
+    """Keep synthetic graph submissions outside the scheduler's Host DMA step.
+
+    Both eager warmup and capture call this model without connector pre/finish
+    hooks. They still write Resident KV and prepare all attention metadata, but
+    have no scheduler rows to mirror. Real FULL replay is mirrored afterwards
+    by the connector's unchanged finish_forward().
+    """
+    saved = []
+    seen = set()
+    try:
+        for module in model.modules():
+            cache = getattr(module, "hisparse_cache", None)
+            if cache is None or not hasattr(cache, "submit_layer_mirror") or id(cache) in seen:
+                continue
+            seen.add(id(cache))
+            saved.append((cache, cache.submit_layer_mirror))
+            cache.submit_layer_mirror = None
+        yield
+    finally:
+        # Nested capture wrappers see None and restore it to the outer scope;
+        # the outermost owner restores each exact original callback object.
+        for cache, callback in reversed(saved):
+            cache.submit_layer_mirror = callback
+
+
 class ModelWithContext(nn.Module):
     """Define a wrapper model to inject forward context.
     so we can inherit vllm's CudaGraphManager._capture_full_graph.
@@ -331,7 +358,8 @@ class ModelWithContext(nn.Module):
         try:
             if self.device_metadata is not None:
                 self.device_metadata.begin_forward()
-            return self.original_model(*args, **kwargs)
+            with _suspend_hisparse_mirrors_for_capture(self.original_model):
+                return self.original_model(*args, **kwargs)
         finally:
             # Warmup and actual capture receive separate prepare_attn calls.
             # Retire each submission, including unused producers, after its

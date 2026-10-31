@@ -439,7 +439,6 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             self,
             _PACKED_CONV_WEIGHT_NAME,
             packed_weight,
-            prefer_copy=True,
         )
 
     def _run_recurrent(

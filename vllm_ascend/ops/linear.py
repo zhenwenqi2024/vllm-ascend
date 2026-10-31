@@ -114,7 +114,7 @@ class AscendUnquantizedLinearMethod(WeightSwitchMixin, UnquantizedLinearMethod):
             new_fp32 = weight_fp32 if keep_nd_weight or skip_weight_nz_conversion else maybe_trans_nz(weight_fp32)
             # keep the captured graph's weight reference to the updated weight
             # during RL weight updates.
-            replace_parameter(layer, "weight_fp32", new_fp32, prefer_copy=True)
+            replace_parameter(layer, "weight_fp32", new_fp32)
         if "conv1d" not in layer.prefix and not skip_weight_nz_conversion:
             # 310P torch_npu rejects FRACTAL_NZ matmul when the weight-side
             # matrix has n=1 or k=1. Keep scalar gates such as Qwen MoE's

@@ -39,7 +39,7 @@ from vllm.distributed import get_dcp_group, get_tensor_model_parallel_rank
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
@@ -52,6 +52,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    SparseCacheRole,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -95,6 +96,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     allocate_kv_cache_tensors_for_sparse_kv_offload,
     reshape_kv_cache_tensors_for_sparse_kv_offload,
 )
+from vllm_ascend.kv_cache_dtype import native_c8_cache_dtype
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
 from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
 from vllm_ascend.quantization.methods.kv_cache.turboquant import TURBOQUANT_CACHE_DTYPE
@@ -215,7 +217,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     )
     enable_sparse_li_c8 = vllm_config.attention_config.indexer_kv_dtype in ["fp8", "int8"]
     if enable_sparse_li_c8:
-        c8_k_cache_dtype = kv_cache_dtype_str_to_dtype(
+        c8_k_cache_dtype = native_c8_cache_dtype(
             vllm_config.attention_config.indexer_kv_dtype, vllm_config.model_config
         )
         if c8_k_cache_dtype == torch.float8_e4m3fn:
@@ -223,7 +225,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         elif c8_k_cache_dtype == torch.int8:
             c8_k_scale_cache_dtype = torch.float16
 
-    c8_cache_dtype = kv_cache_dtype_str_to_dtype(vllm_config.cache_config.cache_dtype, vllm_config.model_config)
+    c8_cache_dtype = native_c8_cache_dtype(vllm_config.cache_config.cache_dtype, vllm_config.model_config)
 
     for layer_name, attn_module in attn_layers.items():
         if getattr(attn_module, "kv_sharing_target_layer_name", None):
@@ -239,6 +241,27 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             mamba_specs[layer_name] = spec
             continue
 
+        if isinstance(attn_module, MLAAttention) and vllm_config.attention_config.hisparse_config is not None:
+            # HiSparse owns row-packed host/resident/hot views. Keep the
+            # upstream MLA spec instead of selecting Ascend's split K/RoPE layout.
+            # Ascend may retain an indexer only for cache writes while reusing
+            # another layer's top-k. The physical pool must follow the actual
+            # runtime group, not merely the presence of an indexer module.
+            if bool(getattr(attn_module.impl, "enable_sparse_sfa_c8", False)):
+                if getattr(attn_module.impl, "hisparse_c8_payload_format", None) is None:
+                    raise ValueError("HiSparse C8 attention must declare its native packed format")
+                spec = replace(
+                    spec,
+                    head_size=656,
+                    dtype=torch.float8_e4m3fn,
+                    state_content_bytes=656,
+                    cache_dtype_str=vllm_config.cache_config.cache_dtype,
+                    block_stride_alignment=math.lcm(spec.get_block_stride_alignment(), 656),
+                )
+            kv_cache_spec[layer_name] = replace(
+                spec, is_index_group_leader=attn_module.hisparse_cache.runtime.is_group_leader
+            )
+            continue
         if isinstance(attn_module, MLAAttention):
             cache_sparse_sfa_c8 = False
             cache_sparse_sfa_turboquant = False
@@ -303,6 +326,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 continue
             cache_sparse_li_c8 = get_ascend_config().is_sparse_li_c8_layer(layer_name)
             cache_sparse_li_c4 = get_ascend_config().is_sparse_li_c4_layer(layer_name)
+            if vllm_config.attention_config.hisparse_config is not None and cache_sparse_li_c4:
+                raise ValueError("Ascend HiSparse indexer C4 is not supported")
             head_dim = vllm_config.model_config.hf_text_config.index_head_dim
             kv_cache_spec[layer_name] = AscendSFAIndexerCacheSpec(
                 block_size=vllm_config.cache_config.block_size,
@@ -314,7 +339,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 if cache_sparse_li_c8
                 else vllm_config.model_config.dtype,
                 cache_dtype_str=(
-                    vllm_config.cache_config.cache_dtype
+                    vllm_config.attention_config.indexer_kv_dtype
                     if (cache_sparse_li_c8 or cache_sparse_li_c4)
                     else None
                     if use_turboquant
@@ -329,6 +354,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 cache_sparse_li_c4=cache_sparse_li_c4,
                 cache_sparse_li_c8=cache_sparse_li_c8,
                 sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size,
+                cache_role=SparseCacheRole.INDEXER,
             )
             continue
 
@@ -351,6 +377,15 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 mamba_specs[layer_name] = replace(spec, page_size_padded=common_page_size)
         kv_cache_spec.update(mamba_specs)
 
+    if vllm_config.attention_config.hisparse_config is not None:
+        from vllm.v1.hisparse.binding import resolve_hisparse_specs
+
+        from vllm_ascend.distributed.kv_transfer.hisparse.binding import align_hisparse_indexer_specs
+
+        return align_hisparse_indexer_specs(
+            resolve_hisparse_specs(vllm_config, kv_cache_spec, attn_layers),
+            packed_row_bytes=656 if get_ascend_config().enable_sparse_sfa_c8 else None,
+        )
     return kv_cache_spec
 
 
@@ -495,6 +530,9 @@ def build_attn_metadata(
             plan = get_dsa_attn_kv_plan(dsa_builder.vllm_config, dsa_builder.compressor_ratio)
             formatted_slot_mappings = plan.format_dsa_slot_mapping(slot_mappings[:, :num_input_tokens], block_sizes)
     for i, kv_cache_spec in enumerate(kv_cache_groups):
+        # HiSparse resident/hot groups have storage but no attention layers.
+        if not attn_groups[i]:
+            continue
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
         # Hybrid drafters can configure causality per KV cache group.
@@ -1790,7 +1828,7 @@ def _reshape_kv_cache_v2(
                 k_dtype = (
                     torch.int8
                     if vllm_config.cache_config.cache_dtype == TURBOQUANT_CACHE_DTYPE
-                    else kv_cache_dtype_str_to_dtype(vllm_config.cache_config.cache_dtype, vllm_config.model_config)
+                    else native_c8_cache_dtype(vllm_config.cache_config.cache_dtype, vllm_config.model_config)
                 )
                 k_cache = raw_k_tensor.view(k_dtype).view(k_shape)
                 kv_caches[layer_name] = (k_cache,)

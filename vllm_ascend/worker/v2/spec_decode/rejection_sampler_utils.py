@@ -231,11 +231,29 @@ def rejection_sample(
     # [num_speculative_steps]
     synthetic_conditional_rates: torch.Tensor | None = None,
     use_fp64: bool = False,
-    # TODO: refactor speculative decoding functionality in a future PR.
-    # `use_block_verification` is accepted but not yet implemented on NPU;
-    # wire it up when the block verification path is supported.
+    # Reject unsupported block verification explicitly below.
     use_block_verification: bool = False,
+    contexts: torch.Tensor | None = None,
+    watermarking: torch.Tensor | None = None,
+    watermarking_skip_mask: torch.Tensor | None = None,
+    watermark_key: int | None = None,
+    fly_window_size: int = 0,
+    fly_entropy_threshold: float = 0.3,
+    fly_entropy_top_k: int = 3,
+    draft_logits_num_shards: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # The current upstream verifier passes these options even for ordinary MTP.
+    # Preserve this NPU implementation's unsharded, unwatermarked algorithm;
+    # reject enabled modes rather than silently claim their sampling semantics.
+    if use_block_verification:
+        raise NotImplementedError("Block verification is not supported by this NPU implementation.")
+    if any(value is not None for value in (contexts, watermarking, watermarking_skip_mask, watermark_key)):
+        raise NotImplementedError("Watermarked rejection sampling is not supported by this NPU implementation.")
+    if fly_window_size != 0:
+        raise NotImplementedError("FLY rejection sampling is not supported by this NPU implementation.")
+    if draft_logits_num_shards != 1:
+        raise NotImplementedError("Batch-sharded draft logits are not supported by this NPU implementation.")
+    # FLY entropy parameters have no effect while its window is disabled.
     if use_fp64:
         raise NotImplementedError("FP64 rejection sampling is not supported on NPU.")
 
@@ -284,9 +302,12 @@ def rejection_sample(
         expanded_local_pos,
         temperature,
         vocab_size,
-        num_speculative_steps,
+        # The upstream kernel detects each request's bonus row from the
+        # following expanded_local_pos entry, bounded by the full logit count.
+        num_logits=num_logits,
         BLOCK_SIZE=VOCAB_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,
+        DRAFT_LOGITS_NUM_SHARDS=draft_logits_num_shards,
         # TODO: Remove this workaround after the Triton Ascend AutoBlockify
         # bug for max-with-index reductions is fixed.
         has_auto_blockify_blacklist_op=True,

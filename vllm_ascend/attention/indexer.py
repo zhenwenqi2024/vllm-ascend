@@ -10,7 +10,6 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tp_group
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -39,6 +38,7 @@ from vllm_ascend.attention.context_parallel.sfa_dcp_utils import (
 from vllm_ascend.attention.utils import split_decodes_and_prefills
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.kv_cache_dtype import native_c8_cache_dtype
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.utils import (
@@ -151,6 +151,8 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
+        if get_current_vllm_config().attention_config.hisparse_config is not None:
+            return AscendHiSparseIndexerMetadataBuilder
         return AscendSFAIndexerMetadataBuilder
 
     @staticmethod
@@ -191,7 +193,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
 
         self.enable_sparse_li_c8 = get_ascend_config().is_sparse_li_c8_layer(self.k_cache.prefix)
         if self.enable_sparse_li_c8:
-            self.c8_k_cache_dtype = kv_cache_dtype_str_to_dtype(
+            self.c8_k_cache_dtype = native_c8_cache_dtype(
                 get_current_vllm_config().attention_config.indexer_kv_dtype,
                 get_current_vllm_config().model_config,
             )
@@ -273,9 +275,26 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         the parallel layout of the tensors and the slot mapping; variants
         with a different cache layout should override it.
         """
+        if self.enable_sparse_li_c8 and hasattr(self.k_cache, "hisparse_block_stride"):
+            from vllm_ascend.distributed.kv_transfer.hisparse.binding import write_hisparse_indexer_c8
+
+            assert k_li_scale is not None
+            write_hisparse_indexer_c8(
+                self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT],
+                self.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT],
+                k_li,
+                k_li_scale,
+                slot_mapping,
+                DeviceOperator.scatter_cache,
+            )
+            return
         indexer_k_cache = self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT]
         # float4_e2m1fn_x2 / float8_e8m0fnu are not supported by the scatter
         # kernel; view as uint8 (same 1-byte layout) for the cache write.
+        if k_li.dtype == torch.float8_e4m3fn:
+            # Preserve FP8 bits through the installed PA store's INT8 kernel.
+            indexer_k_cache = indexer_k_cache.view(torch.int8)
+            k_li = k_li.view(torch.int8)
         if k_li.dtype == torch_npu.float4_e2m1fn_x2:
             indexer_k_cache = indexer_k_cache.view(torch.uint8)
             k_li = k_li.view(torch.uint8)
@@ -1102,3 +1121,45 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             actual_seq_lengths_key=actual_seq_lengths_key,
             num_decode_tokens=num_decode_tokens,
         )
+
+
+class AscendHiSparseIndexerMetadataBuilder(AscendSFAIndexerMetadataBuilder):
+    """Map logical indexer pages into HiSparse's shared device allocation."""
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        context = vllm_config.compilation_config.static_forward_context
+        self._cache_layers = [context[name] for name in layer_names]
+        self._physical_metadata_buffers: dict[object, tuple[torch.Tensor, torch.Tensor]] = {}
+        scheduler = vllm_config.scheduler_config
+        max_capture = vllm_config.compilation_config.max_cudagraph_capture_size or 0
+        self._table_capacity = (
+            max(scheduler.max_num_seqs, max_capture) + 1,
+            _round_up(vllm_config.model_config.max_model_len, self.kernel_block_size) // self.kernel_block_size,
+        )
+
+    def _build(self, common_attn_metadata, buffer_key, use_cached_rope, copy_rope, **kwargs):
+        metadata = super()._build(common_attn_metadata, buffer_key, use_cached_rope, copy_rope, **kwargs)
+        strides = {getattr(layer, "hisparse_block_stride", 1) for layer in self._cache_layers}
+        if len(strides) != 1:
+            raise RuntimeError("HiSparse indexers sharing metadata must have the same physical block stride")
+        stride = strides.pop()
+        if stride == 1:
+            return metadata
+        if buffer_key not in self._physical_metadata_buffers:
+            self._physical_metadata_buffers[buffer_key] = (
+                torch.empty(self._table_capacity, dtype=metadata.block_table.dtype, device=self.device),
+                torch.empty(self._slot_capacity, dtype=metadata.slot_mapping.dtype, device=self.device),
+            )
+        table_buffer, slot_buffer = self._physical_metadata_buffers[buffer_key]
+        rows, columns = metadata.block_table.shape
+        table = table_buffer[:rows, :columns]
+        slots = slot_buffer[: metadata.slot_mapping.numel()]
+        torch.mul(metadata.block_table, stride, out=table)
+        logical = metadata.slot_mapping
+        physical = (logical // self.kernel_block_size) * (self.kernel_block_size * stride)
+        physical += logical % self.kernel_block_size
+        slots.copy_(torch.where(logical >= 0, physical, -1))
+        metadata.block_table = table
+        metadata.slot_mapping = slots
+        return metadata

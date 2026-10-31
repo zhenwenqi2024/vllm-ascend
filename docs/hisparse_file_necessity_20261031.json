@@ -1,0 +1,2515 @@
+{
+  "base": "2581a69bcc16ee6af56e72985a15799bb5f61808",
+  "parent": "e3a19362d781d0572ba94d62ea26194e7a9855c9",
+  "audit_scope": "逐文件分类，不宣称所有文件均必要或所有代码均已通过生产审查。历史改动保留供评审，不盲删已验证版本依赖。",
+  "category_counts": {
+    "证据/文档": 12,
+    "可选BF16构建": 2,
+    "可选BF16注意力": 20,
+    "HiSparse功能/桥接": 29,
+    "测试": 30,
+    "冻结上游兼容/可拆": 39,
+    "功能与兼容混合": 6,
+    "可独立性能优化": 19,
+    "仅P/D需要": 17,
+    "独立模型/量化修复": 2,
+    "待实测候选": 1
+  },
+  "files": [
+    {
+      "path": "benchmarks/hisparse/qualification/generic_padding.py",
+      "category": "证据/文档",
+      "reason": "不参与推理；用于复现、核对历史失败与验证边界。",
+      "added": "149",
+      "removed": "0",
+      "entry_symbols": [
+        "load",
+        "qualify"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "benchmarks/hisparse/qualification/resolver60103.py",
+      "category": "证据/文档",
+      "reason": "不参与推理；用于复现、核对历史失败与验证边界。",
+      "added": "193",
+      "removed": "0",
+      "entry_symbols": [
+        "load",
+        "qualify"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/aclnn_torch_adapter/op_api_common.h",
+      "category": "可选BF16构建",
+      "reason": "构建注册或多翻译单元链接支持；随旧BF16原生注意力分支一起拆分。",
+      "added": "1",
+      "removed": "1",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/CMakeLists.txt",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "19",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/README.md",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "23",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/hisparse_flash_attention_torch_adpt.h",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "81",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_host/CMakeLists.txt",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "29",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_host/hisparse_flash_attention_def.cpp",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "48",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_host/hisparse_flash_attention_infershape.cpp",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "51",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_host/hisparse_flash_attention_tiling.cpp",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "469",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_host/hisparse_flash_attention_tiling.h",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "390",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_host/op_api/aclnn_hisparse_flash_attention.cpp",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "50",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_host/op_api/aclnn_hisparse_flash_attention.h",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "36",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_kernel/arch35/hisparse_flash_attention_common_arch35.h",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "112",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_kernel/arch35/hisparse_flash_attention_kernel_mla.h",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "745",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_kernel/arch35/hisparse_flash_attention_kvcache.h",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "303",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_kernel/arch35/hisparse_flash_attention_service_cube_mla.h",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "387",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_kernel/arch35/hisparse_flash_attention_service_vector_mla.h",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "831",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_kernel/arch35/util_regbase.h",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "267",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_kernel/hisparse_flash_attention.cpp",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "61",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_kernel/hisparse_flash_attention_common.h",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "202",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/attention/hisparse_flash_attention/op_kernel/hisparse_flash_attention_template_tiling_key.h",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "52",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/build_aclnn.sh",
+      "category": "可选BF16构建",
+      "reason": "构建注册或多翻译单元链接支持；随旧BF16原生注意力分支一起拆分。",
+      "added": "1",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/hisparse_direct_binding.cpp",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "25",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/hisparse_runtime/batch_copy.cpp",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "160",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/hisparse_runtime/build.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "96",
+      "removed": "0",
+      "entry_symbols": [
+        "main"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/hisparse_runtime/host_registration.cpp",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "54",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/hisparse_runtime/resolver.asc",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "450",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "csrc/hisparse_runtime/torch_binding.cpp",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "55",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "docs/hisparse_file_necessity_20261031.json",
+      "category": "证据/文档",
+      "reason": "不参与推理；用于复现、核对历史失败与验证边界。",
+      "added": 2488,
+      "removed": 0,
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "docs/hisparse_file_necessity_20261031.md",
+      "category": "证据/文档",
+      "reason": "不参与推理；用于复现、核对历史失败与验证边界。",
+      "added": 367,
+      "removed": 0,
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "docs/hisparse_integration_validation_20261020.json",
+      "category": "证据/文档",
+      "reason": "不参与推理；用于复现、核对历史失败与验证边界。",
+      "added": "209",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "docs/hisparse_review_20261023.json",
+      "category": "证据/文档",
+      "reason": "不参与推理；用于复现、核对历史失败与验证边界。",
+      "added": "457",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "docs/hisparse_review_20261023.md",
+      "category": "证据/文档",
+      "reason": "不参与推理；用于复现、核对历史失败与验证边界。",
+      "added": "53",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "docs/hisparse_review_20261030.json",
+      "category": "证据/文档",
+      "reason": "不参与推理；用于复现、核对历史失败与验证边界。",
+      "added": "191",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "docs/hisparse_review_20261030.md",
+      "category": "证据/文档",
+      "reason": "不参与推理；用于复现、核对历史失败与验证边界。",
+      "added": "116",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "docs/hisparse_review_20261031.md",
+      "category": "证据/文档",
+      "reason": "不参与推理；用于复现、核对历史失败与验证边界。",
+      "added": 85,
+      "removed": 0,
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "docs/source/user_guide/feature_guide/hisparse.md",
+      "category": "证据/文档",
+      "reason": "不参与推理；用于复现、核对历史失败与验证边界。",
+      "added": "88",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "mkdocs.yml",
+      "category": "证据/文档",
+      "reason": "不参与推理；用于复现、核对历史失败与验证边界。",
+      "added": "1",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/e2e/pull_request/one_card/test_hisparse_attention.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "105",
+      "removed": "0",
+      "entry_symbols": [
+        "_require_ascend950_sfa",
+        "test_sparse_attention_reference"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/e2e/pull_request/one_card/test_hisparse_direct_attention.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "228",
+      "removed": "0",
+      "entry_symbols": [
+        "normal_native_registration",
+        "test_direct_sfa_matches_bridge_and_cpu_reference",
+        "test_direct_sfa_addresses_beyond_eight_gib",
+        "test_direct_sfa_empty_and_tile_boundary_counts"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/e2e/pull_request/one_card/test_hisparse_kv_preprocess.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "204",
+      "removed": "0",
+      "entry_symbols": [
+        "_setup",
+        "test_fused_preprocess_preserves_native_rounding_and_packed_writes",
+        "test_nope_preprocess_uses_native_layernorm"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/e2e/pull_request/one_card/test_hisparse_ops.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "557",
+      "removed": "0",
+      "entry_symbols": [
+        "_require_mapped_host_device",
+        "reference",
+        "test_resolver_strides_padding_graph",
+        "test_topk_2048_speculative_union_graph",
+        "test_random_request_unions",
+        "test_plan_gather_and_written_slot_invalidation",
+        "test_upstream_prefill_staging_plan",
+        "test_invalidate_large_hot_capacity_graph"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/e2e/pull_request/one_card/test_hisparse_prefill_staging.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "84",
+      "removed": "0",
+      "entry_symbols": [
+        "test_resident_prefill_plan_shared_layers"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/e2e/pull_request/one_card/test_hisparse_selection_order.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "85",
+      "removed": "0",
+      "entry_symbols": [
+        "test_valid_order_duplicates_and_interleaved_padding"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/e2e/pull_request/one_card/test_shared_swiglu_a5.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "88",
+      "removed": "0",
+      "entry_symbols": [
+        "test_a5_shared_mlp_standard_swiglu"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/e2e/pull_request/one_card/test_w4a8_a5.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "122",
+      "removed": "0",
+      "entry_symbols": [
+        "_cpu_gmm",
+        "_assert_close",
+        "test_a5_w4a8_modelslim_mlp"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/core/test_mla_storage_block_size.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "40",
+      "removed": "0",
+      "entry_symbols": [
+        "test_mla_storage_uses_num_states",
+        "test_sfa_indexer_storage_rows_match_page_size",
+        "test_sliding_window_mla_preserves_custom_storage_compression"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/hisparse_pd/conftest.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "125",
+      "removed": "0",
+      "entry_symbols": [
+        "load_classes",
+        "modules"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/hisparse_pd/test_cleanup.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "422",
+      "removed": "0",
+      "entry_symbols": [
+        "Owner",
+        "Engine",
+        "Device",
+        "environment",
+        "owners",
+        "reader",
+        "worker",
+        "collect",
+        "test_reader_construction_has_no_engine_side_effect",
+        "test_incomplete_teardown_api_rejected_before_registration",
+        "test_registration_failure_retains_assigned_reader_and_real_owners",
+        "test_teardown_retry_commits_successful_stages",
+        "test_read_failure_requires_device_drain_and_keeps_descriptors",
+        "test_worker_close_failure_retains_owners_until_device_and_transport_drained",
+        "test_active_source_lease_keeps_ack_server_usable",
+        "test_future_error_preserved_after_safe_teardown_or_as_cleanup_cause",
+        "test_background_read_failure_keeps_worker_without_drained_ack",
+        "test_server_close_failure_retains_worker_until_retry"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/hisparse_pd/test_graph_mtp_contract.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "110",
+      "removed": "0",
+      "entry_symbols": [
+        "config",
+        "policy",
+        "test_mtp_graph_handoff_exports_only_completed_prefix",
+        "test_unimplemented_draft_policies_remain_rejected",
+        "test_loaded_layer_names_do_not_change_common_group_planning",
+        "test_export_waits_for_the_common_draft_mirror",
+        "test_transfer_rejects_capture_and_changed_registered_binding"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/hisparse_pd/test_pd.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "555",
+      "removed": "0",
+      "entry_symbols": [
+        "port",
+        "layouts",
+        "test_real_strided_payload_partial_pages",
+        "test_64bit_addresses_and_reject_missing_geometry",
+        "test_lease_does_not_free_on_rank_mismatch_timeout_or_unfinished_read",
+        "test_actual_upstream_aggregator_waits_all_ranks_including_failure",
+        "test_actual_multi_preserves_hisparse_completion_and_child_metadata",
+        "test_real_zmq_worker_read_then_ack_or_retain_on_dma_error",
+        "make_config",
+        "test_scheduler_ticket_all_group_blocks_and_exact_prompt",
+        "test_reject_unsupported_configuration",
+        "test_real_tensor_binding_and_storage_registration_dedup",
+        "test_shutdown_refusal_keeps_ack_path_and_tombstones_are_bounded",
+        "test_safe_failures_before_dma_do_not_crash_worker",
+        "test_drained_read_with_lost_ack_is_failed_request",
+        "test_upstream_import_publishes_only_after_rank_completion",
+        "test_composition_rejects_missing_reordered_or_extra_children",
+        "test_pd_pre_release_fences_upstream_cache_owner"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/hisparse_pd/test_scheduler_lifecycle.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "118",
+      "removed": "0",
+      "entry_symbols": [
+        "actual_classes",
+        "test_cancel_waits_for_actual_receive_drain"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/hisparse_pd/test_transport_config.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "368",
+      "removed": "0",
+      "entry_symbols": [
+        "configuration",
+        "test_canonical_bounded_mib",
+        "test_invalid_mib",
+        "test_pd_protocol_must_be_explicit",
+        "test_default_is_sixteen_mib_only_for_pd",
+        "unloaded",
+        "test_configure_before_loading_records_version_hash_and_units",
+        "test_conflict_does_not_change_environment",
+        "test_deprecated_even_equal_is_rejected",
+        "test_already_loaded_cannot_be_repaired_by_environment",
+        "test_unverifiable_library_cannot_set_environment",
+        "test_real_configuration_precedes_engine_registration",
+        "Mapping",
+        "cache_fixture",
+        "test_role_addresses_offsets_multilayer_stride_and_actual_owners",
+        "test_source_mapping_must_still_be_live_for_both_addresses",
+        "test_cpu_indexer_remains_test_only_and_bf16_required",
+        "test_role_cannot_be_inferred_or_truthy",
+        "test_role_layout_partial_transfer_preserves_entire_backing"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/test_hisparse.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "382",
+      "removed": "0",
+      "entry_symbols": [
+        "test_explicit_dma_extension_load_keeps_global_op_policy",
+        "test_lru_init_avoids_unsupported_int16_range",
+        "test_backend_current_stream_tracks_context_changes",
+        "test_hisparse_uses_core_role_managers_and_host_pool",
+        "test_registration_retains_mapping_until_explicit_release",
+        "test_group_layers_share_one_resolver_workspace",
+        "test_indexer_expanded_view_addresses_shared_hma_pages",
+        "test_indexer_alignment_flows_through_real_planner_and_shared_views",
+        "test_runtime_index_groups_drive_specs_and_physical_payloads",
+        "test_quantized_indexer_is_rejected_before_pool_allocation",
+        "test_invalid_indexer_stride_releases_initialized_host_pool"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/test_hisparse_host_mirror_descriptors.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": 106,
+      "removed": 0,
+      "entry_symbols": [
+        "test_mapped_snapshot_preserves_exact_bytes_and_unwritten_neighbors",
+        "test_ineligible_writes_keep_native_dma",
+        "test_bad_ownership_is_rejected_before_enqueue",
+        "test_small_batch_fallback_preserves_exact_descriptor_snapshot",
+        "test_small_batch_still_rejects_expired_or_invalid_ownership"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/test_hisparse_runtime_adapter.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "285",
+      "removed": "0",
+      "entry_symbols": [
+        "load_definitions",
+        "test_prefill_resident_mapping_matches_common",
+        "test_group_invalidation_updates_all_leaders_and_reuses_pointer_storage",
+        "test_stage_keeps_dependency_and_follower_event_order",
+        "test_worker_mirror_preserves_dma_and_batches_only_active_group_leaders",
+        "install_fixture",
+        "test_call_site_installation_is_idempotent_and_cpu_worker_keeps_original",
+        "test_backend_binding_changes_only_selected_runtime_instance",
+        "test_unreviewed_common_source_rejected_before_binding"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/distributed/kv_transfer/test_hisparse_submission_helpers.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": 136,
+      "removed": 0,
+      "entry_symbols": [
+        "load_module",
+        "test_prefix_views_alias_current_values_without_recreating_views",
+        "test_rebound_or_custom_tables_do_not_reuse_old_allocation_views",
+        "test_page_descriptors_match_scalar_oracle_and_preserve_duplicate_transfer_order",
+        "resident_functions",
+        "test_resident_matrix_uses_current_request_order_and_page_values"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/ops/test_hisparse_direct.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "125",
+      "removed": "0",
+      "entry_symbols": [
+        "test_raw_alias_preserves_layer_offset_and_page_gaps",
+        "test_expanded_attention_view_alias_stays_within_tail_storage",
+        "test_reject_unsupported_cache_layouts",
+        "test_compaction_preserves_order_duplicates_and_high_physical_ids",
+        "test_full_prefill_issues_one_launch_without_materializing_kv",
+        "test_private_library_loads_once_and_rejects_different_registration",
+        "test_private_library_requires_existing_absolute_shared_object"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/ops/test_shared_swiglu_a5.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "63",
+      "removed": "0",
+      "entry_symbols": [
+        "test_standard_swiglu_keeps_other_contracts"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/patch/platform/test_kv_cache_planning_compat.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "53",
+      "removed": "0",
+      "entry_symbols": [
+        "_config_and_groups",
+        "test_default_builder_materializes_exact_requested_block_count",
+        "test_memory_accounting_preserves_selected_builder"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/quantization/methods/w4a8/test_w4a8_a5.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "35",
+      "removed": "0",
+      "entry_symbols": [
+        "test_w4a8_fused_activation_hardware_scope",
+        "test_a5_unverified_weight_layouts_fail_before_loading"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/test_platform.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "11",
+      "removed": "0",
+      "entry_symbols": [
+        "test_validate_v4_index_cache_pp_partition",
+        "test_v4_index_cache_schedule_uses_indexer_ordinals",
+        "test_validate_v4_index_cache_pp_pattern",
+        "test_v4_index_cache_recomputes_first_local_c4",
+        "test_ascend_sequence_parallel_moe_supports_dp1",
+        "test_validate_pcp_dcp_config_accepts_supported_sizes",
+        "test_validate_pcp_dcp_config_rejects_unsupported_sizes",
+        "test_parallel_config_preserves_upstream_pcp_dcp_sizes",
+        "test_parallel_config_rejects_partial_tp_pcp_groups",
+        "test_pcp_dcp_rejects_unequal_sizes_for_gqa_draft",
+        "test_eagle3_gqa_pcp_dcp_skips_tp_only_head_limit",
+        "test_sfa_dcp_validation_only_bypasses_separate_draft",
+        "test_sfa_dcp_c8_hardware_validation",
+        "test_routing_replay_requires_v2_model_runner",
+        "test_visible_device_id_to_physical_device_id",
+        "TestNPUPlatform"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/worker/test_model_runner_v2_kv_cache.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "12",
+      "removed": "2",
+      "entry_symbols": [
+        "test_initialize_preserves_connector_containers_and_flattens_runner_cache",
+        "test_mrv2_block_copy_preserves_segmented_mamba_storage"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/worker/test_worker_v1.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "8",
+      "removed": "0",
+      "entry_symbols": [
+        "TestNPUWorker",
+        "TestNPUWorkerWeightUpdate",
+        "TestKVPPWorkerBudget"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/worker/v2/test_block_table.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "32",
+      "removed": "2",
+      "entry_symbols": [
+        "_allow_cpu_buffers",
+        "test_encoder_only_zero_cache_groups_initialize_and_compute",
+        "test_current_core_keeps_manager_ids_with_smaller_kernel_pages"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/worker/v2/test_spec_decode_sampling_compat.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "88",
+      "removed": "0",
+      "entry_symbols": [
+        "test_rejection_statistics_cover_all_non_bonus_logits",
+        "test_draft_sampling_forwards_step_and_watermark_width"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/worker/v2/test_speculator.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "38",
+      "removed": "3",
+      "entry_symbols": [
+        "test_calc_next_seq_lens_cpu",
+        "test_get_seq_lens_cpu",
+        "test_gather_without_out",
+        "test_gather_with_out",
+        "test_torch_gather_wrapper",
+        "test_maybe_remove_d2t_for_eagle3_same_vocab",
+        "test_maybe_remove_d2t_for_eagle3_different_vocab",
+        "test_maybe_remove_d2t_for_non_eagle3",
+        "test_draft_prefill_attn_groups",
+        "test_load_model_disables_mm_inputs_for_pp",
+        "test_load_draft_model_calls_remove_d2t",
+        "test_init_cudagraph_manager_enforce_eager",
+        "test_init_cudagraph_manager_keeps_graph_mode",
+        "test_run_model_broadcasts_replicated_hidden_states",
+        "test_generate_draft_updates_attn_metadata",
+        "test_generate_draft_skips_update_without_attn_metadata",
+        "test_multi_step_decode_full_graph",
+        "test_multi_step_decode_non_full_graph",
+        "test_merged_draft_graph_rejects_different_step_count",
+        "test_prefill_filters_target_only_metadata",
+        "test_build_uniform_attn_metadata_sets_decode_only",
+        "test_build_attn_metadata_sets_decode_only",
+        "test_build_attn_metadata_delegates_offload_kwargs_once",
+        "test_build_draft_attn_metadatas_prefill",
+        "test_build_draft_attn_metadatas_decode_updates_each_step",
+        "test_init_decode_draft_attn_metadatas_sparse_attention",
+        "test_init_decode_draft_attn_metadatas_gqa",
+        "test_update_decode_attn_metadata_gqa",
+        "test_build_fia_params_prefill",
+        "test_build_fia_params_decode",
+        "test_set_attn_detects_architecture",
+        "test_capture_single_step_only_captures_prefill",
+        "test_capture_multi_step_captures_decode",
+        "test_propose_replicated_pcp_disables_dp_sync",
+        "test_propose_forwards_upstream_step_count_and_sync",
+        "test_propose_consumes_restored_global_inputs",
+        "test_init_dcp_disabled",
+        "test_init_dcp_enabled",
+        "test_update_decode_attn_metadata_mla_with_dcp"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "tests/ut/worker/v2/test_v2_block_table.py",
+      "category": "测试",
+      "reason": "不参与推理；覆盖对应行为，不能因运行时不引用而删除。",
+      "added": "5",
+      "removed": "5",
+      "entry_symbols": [
+        "_parent_init",
+        "_init_tables",
+        "test_init_defaults_kernel_sizes_and_rebuilds_int32_slots",
+        "test_init_keeps_explicit_kernel_block_sizes",
+        "test_init_forwards_slot_mapping_enabled_on_newer_vllm",
+        "test_init_forwards_single_group_slot_mapping_enabled",
+        "_make_uninitialized_tables",
+        "test_compute_slot_mappings_launches_kernel_and_honors_out",
+        "test_compute_slot_mappings_passes_enabled_mask_on_newer_vllm",
+        "test_init_block_table_layout_tensors_uses_manager_sizes_for_slots",
+        "test_init_block_table_layout_tensors_keeps_main_contract"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/_310p/worker/v2/spec_decode/mtp_speculator.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "3",
+      "removed": "3",
+      "entry_symbols": [
+        "AscendMTPSpeculator310"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/_310p/worker_310p.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "1",
+      "entry_symbols": [
+        "NPUWorker310"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ascend_config.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "7",
+      "removed": "2",
+      "entry_symbols": [
+        "is_mega_moe_supported",
+        "validate_additional_config_bool",
+        "KVPPConfig",
+        "AscendCompilationConfig",
+        "AscendFusionConfig",
+        "StairConfig",
+        "AscendWarmupConfig",
+        "EplbConfig",
+        "RejectionSamplerConfig",
+        "RlConfig",
+        "AscendConfig",
+        "DynamicSpecConfig",
+        "FinegrainedTPConfig",
+        "XliteGraphConfig",
+        "ProfilingChunkConfig",
+        "BatchJobSchedConfig",
+        "ShortRequestFirstConfig",
+        "DyntraLBConfig",
+        "SchedulerConfig",
+        "SparseKVOffloadConfig",
+        "_is_ascend_config_initialized",
+        "init_ascend_config",
+        "clear_ascend_config",
+        "get_ascend_config"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/attention/hisparse_resident_state.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "76",
+      "removed": "0",
+      "entry_symbols": [
+        "eligible_resident_forward",
+        "ResidentForwardState",
+        "resident_eager_transport_allowed"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/attention/indexer.py",
+      "category": "功能与兼容混合",
+      "reason": "包含HiSparse/C8选择或硬件能力接入；必须按hunk拆分基础功能、可选优化与兼容改动。",
+      "added": "63",
+      "removed": "2",
+      "entry_symbols": [
+        "AscendSFAIndexerMetadata",
+        "AscendSFAIndexerBackend",
+        "AscendSFAIndexerMetadataBuilder",
+        "AscendHiSparseIndexerMetadataBuilder"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/attention/mla_v1.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "3",
+      "removed": "5",
+      "entry_symbols": [
+        "AscendMLABackend",
+        "AscendMLAAttention",
+        "ChunkedContextMetadata",
+        "AscendMLAPrefillMetadata",
+        "AscendMLADecodeMetadata",
+        "AscendMLAMetadata",
+        "AscendMLAMetadataBuilder",
+        "DecodeMLAPreprocessResult",
+        "PrefillMLAPreprocessResult",
+        "AscendMLAImpl",
+        "_mla_nope_zero_rope"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/attention/sfa_hisparse.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "666",
+      "removed": "0",
+      "entry_symbols": [
+        "_hisparse_uniform_mtp_group_size",
+        "AscendHiSparsePrefillMetadata",
+        "AscendHiSparseMetadata",
+        "AscendHiSparseMetadataBuilder",
+        "AscendHiSparseImpl"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/attention/sfa_v1.py",
+      "category": "功能与兼容混合",
+      "reason": "包含HiSparse/C8选择或硬件能力接入；必须按hunk拆分基础功能、可选优化与兼容改动。",
+      "added": "21",
+      "removed": "12",
+      "entry_symbols": [
+        "generate_smla_plan",
+        "build_smla_metadata",
+        "_view_cache_as_operator_pages",
+        "sparse_mla",
+        "SparseMLAMetadataState",
+        "_get_indexer_types",
+        "_has_shared_indexer_layers",
+        "_get_config_bool",
+        "AscendSFABackend",
+        "AscendSFAMetadata",
+        "needs_pcp_kv_gather",
+        "_int64_kv_slots",
+        "SFAForwardContext",
+        "AscendSFAMetadataBuilder",
+        "AscendSFAImpl",
+        "turboquant_kv_rmsnorm_rope",
+        "custom_kv_rmsnorm_rope"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/compilation/graph_fusion_pass_manager.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "1",
+      "entry_symbols": [
+        "GraphFusionPassManager"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/core/kv_cache_interface.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "6",
+      "removed": "6",
+      "entry_symbols": [
+        "get_kv_cache_compression_ratio",
+        "get_storage_block_size",
+        "is_circular_kv_cache_spec",
+        "is_prefix_cacheable",
+        "declared_kwarg",
+        "supports_bounded_replay",
+        "resolve_bounded_replay",
+        "requires_padded_page_layout",
+        "supports_component_major_mla_pd",
+        "AscendMLAAttentionSpec",
+        "AscendSFAIndexerCacheSpec",
+        "AscendSlidingWindowMLASpec",
+        "AscendIndexerKPoolTailSpec",
+        "AscendCircularBufferSpec",
+        "register_ascend_kv_cache_specs"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/device/hardware_profile.py",
+      "category": "功能与兼容混合",
+      "reason": "包含HiSparse/C8选择或硬件能力接入；必须按hunk拆分基础功能、可选优化与兼容改动。",
+      "added": "4",
+      "removed": "0",
+      "entry_symbols": [
+        "HardwareCapability",
+        "AttentionBackendFamily",
+        "CPUBindingMode",
+        "DeviceAdaptorFamily",
+        "DeviceAddressingMode",
+        "MoECommPolicy",
+        "QuantizationBackendFamily",
+        "WeightLayoutPolicy",
+        "DeepSeekV4TPPolicy",
+        "HardwareProfile",
+        "get_hardware_profile",
+        "get_current_hardware_profile"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/__init__.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "注册后端/connector并支持组合生命周期；仅应在选择对应connector时生效。",
+      "added": "6",
+      "removed": "0",
+      "entry_symbols": [
+        "register_connector"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "注册后端/connector并支持组合生命周期；仅应在选择对应connector时生效。",
+      "added": "25",
+      "removed": "0",
+      "entry_symbols": [
+        "AscendMultiConnector"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/__init__.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "3",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/backend.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "176",
+      "removed": "0",
+      "entry_symbols": [
+        "AscendHiSparseBackend"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/backend_dma.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "162",
+      "removed": "0",
+      "entry_symbols": [
+        "_Generation",
+        "HostDMALifetime"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/binding.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "184",
+      "removed": "0",
+      "entry_symbols": [
+        "align_hisparse_indexer_specs",
+        "get_hisparse_indexer_specs",
+        "_validate_indexer_spec",
+        "_quantized_indexer_views",
+        "write_hisparse_indexer_c8",
+        "_bind_indexer_views"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/host_mirror_descriptors.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": 65,
+      "removed": 0,
+      "entry_symbols": [
+        "prepare_snapshot"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/page_dma_descriptors.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": 187,
+      "removed": 0,
+      "entry_symbols": [
+        "_PageGeometry",
+        "_geometry",
+        "enqueue_transfers",
+        "install"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/queued_dma.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": "198",
+      "removed": "0",
+      "entry_symbols": [
+        "QueuedHostDMA"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/resident_update_installer.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": 37,
+      "removed": 0,
+      "entry_symbols": [
+        "install"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/resident_updates.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": 136,
+      "removed": 0,
+      "entry_symbols": [
+        "pack_current_updates",
+        "fresh_host_updates",
+        "unique_destinations",
+        "eligible_update_matrix",
+        "_apply_updates",
+        "candidate_update"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/hisparse/runtime_adapter.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "360",
+      "removed": "0",
+      "entry_symbols": [
+        "_ensure_gpu_sources",
+        "_resolve_residency",
+        "_resolve_and_stage_group",
+        "_enqueue_host_mirror",
+        "AscendHiSparseSlotInvalidator",
+        "_verify_source",
+        "_invalidate_written_slots",
+        "install_call_sites",
+        "bind_runtime"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/__init__.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "1",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/acl_stage.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "396",
+      "removed": "0",
+      "entry_symbols": [
+        "PTAStageBuffer"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/client.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "100",
+      "removed": "0",
+      "entry_symbols": [
+        "SnapshotClient"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/configuration.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "75",
+      "removed": "0",
+      "entry_symbols": [
+        "parse_urma_swap_mib",
+        "validate_transport_options",
+        "configure_urma_staging"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/connector.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "243",
+      "removed": "0",
+      "entry_symbols": [
+        "HiSparsePDMetadata",
+        "HiSparsePDConnector"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/execution.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "64",
+      "removed": "0",
+      "entry_symbols": [
+        "draft_transfer_enabled",
+        "execution_contract",
+        "draft_state",
+        "validate_draft_state",
+        "export_mirror_ready",
+        "validate_execution",
+        "assert_transfer_boundary",
+        "validate_completion",
+        "_binding",
+        "CacheBindingGuard"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/import_session.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "138",
+      "removed": "0",
+      "entry_symbols": [
+        "ImportSession"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/layout.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "190",
+      "removed": "0",
+      "entry_symbols": [
+        "_fp8_indexer_layouts",
+        "build_layouts"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/owners.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "23",
+      "removed": "0",
+      "entry_symbols": [
+        "bind_loaded_owners"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/pool.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "232",
+      "removed": "0",
+      "entry_symbols": [
+        "PoolKey",
+        "SharedSnapshotPool"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/protocol.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "417",
+      "removed": "0",
+      "entry_symbols": [
+        "validate_wire",
+        "digest",
+        "LayerLayout",
+        "validate_layouts",
+        "plan_reads",
+        "coalesce_transfers",
+        "build_source_range_index",
+        "validate_source_range",
+        "LeaseRegistry",
+        "encode_layouts",
+        "batch_source_transfers"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/stage.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "175",
+      "removed": "0",
+      "entry_symbols": [
+        "StageSlot"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/stage_reorder2581.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "23",
+      "removed": "0",
+      "entry_symbols": [
+        "_reorder",
+        "reorder"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/topology.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "104",
+      "removed": "0",
+      "entry_symbols": [
+        "_integer",
+        "Replica",
+        "ProducerPeer",
+        "ProducerDirectory",
+        "contiguous_peers"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/transfer.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "76",
+      "removed": "0",
+      "entry_symbols": [
+        "StagedTransfer"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/transport.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "414",
+      "removed": "0",
+      "entry_symbols": [
+        "TransferCancelled",
+        "LeaseServer",
+        "RpcClient",
+        "rpc",
+        "acquire",
+        "validate_prepared_stage",
+        "advance_stage",
+        "prepare_stage",
+        "MemfabricReader"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_p2p/hisparse_pd/worker.py",
+      "category": "仅P/D需要",
+      "reason": "属于ticket、导入导出或传输生命周期；单机HiSparse不需要，本轮单D结果不能验证它。",
+      "added": "587",
+      "removed": "0",
+      "entry_symbols": [
+        "HiSparsePDWorker"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/kv_cache_dtype.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "68",
+      "removed": "0",
+      "entry_symbols": [
+        "native_c8_cache_dtype",
+        "prepare_native_hisparse_view_dtypes"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v4/compressor.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "2",
+      "entry_symbols": [
+        "AscendCompressorStateCache",
+        "AscendCompressorMetadata",
+        "Compressor"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v4/indexer.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "2",
+      "entry_symbols": [
+        "hadamard_linear",
+        "hadamard_scale",
+        "rotate_activation",
+        "_is_w8a8_dynamic",
+        "_is_mxfp8_dynamic",
+        "get_indexer_k_dtype",
+        "AscendDeepseekV4IndexerCache",
+        "AscendIndexerMetadata",
+        "IndexerOverlapPlan",
+        "AscendIndexerOps",
+        "DeepseekV4Indexer"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v4/mm_preprocess.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "2",
+      "entry_symbols": [
+        "_get_thread_local_tokenizer",
+        "image_sentinel_mask",
+        "validate_image_sentinel_ids",
+        "grid_tokens",
+        "solve_resize_ratio",
+        "safe_resize",
+        "load_image",
+        "build_image_block",
+        "build_image_block_pad_free",
+        "DeepseekV4VLImageProcessor",
+        "DeepseekV4VLProcessor",
+        "DeepseekV4VLProcessingInfo",
+        "DeepseekV4VLDummyInputsBuilder",
+        "DeepseekV4VLMultiModalProcessor"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v4/model.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "2",
+      "entry_symbols": [
+        "AscendDeepseekV4SWACache",
+        "precompute_freqs_cis_cpu",
+        "apply_rotary_emb",
+        "get_spec_layer_idx_from_weight_name",
+        "DeepseekV2MLP",
+        "DeepseekV4MoE",
+        "yarn_get_mscale",
+        "_get_llama_4_scaling",
+        "DeepseekV4Attention",
+        "DeepseekV4DecoderLayer",
+        "DeepseekV4Model",
+        "DeepseekV2MixtureOfExperts",
+        "AscendDeepseekV4ForCausalLM"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/cache_config.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "1",
+      "entry_symbols": [
+        "uses_a5_packed_cache",
+        "make_swa_cache_spec",
+        "make_mla_cache_spec",
+        "make_index_cache_spec",
+        "make_folded_index_cache_spec",
+        "is_deepseek_v41_cache",
+        "_layer_number",
+        "_draft_layer_number",
+        "get_layer_tuples",
+        "group_cache_specs",
+        "make_cache_groups",
+        "_specs_from_groups",
+        "get_deepseek_v41_pool_bytes_per_block",
+        "get_deepseek_v41_kv_cache_config"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/engram/parallel.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "2",
+      "removed": "2",
+      "entry_symbols": [
+        "resolve_dp_shared_memory",
+        "engram_gathered_num_tokens",
+        "gather_engram_hashes",
+        "exchange_engram_rows"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/models/glm5next/cache_config.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "1",
+      "entry_symbols": [
+        "_Glm5NextCacheLayout",
+        "_is_glm5_next_spec",
+        "_unpadded_page_size",
+        "_sorted_layer_names",
+        "_layer_indices",
+        "_is_glm5_next_main_spec",
+        "_is_glm5_next_indexer_spec",
+        "_is_glm5_next_tail_spec",
+        "_align_glm5_next_cache_specs",
+        "_create_glm5_next_attention_groups",
+        "_get_glm5_next_cache_layout",
+        "_group_glm5_next_mamba_layer_names",
+        "_create_mamba_groups",
+        "get_glm5_next_kv_cache_groups",
+        "get_glm5_next_pool_bytes_per_block",
+        "get_glm5_next_kv_cache_config",
+        "get_glm5_next_max_memory_usage"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/shared_experts.py",
+      "category": "独立模型/量化修复",
+      "reason": "A5 SwiGLU或INT4权重ABI修复；不由HiSparse算法要求，单列，不计为HiSparse性能优化。",
+      "added": "23",
+      "removed": "1",
+      "entry_symbols": [
+        "SharedExpertParallelMode",
+        "SharedExpertMLPPath",
+        "PreparedSharedExpertExecution",
+        "SubmittedSharedExpertGateUp",
+        "AscendSharedExperts"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/gdn.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "0",
+      "removed": "1",
+      "entry_symbols": [
+        "_get_fla_gdn_prefill_op",
+        "_get_base_conv1d",
+        "_pack_conv_weights",
+        "initialize_packed_conv_weight",
+        "_get_packed_conv_weights",
+        "_normalize_causal_cache_indices",
+        "_split_head_first_conv_output",
+        "_rearrange_decode_qkv",
+        "AscendGatedDeltaNetAttention"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "746",
+      "removed": "0",
+      "entry_symbols": [
+        "MappedHostTensor",
+        "allocate_mapped_host",
+        "ResolverWorkspace",
+        "_cache_layout",
+        "_check_tensor",
+        "_check_packed_cache",
+        "_check_payload_rows",
+        "HiSparseNPUOps",
+        "pack_attention_rows",
+        "scatter_packed_kv"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_ascendc.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "163",
+      "removed": "0",
+      "entry_symbols": [
+        "BoundResolver",
+        "try_resolve"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_c8.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "192",
+      "removed": "0",
+      "entry_symbols": [
+        "pack_c8_components",
+        "c8_storage_view",
+        "map_c8_physical_indices",
+        "compact_c8_indices",
+        "c8_physical_attention"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_c8_mapping.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": "87",
+      "removed": "0",
+      "entry_symbols": [
+        "_map_compact_prefix1417",
+        "map_compact_c8_indices"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_c8_scope.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": "130",
+      "removed": "0",
+      "entry_symbols": [
+        "C8MappingScope",
+        "begin_c8_mapping_scope",
+        "current_c8_mapping_scope"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_c8_staged.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "72",
+      "removed": "0",
+      "entry_symbols": [
+        "_staged_map_compact",
+        "prepare_staged_c8_indices"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_compact.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "36",
+      "removed": "0",
+      "entry_symbols": [
+        "compact_physical_indices_eager"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_direct.py",
+      "category": "可选BF16注意力",
+      "reason": "旧BF16直调注意力分支；当前C8路径不以此为必要条件，应与C8支持拆分审查。",
+      "added": "186",
+      "removed": "0",
+      "entry_symbols": [
+        "load_direct_library",
+        "ensure_direct_operator",
+        "packed_cache_storage",
+        "compact_physical_indices",
+        "packed_sparse_flash_attention"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/hisparse_resident.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "192",
+      "removed": "0",
+      "entry_symbols": [
+        "resident_index_kernel",
+        "metadata_signature",
+        "begin_resident_forward",
+        "group_mapping_contract",
+        "resident_topk_or_none"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/kimi_kda.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "0",
+      "removed": "1",
+      "entry_symbols": [
+        "_kda_bfg_stream",
+        "_KDAFusedBFGLinear",
+        "_normalize_causal_cache_indices",
+        "_prepare_beta",
+        "AscendKimiK3DeltaAttention"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/linear.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "1",
+      "entry_symbols": [
+        "unquantized_gemm",
+        "unquantized_gemm_fake",
+        "_should_keep_nd_for_compatibility_weight",
+        "_should_reshape_wo_a_to_3d",
+        "AscendUnquantizedLinearMethod",
+        "AscendLinearBase",
+        "AscendQKVParallelLinear",
+        "AscendMergedColumnParallelLinear",
+        "AscendRowParallelLinear",
+        "AscendColumnParallelLinear",
+        "AscendReplicatedLinear"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/mla.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "2",
+      "removed": "0",
+      "entry_symbols": [
+        "IndexerWrapper",
+        "AscendMultiHeadLatentAttention",
+        "mla_forward",
+        "mla_forward_fake"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/rotary_embedding.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "2",
+      "removed": "2",
+      "entry_symbols": [
+        "set_cos_and_sin",
+        "get_cos_and_sin_mla",
+        "_record_cos_sin_cache",
+        "_record_cos_and_sin_cache",
+        "_record_cos_and_sin_cache_interleaved",
+        "update_cos_sin",
+        "get_cos_and_sin_slice",
+        "rope_forward_oot",
+        "AscendRotaryEmbedding",
+        "AscendYaRNRotaryEmbedding",
+        "AscendGemma4RotaryEmbedding",
+        "AscendDeepseekScalingRotaryEmbedding",
+        "AscendMRotaryEmbedding",
+        "AscendApplyRotaryEmb"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "786",
+      "removed": "0",
+      "entry_symbols": [
+        "_translate",
+        "_lookup_with_position",
+        "_lookup",
+        "prepare_residency_kernel",
+        "classify_residency_kernel",
+        "protect_residency_kernel",
+        "partition_residency_kernel",
+        "update_lru_kernel",
+        "protected_lru_tile_prefix_kernel",
+        "protected_lru_partition_kernel",
+        "protect_and_update_lru_kernel",
+        "assign_residency_kernel",
+        "finish_residency_kernel",
+        "residency_stats_kernel",
+        "compact_physical_indices_kernel",
+        "gather_rows_kernel",
+        "invalidate_kernel",
+        "pack_attention_rows_kernel",
+        "scatter_packed_kv_kernel"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_c8_fused.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": "214",
+      "removed": "0",
+      "entry_symbols": [
+        "_scatter_components",
+        "scatter_c8_components",
+        "_pack_query_lengths",
+        "pack_c8_query_lengths",
+        "_zero_empty_rows",
+        "zero_empty_c8_rows"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_c8_map_pack.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": "140",
+      "removed": "0",
+      "entry_symbols": [
+        "_map32",
+        "_map_pack",
+        "geometry",
+        "map32",
+        "map_pack"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_compact.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "26",
+      "removed": "0",
+      "entry_symbols": [
+        "stable_compact_kernel"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_gather_global.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "53",
+      "removed": "0",
+      "entry_symbols": [
+        "gather_compact_global_kernel"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_gather_persistent.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": "59",
+      "removed": "0",
+      "entry_symbols": [
+        "gather_rows_persistent_kernel"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_host_mirror.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": 16,
+      "removed": 0,
+      "entry_symbols": [
+        "store_opaque_extents"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_indexer_c8_write.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": 93,
+      "removed": 0,
+      "entry_symbols": [
+        "_write_indexer_c8",
+        "try_write"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_invalidate_groups.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": "76",
+      "removed": "0",
+      "entry_symbols": [
+        "invalidate_groups_kernel",
+        "invalidate_written_groups"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_invalidation.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "69",
+      "removed": "0",
+      "entry_symbols": [
+        "_invalidate_hot_slots",
+        "try_invalidate"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_recycled_invalidate.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": 132,
+      "removed": 0,
+      "entry_symbols": [
+        "normalized_blocks",
+        "_invalidate_recycled_groups",
+        "RecycledGroupInvalidator"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_request_rows.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "58",
+      "removed": "0",
+      "entry_symbols": [
+        "_request_rows",
+        "try_build_request_rows"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/ops/triton/hisparse_resident_gather.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "62",
+      "removed": "0",
+      "entry_symbols": [
+        "_resident_rows_to_staging",
+        "try_gather_resident_rows"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/__init__.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "25",
+      "removed": "0",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "29",
+      "removed": "0",
+      "entry_symbols": [
+        "_skips_eagle_block_drop",
+        "_select_kv_token_budget",
+        "_is_deepseek_v4_kv_cache_spec",
+        "_is_deepseek_v4_kv_cache_config",
+        "_manager_spec",
+        "AscendHybridKVCacheCoordinator",
+        "get_kv_cache_coordinator"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_kv_cache_utils.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "20",
+      "removed": "26",
+      "entry_symbols": [
+        "_page_sizes",
+        "_ascend_resolve_kv_cache_block_sizes",
+        "_get_kimi_k3_dspark_mixed_kv_cache_groups",
+        "_get_kv_cache_groups_uniform_page_size",
+        "_kv_cache_config_has_mamba_layers",
+        "group_and_unify_kv_cache_specs",
+        "_get_kv_cache_groups_uniform_groups",
+        "_get_max_layers_per_page_size",
+        "_ascend_get_packed_kv_cache_groups",
+        "_get_deepseek_v4_cache_layout",
+        "_get_kv_cache_config_deepseek_v4_main",
+        "_is_deepseek_v4_groups",
+        "_ascend_pool_bytes_per_block",
+        "_ascend_max_memory_usage_bytes_from_groups",
+        "_get_glm5_next_kv_cache_groups",
+        "_ascend_get_kv_cache_config_from_groups"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/__init__.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "1",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_deepseek_v2.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "2",
+      "entry_symbols": [
+        "_should_skip_indexer_init",
+        "_deepseek_v2_mla_attention_init",
+        "_find_topk_indices_buffer",
+        "_patched_deepseek_v2_model_init",
+        "_set_aux_hidden_state_layers",
+        "_capture_aux_hidden_state",
+        "_patched_forward"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_hisparse_block_table_views.py",
+      "category": "待实测候选",
+      "reason": "复用前缀视图对象；仅CPU验证，尚无模型收益证据，不是基础功能必需。",
+      "added": 87,
+      "removed": 0,
+      "entry_symbols": [
+        "current_table_views",
+        "bind",
+        "install"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_hisparse_invalidation.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "31",
+      "removed": "0",
+      "entry_symbols": [
+        "install"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_hisparse_lazy_mtp_mirror.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": 207,
+      "removed": 0,
+      "entry_symbols": [
+        "_eligible",
+        "_verify_contract",
+        "_validate_consumer",
+        "install"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_hisparse_lazy_row_map.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": 86,
+      "removed": 0,
+      "entry_symbols": [
+        "can_discard",
+        "resolve",
+        "install"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_hisparse_padding_owner.py",
+      "category": "HiSparse功能/桥接",
+      "reason": "参与Ascend后端、Host注册、KV映射或失效生命周期；当前实现依赖，但不等于唯一实现。",
+      "added": "149",
+      "removed": "0",
+      "entry_symbols": [
+        "PaddingMaskOwner",
+        "_prepare_group_owner",
+        "_padding_mask",
+        "prepare_group",
+        "install",
+        "_owned_resolve_and_stage_group"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_hisparse_recycled_groups.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": 45,
+      "removed": 0,
+      "entry_symbols": [
+        "install"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_hisparse_streams.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": "146",
+      "removed": "0",
+      "entry_symbols": [
+        "_is_npu",
+        "_native_stream",
+        "HiSparseStream",
+        "HiSparseEvent",
+        "native_current_stream",
+        "create_event",
+        "_group_current_stream",
+        "_AcceleratorFacade",
+        "_TorchFacade",
+        "install"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_hisparse_unused_staging.py",
+      "category": "可独立性能优化",
+      "reason": "替代原有准备/搬运/映射路径；应独立证明正确性和收益，不能视为功能必需。",
+      "added": 140,
+      "removed": 0,
+      "entry_symbols": [
+        "scope_for",
+        "make_bindings",
+        "install"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_v2/patch_adaptive_verification.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "20",
+      "removed": "9",
+      "entry_symbols": [
+        "_index_fill",
+        "_IndexFillMode",
+        "_assign_draft_token_budget_ascend"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_v2/patch_eagle_speculator.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "1",
+      "entry_symbols": [],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_v2/patch_model_runner.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "4",
+      "removed": "9",
+      "entry_symbols": [
+        "dispatch_cg_and_sync_dp",
+        "initialize_kv_cache"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_v2/patch_spec_decode_310.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "1",
+      "entry_symbols": [
+        "_embed_input_ids",
+        "_init_speculator_310p"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_v2/patch_uva.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "15",
+      "removed": "0",
+      "entry_symbols": [
+        "check_triton_ascend_version_valid",
+        "is_uva_available",
+        "get_row_indices_from_key",
+        "MonitoredNumPyArray",
+        "MonitoredTorchTensor",
+        "_zeros_on_npu",
+        "_int64_storage",
+        "UvaBufferWrapper",
+        "_copy_chunks_to_uva"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "category": "功能与兼容混合",
+      "reason": "包含HiSparse/C8选择或硬件能力接入；必须按hunk拆分基础功能、可选优化与兼容改动。",
+      "added": "9",
+      "removed": "4",
+      "entry_symbols": [
+        "NPUPlatform",
+        "_configure_minimax_m3_a5_mixed_kv_cache",
+        "_fix_incompatible_config",
+        "_validate_model_runner_config",
+        "_validate_eplb_config",
+        "_check_ascend_config",
+        "_validate_kv_load_failure_policy",
+        "_update_compilation_modes",
+        "_setup_compile_backend",
+        "_setup_worker_and_scheduler",
+        "_swa_bounded_replay_unsupported_mode",
+        "_downgrade_swa_bounded_replay",
+        "_validate_sfa_dcp_kv_sp",
+        "_set_pytorch_npu_alloc_env",
+        "_disable_expandable_segments",
+        "_validate_fa3_backend",
+        "_get_reduced_cg_cap",
+        "_config_deprecated_logging",
+        "_get_recompute_scheduler_cls",
+        "_get_dyntra_lb_scheduler_cls",
+        "_validate_engram_config",
+        "_validate_routing_replay_config",
+        "_validate_parallel_config",
+        "_validate_model_pcp_dcp_config",
+        "_validate_pcp_dcp_config",
+        "_validate_aux_output_config",
+        "_get_deepseek_v4_variant",
+        "_validate_deepseek_v4_tp_config",
+        "_validate_draft_decode_context_parallel_config"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/quantization/methods/kv_cache/turboquant/cache.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "1",
+      "entry_symbols": [
+        "uses_turboquant_groups",
+        "group_specs",
+        "_alignment",
+        "packed_layout",
+        "pool_bytes_per_block",
+        "max_memory_usage",
+        "cache_config"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/quantization/methods/w4a8/w4a8.py",
+      "category": "独立模型/量化修复",
+      "reason": "A5 SwiGLU或INT4权重ABI修复；不由HiSparse算法要求，单列，不计为HiSparse性能优化。",
+      "added": "29",
+      "removed": "2",
+      "entry_symbols": [
+        "AscendW4A8DynamicFusedMoEMethod"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/spec_decode/__init__.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "4",
+      "removed": "1",
+      "entry_symbols": [
+        "get_spec_decode_method"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/aclgraph_utils.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "29",
+      "removed": "1",
+      "entry_symbols": [
+        "_prepare_pcp_inputs_to_capture",
+        "collect_sorted_captured_token_sizes",
+        "_get_graph_update_backend",
+        "ModelAclGraphManager",
+        "_suspend_hisparse_mirrors_for_capture",
+        "ModelWithContext",
+        "model_capture_wrapper"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/attn_utils.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "43",
+      "removed": "5",
+      "entry_symbols": [
+        "skip_ring_state_update",
+        "ring_state_update_skipped",
+        "unwrap_mamba_kv_cache_groups",
+        "_align_hybrid_attention_page_sizes",
+        "get_kv_cache_spec",
+        "_get_parallel_config_for_attn_metadata",
+        "build_attn_metadata",
+        "build_attn_state",
+        "_get_layer_kv_cache_specs",
+        "_is_dsv4_model",
+        "_get_attention_kv_cache_dims",
+        "_adjust_dsv4_kv_layout",
+        "_reshape_combined_mla_kv_cache",
+        "_reshape_combined_attention_kv_cache",
+        "_view_dsv4_cache",
+        "_align_memory",
+        "_align_up",
+        "_allocate_int8_cache_tensor",
+        "_allocate_sparse_c8_indexer_tensors",
+        "_uses_single_raw_mla_cache",
+        "_allocate_kv_cache",
+        "allocate_kv_cache_main",
+        "_reshape_mamba_kv_cache",
+        "_reshape_kv_cache_v2",
+        "build_attn_metadata_wrapper",
+        "build_attn_metadata_factory"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/block_table.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "11",
+      "removed": "4",
+      "entry_symbols": [
+        "AscendBlockTables"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/model_runner.py",
+      "category": "功能与兼容混合",
+      "reason": "包含P/D owner绑定、profiling签名和dummy preemption保护；可分别审查，不能归为计数/MTP时序修复。",
+      "added": "8",
+      "removed": "1",
+      "entry_symbols": [
+        "NPUModelRunner",
+        "graph_manager_wrapper"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/sample/apply_top_k_top_p.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "9",
+      "removed": "1",
+      "entry_symbols": [
+        "apply_top_k_top_p_npu"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/spec_decode/autoregressive/aclgraph.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "1",
+      "removed": "1",
+      "entry_symbols": [
+        "AutoRegressiveAclGraphManager"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "29",
+      "removed": "4",
+      "entry_symbols": [
+        "AscendAutoRegressiveSpeculator",
+        "gather",
+        "torch_gather_wrapper"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/spec_decode/lmhead_tp_utils.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "21",
+      "removed": "3",
+      "entry_symbols": [
+        "LmheadTPDraftSamplingMixin"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/worker/v2/spec_decode/rejection_sampler_utils.py",
+      "category": "冻结上游兼容/可拆",
+      "reason": "适配当前冻结Core接口或独立模型路径；不是HiSparse算法必需，换基线后应重审并独立提交。",
+      "added": "25",
+      "removed": "4",
+      "entry_symbols": [
+        "_probabilistic_rejection_kernel",
+        "rejection_sample"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "category": "功能与兼容混合",
+      "reason": "同时包含新Core导入、shared-slab计费绕过及已注册Host页的NUMA保护；不能按整文件判断必要。",
+      "added": "14",
+      "removed": "5",
+      "entry_symbols": [
+        "NPUWorker",
+        "parse_text_output"
+      ],
+      "audit_scope": "静态改动范围/功能依赖审计；非逐文件删除回归证明"
+    }
+  ]
+}

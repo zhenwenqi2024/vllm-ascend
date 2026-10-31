@@ -207,3 +207,18 @@ class UvaBufferWrapper:
 
 
 vllm.v1.worker.gpu.buffer_utils.UvaBuffer = UvaBufferWrapper
+
+
+def _copy_chunks_to_uva(self, chunks, n: int) -> torch.Tensor:
+    """Retain dirty tracking for NumPy writes through a raw sliced view."""
+    buf = self._next_buf(n)
+    np.concatenate(chunks, out=buf.np[:n], casting="unsafe")
+    if isinstance(buf, UvaBufferWrapper) and not buf._use_real_uva:
+        # concatenate(out=...) writes the ndarray returned by __getitem__,
+        # bypassing MonitoredNumPyArray.__setitem__. Mark only after success;
+        # uva(n) then submits the existing asynchronous prefix copy.
+        buf._modified_indices.update(range(n))
+    return buf.uva(n)
+
+
+vllm.v1.worker.gpu.buffer_utils.UvaBufferPool.copy_chunks_to_uva = _copy_chunks_to_uva

@@ -12,7 +12,6 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.utils import replace_parameter
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,  # type: ignore
     AttentionCGSupport,
@@ -55,6 +54,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     OFFLOAD_KV_CACHE_TUPLE_LEN,
     OFFLOAD_V_CACHE_NPU_INDEX,
 )
+from vllm_ascend.kv_cache_dtype import native_c8_cache_dtype
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.quantization.methods import (
     AscendW8A8DynamicLinearMethod,
@@ -358,6 +358,10 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
+        if get_current_vllm_config().attention_config.hisparse_config is not None:
+            from vllm_ascend.attention.sfa_hisparse import AscendHiSparseMetadataBuilder
+
+            return AscendHiSparseMetadataBuilder
         if get_ascend_config().sparse_kv_offload_config.enabled:
             from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadMetadataBuilder
 
@@ -378,6 +382,10 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["AscendSFAImpl"]:
+        if get_current_vllm_config().attention_config.hisparse_config is not None:
+            from vllm_ascend.attention.sfa_hisparse import AscendHiSparseImpl
+
+            return AscendHiSparseImpl
         if get_ascend_config().sparse_kv_offload_config.enabled:
             from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl
 
@@ -665,9 +673,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             seq_lens_cpu = common_attn_metadata._seq_lens_cpu[:num_reqs]
         elif common_attn_metadata.seq_lens_cpu is not None:
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
-        elif self.nope:
+        elif self.nope or self.vllm_config.attention_config.hisparse_config is not None:
             # MTP accepted counts are device-resident. NoPE operators use
-            # device lengths and scheduler upper bounds, so need no CPU copy.
+            # device lengths and scheduler upper bounds, as does HiSparse's
+            # staging plan, so neither path needs an exact CPU copy.
             seq_lens_cpu = None
         else:
             seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
@@ -879,7 +888,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.enable_sparse_sfa_turboquant = ascend_config.enable_sparse_sfa_turboquant
         self.enable_sparse_sfa_c8 = ascend_config.enable_sparse_sfa_c8
         if self.enable_sparse_sfa_c8:
-            self.c8_cache_dtype = kv_cache_dtype_str_to_dtype(
+            self.c8_cache_dtype = native_c8_cache_dtype(
                 self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config
             )
 
@@ -961,23 +970,21 @@ class AscendSFAImpl(MLAAttentionImpl):
         # scenario the graph is captured once, so every later weight update
         # reload has to refresh the stored tensors in place instead of
         # rebinding the attributes to freshly allocated tensors.
-        # `replace_parameter(..., prefer_copy=True)` does exactly that: it
+        # `replace_parameter(...)` does exactly that: it
         # copies into the existing storage while the new value stays
-        # compatible, and rebinds only when shape/dtype/device actually
-        # changes. This mirrors how upstream vLLM refreshes
+        # compatible, and rebinds its data when shape/stride/dtype/device
+        # changes, preserving the parameter object. Upstream refreshes
         # `MLAAttention.W_UV`/`W_UK_T`, and unlike a plain `copy_` it cannot
         # raise on a shape mismatch.
         replace_parameter(
             self,
             "W_UV",
             W_UV.transpose(0, 1).contiguous(),  # (L, N, V) -> (N, L, V)
-            prefer_copy=True,
         )
         replace_parameter(
             self,
             "W_UK_T",
             W_UK.permute(1, 2, 0).contiguous(),  # (L, N, P) -> (N, P, L)
-            prefer_copy=True,
         )
 
         # Dispose kv_b_proj since it is replaced by W_UV and W_UK_T to save memory.
@@ -1098,13 +1105,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         if qt is None:
             self.fused_qkv_a_proj.weight.data = self.fused_qkv_a_proj.weight.data.T
 
-        fused_weight = self.fused_qkv_a_proj.weight.data
+        # A5's aclnn clone cannot materialize slices of an internal-format
+        # tensor. Split a logical ND view, then restore the prolog's NZ inputs.
+        fused_weight = torch_npu.npu_format_cast(self.fused_qkv_a_proj.weight.data, 2)
         weight_dq = fused_weight[..., : self.q_lora_rank].contiguous()
         weight_dkv_kr = fused_weight[..., self.q_lora_rank :].contiguous()
         if qt is not None:
-            weight_uq_qr = self.q_proj.weight.data.contiguous()
+            weight_uq_qr = torch_npu.npu_format_cast(self.q_proj.weight.data, 2).contiguous()
         else:
-            weight_uq_qr = self.q_proj.weight.data.T.contiguous()
+            weight_uq_qr = torch_npu.npu_format_cast(self.q_proj.weight.data, 2).T.contiguous()
 
         self.weight_dq = torch_npu.npu_format_cast(weight_dq, ACL_FORMAT_FRACTAL_NZ)
         self.weight_dkv_kr = torch_npu.npu_format_cast(weight_dkv_kr, ACL_FORMAT_FRACTAL_NZ)

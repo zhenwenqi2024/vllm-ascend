@@ -92,7 +92,6 @@ def _pack_conv_weights(conv1d: nn.Module) -> None:
         conv1d,
         _PACKED_CONV_WEIGHT_NAME,
         packed_weight,
-        prefer_copy=True,
     )
 
 
