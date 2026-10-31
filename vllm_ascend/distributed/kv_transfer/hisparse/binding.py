@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
+
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 
 
@@ -67,7 +68,6 @@ def get_hisparse_indexer_specs(
                 indexer_specs[name] = spec
 
     return indexer_specs
-
 
 
 def _validate_indexer_spec(spec: AscendSFAIndexerCacheSpec) -> None:
@@ -125,6 +125,10 @@ def write_hisparse_indexer_c8(key, scale, values, scales, slots, scatter) -> Non
     Derive aliases from the current cache tuple, so profiling-cache replacement
     and teardown cannot leave a second set of persistent cache references.
     """
+    from vllm_ascend.ops.triton.hisparse_indexer_c8_write import try_write
+
+    if try_write(key, scale, values, scales, slots):
+        return
     pages, block, heads, width = key.shape
     stride = key.stride(0)
     count = slots.numel()

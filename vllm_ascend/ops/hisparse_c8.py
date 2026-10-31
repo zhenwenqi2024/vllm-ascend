@@ -136,7 +136,7 @@ def c8_physical_attention(
         fused = None
         if (
             _mapping_scope is not None
-            and rows in (8, 16)
+            and rows in (8, 16, 32)
             and _mapping_scope.context() is not None
             and torch.npu.is_current_stream_capturing()
         ):

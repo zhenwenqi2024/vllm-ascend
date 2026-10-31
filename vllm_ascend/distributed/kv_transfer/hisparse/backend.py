@@ -81,6 +81,20 @@ class AscendHiSparseBackend(HiSparseBackend):
         from .runtime_adapter import bind_runtime
 
         bind_runtime(runtime)
+        from .page_dma_descriptors import install as install_page_descriptors
+        from .resident_update_installer import install as install_resident_updates
+
+        install_page_descriptors()
+        install_resident_updates()
+        from vllm_ascend.patch.worker.patch_hisparse_recycled_groups import install as install_recycled
+
+        install_recycled()
+        if runtime.eager_host_mirror is False:
+            from vllm.config import get_current_vllm_config
+
+            from vllm_ascend.patch.worker.patch_hisparse_lazy_mtp_mirror import install as install_lazy_mtp_mirror
+
+            install_lazy_mtp_mirror(get_current_vllm_config())
         return ops
 
     def validate_kv_cache_config(self, kv_cache_config: KVCacheConfig) -> None:
