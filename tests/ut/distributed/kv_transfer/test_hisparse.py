@@ -36,6 +36,8 @@ def test_explicit_dma_extension_load_keeps_global_op_policy(monkeypatch):
     namespace = SimpleNamespace()
     bootstrap = MagicMock()
     ops_type = MagicMock()
+    descriptor_patch = MagicMock()
+    monkeypatch.setitem(sys.modules, "vllm_ascend.patch.worker.patch_hisparse_page_descriptors", descriptor_patch)
     monkeypatch.setattr(torch.ops, "_C_ascend", namespace)
     monkeypatch.setitem(sys.modules, "vllm_ascend.ops.hisparse", SimpleNamespace(HiSparseNPUOps=ops_type))
     monkeypatch.setitem(sys.modules, "vllm_ascend.utils", SimpleNamespace(bootstrap_custom_op_env=bootstrap))
@@ -52,6 +54,7 @@ def test_explicit_dma_extension_load_keeps_global_op_policy(monkeypatch):
 
     bootstrap.assert_called_once_with()
     loader.assert_called_once_with("vllm_ascend.vllm_ascend_C")
+    assert descriptor_patch.install.call_count == 2
 
 
 def test_lru_init_avoids_unsupported_int16_range(monkeypatch):

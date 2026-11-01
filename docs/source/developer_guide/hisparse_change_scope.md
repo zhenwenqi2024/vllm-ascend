@@ -1,7 +1,9 @@
 # HiSparse change-scope audit
 
 This feature PR is a platform-backend implementation, not the complete experimental
-performance branch. Rebased onto Ascend main `24a76e84394ae3427195e3715fc08e90769d398c`.
+performance branch. It also includes the measured CPU page-descriptor optimization;
+see [performance decisions](hisparse_performance_decisions.md).
+Rebased onto Ascend main `24a76e84394ae3427195e3715fc08e90769d398c`.
 The paired common vLLM HiSparse interface remains a prerequisite.
 Historical integration runs do not qualify the rebased head.
 
@@ -44,6 +46,7 @@ implementation's feature or tests, not that no smaller design is possible.
 | `tests/e2e/pull_request/one_card/test_hisparse_prefill_staging.py` | Keep: common Prefill staging and opaque-byte gather contract. |
 | `tests/e2e/pull_request/one_card/test_hisparse_selection_order.py` | Keep: selected logical rows retain attention order. |
 | `tests/ut/distributed/kv_transfer/test_hisparse.py` | Keep: backend signatures, ownership, aliases and unsupported-mode rejection. |
+| `tests/ut/distributed/kv_transfer/test_hisparse_page_descriptors.py` | Keep: CPU descriptor byte/order/lifetime guards, fallback and cold installer coverage. |
 | `tests/ut/worker/test_worker_v1.py` | Keep: HiSparse shared-pool memory accounting bypass regression. |
 | `vllm_ascend/attention/indexer.py` | Keep: metadata-only page/slot stride translation for the shared allocation; no Indexer compute kernel change. |
 | `vllm_ascend/attention/sfa_hisparse.py` | Keep: backend integration and layout bridge; current feature rejects attention C8. |
@@ -51,15 +54,19 @@ implementation's feature or tests, not that no smaller design is possible.
 | `vllm_ascend/distributed/kv_transfer/hisparse/__init__.py` | Keep: exports the platform backend. |
 | `vllm_ascend/distributed/kv_transfer/hisparse/backend.py` | Keep: common-runtime backend contract for NPU streams, events, memory and payload operations. |
 | `vllm_ascend/distributed/kv_transfer/hisparse/binding.py` | Keep: declare Indexer alignment before allocation and create same-storage views inside common rollback. |
+| `vllm_ascend/distributed/kv_transfer/hisparse/page_dma_descriptors.py` | Include measured CPU vectorization; no DMA/kernel/event changes. See the performance decision record. |
 | `vllm_ascend/ops/hisparse.py` | Keep as backend primitives; implementation/launch-count optimality is not established. |
 | `vllm_ascend/ops/triton/hisparse.py` | Keep as NPU equivalents; optional fusion candidates are excluded. |
 | `vllm_ascend/ops/mla.py` | Keep: forwards the common Indexer-group builder; no projection or attention math change. |
 | `vllm_ascend/patch/platform/patch_kv_cache_coordinator.py` | Keep: delegate HiSparse roles to the common coordinator rather than an ordinary Ascend hybrid manager. |
+| `vllm_ascend/patch/__init__.py` | Keep: document the temporary CPU descriptor patch and removal plan. |
+| `vllm_ascend/patch/worker/patch_hisparse_page_descriptors.py` | Include cold NPU-only, source-pinned installer; unknown versions retain original behavior. |
 | `vllm_ascend/patch/worker/patch_deepseek_v2.py` | Keep: forwards group ownership from the model into the MLA wrapper. |
 | `vllm_ascend/platform.py` | Keep: platform backend selection hook. |
 | `vllm_ascend/worker/v2/attn_utils.py` | Keep: common role-aware specs, shared-slab alignment and groups without attention layers. |
 | `vllm_ascend/worker/v2/model_runner.py` | Keep only dummy/profile preemption guard; preserve current upstream initialization and JIT warmup helper. |
 | `vllm_ascend/worker/worker.py` | Keep: do not apply ordinary per-layer memory correction to the already-accounted common shared slab. |
+| `docs/source/developer_guide/hisparse_performance_decisions.md` | Include per-candidate/operator decisions and measured evidence limits; no runtime cost. |
 
 ## Intentionally excluded from this upstream feature
 
@@ -67,7 +74,7 @@ The fork's broad integration snapshot is not copied wholesale:
 
 - New AscendC attention source, C8 map/pack/fused resolver variants, grouped
   invalidator experiments, persistent gather and follower query-prepack.
-- Mapped AIV Host-writeback, page-descriptor vectorization, fused Resident updates,
+- Mapped AIV Host-writeback, fused Resident updates,
   lazy-MTP/unused-staging wrappers and block-table view reuse candidates.
 - Device-URMA P/D prototypes, export/import staging and transport control.
 - Independent A5 W4A8/SwiGLU fixes and latest-common API compatibility changes.

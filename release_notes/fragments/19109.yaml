@@ -6,3 +6,7 @@ entries:
       Model Runner V2, private Host pools and unquantized KV caches.
       Requires the paired vLLM HiSparse backend interface; attention C8,
       context parallelism and disaggregated P/D are outside this feature's scope.
+  - category: performance
+    text: >-
+      Vectorized CPU page-transfer descriptor preparation for supported paired
+      HiSparse worker revisions, preserving DMA submission and completion events.

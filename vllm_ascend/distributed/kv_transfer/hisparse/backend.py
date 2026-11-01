@@ -39,6 +39,11 @@ class AscendHiSparseBackend(HiSparseBackend):
                 raise RuntimeError("Ascend HiSparse requires the Ascend swap_blocks_batch operator.")
         if not callable(HiSparseNPUOps):
             raise RuntimeError("Ascend HiSparse device kernels are unavailable.")
+        from vllm_ascend.patch.worker.patch_hisparse_page_descriptors import install
+
+        # Optional CPU preparation optimization; unknown common versions keep
+        # their original builder. DMA submission and fences are never replaced.
+        install()
 
     def pin_tensor(self, tensor: torch.Tensor) -> None:
         from vllm_ascend.ops.hisparse import MappedHostTensor
