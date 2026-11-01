@@ -108,3 +108,62 @@ Thus prefetch reduced the local exposed wait by about 0.262 ms; a roughly
 The latter is not established as a causal effect of prefetch. These are
 profile intervals, not new formal TPOT results. The historical port predates
 later lazy-MTP and kernel changes and cannot qualify the new combination.
+
+## First AllReduce: where the additional wait comes from
+
+Both actual CPU graph launches were linked to device `MODEL_EXECUTE` tasks
+using `connection_id`, then to the first AllReduce. Five middle targets were
+checked on every rank in both saved parent/prefetch arms.
+
+| Mean per rank/target | Parent | Prefetch | Difference |
+| --- | ---: | ---: | ---: |
+| Exposed first wait | 0.667246 ms | 1.159374 ms | +0.492128 ms |
+| Arrival lead relative to the last rank entering the collective | 0.518536 ms | 1.025451 ms | +0.506915 ms |
+| Wait remaining after subtracting arrival lead | 0.148710 ms | 0.133923 ms | -0.014787 ms |
+| CPU submission lead relative to the last submitting rank | 0.515129 ms | 1.010502 ms | +0.495373 ms |
+
+In all ten checked steps, the rank submitting last on CPU also entered the
+collective last. CPU-submit/collective-entry correlation exceeds 0.9997 in
+every step. Previous drafts ended within 6-17 microseconds across ranks;
+collective ends aligned within 12-25 microseconds. In the prefetch arm,
+rank 5 submitted last in all five steps; the last rank varied in the parent.
+
+This supports CPU submission skew causing exposed collective waiting in
+these captures. It does not establish that prefetch caused the skew.
+The remaining-after-arrival term includes communication progress; it is not
+an isolated measurement of data transfer time. Arrival lead and first wait
+overlap and must not be added as separate savings.
+
+## Cross-check on the latest measured ON/OFF tree
+
+The later `b7bf0486...` source was checked independently across eight ranks
+and five middle targets per arm. ON submitted Target with a 1.31-1.53 ms
+cross-rank spread; rank 7 was last in every checked step. Its CPU-submit/
+collective-entry correlation exceeded 0.9995. OFF could queue its next Target
+before the previous device draft finished, whereas ON submitted almost
+immediately before its Target started on device.
+
+To include OFF's work that overlaps device execution, host preparation was
+measured after the last long `aclrtSynchronizeEvent` completed and before
+the next Target submission:
+
+| Observed host interval | OFF | ON | Difference |
+| --- | ---: | ---: | ---: |
+| Total wall interval | 1.866637 ms | 3.892302 ms | +2.025664 ms |
+| Recorded CPU APIs, nested spans counted once | 0.692325 ms | 1.156498 ms | +0.464173 ms |
+| Unmarked wall interval | 1.174312 ms | 2.735803 ms | +1.561491 ms |
+
+The recorded increment includes about 0.158 ms of `as_strided`/`slice`,
+0.043 ms of `copy_`, and 0.028 ms of copy-workspace preparation. Python
+call stacks were not captured for the unmarked time. It can include
+Python/NumPy metadata and descriptor work, IPC, shorter waits or OS
+descheduling. Attributing all 1.561 ms to the 79-layer descriptor builder
+or Resident updates is unsupported. These intervals are not additive TPOT
+predictions. The first checked CPU interval also has a larger readiness
+spread; it is retained in the means rather than silently discarded.
+
+Existing count-copy/MTP ordering is preserved. The current-source prefetch
+plus prefix-view candidate passed ten real cold-module CPU integration
+checks and 54 actual-method CPU policy cases with initialization denied.
+Model/NPU and paired N2 qualification remain pending; CPU checks do not close
+the <=3% target.
