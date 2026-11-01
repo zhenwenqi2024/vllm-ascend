@@ -1,0 +1,8 @@
+pr: 19109
+entries:
+  - category: feature
+    text: >-
+      Added an experimental Ascend HiSparse backend for sparse MLA/DSA with
+      Model Runner V2, private Host pools and unquantized KV caches.
+      Requires the paired vLLM HiSparse backend interface; attention C8,
+      context parallelism and disaggregated P/D are outside this feature's scope.

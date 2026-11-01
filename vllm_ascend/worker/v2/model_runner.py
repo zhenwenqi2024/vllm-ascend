@@ -662,7 +662,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # Preemption stores must complete before the parent updates states and
         # reuses or zeroes the preempted requests' physical KV cache blocks.
-        if has_kv_transfer_group():
+        if has_kv_transfer_group() and not (dummy_run or is_profile):
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
