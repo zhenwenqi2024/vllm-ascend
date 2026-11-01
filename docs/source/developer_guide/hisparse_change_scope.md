@@ -7,6 +7,13 @@ Rebased onto Ascend main `24a76e84394ae3427195e3715fc08e90769d398c`.
 The paired common vLLM HiSparse interface remains a prerequisite.
 Historical integration runs do not qualify the rebased head.
 
+The complete local working-version delta is also available as a non-installed
+[experimental review snapshot](../../../benchmarks/hisparse/experimental/20261031/README.md).
+Its manifest lists every source path and hash. The exclusions below refer to the
+active backend, not absence from that review snapshot. Frozen-source lint/test
+exclusions preserve source bytes and prevent unrelated historical tests from
+being collected as current-head tests; they do not establish a validation pass.
+
 ## Operator boundary
 
 The existing CANN attention, LightningIndexer, MoE and quantization kernels are
