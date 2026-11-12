@@ -4,7 +4,7 @@ import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import compress
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import numpy as np
 import torch
@@ -18,6 +18,12 @@ from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 
 if TYPE_CHECKING:
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import LayerPoolKey
+
+
+class HiSparseSourceReady(Protocol):
+    """Return after Host writeback; raise if blocks are canceled or invalid."""
+
+    def wait_source_ready(self, req_id: str, source_block_ids: Sequence[int], end_token: int) -> None: ...
 
 
 def is_kv_save_role(kv_role: str, consumer_is_to_put: bool) -> bool:
