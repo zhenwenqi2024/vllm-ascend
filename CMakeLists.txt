@@ -233,8 +233,13 @@ else()
   install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 endif()
 
-# Expose the Torch adapter when the A5 toolkit can build the ACLNN SIMT kernel.
-if(SOC_VERSION MATCHES "ascend950")
+# Expose the Torch adapter for the native resolver on each architecture.
+if(SOC_VERSION MATCHES "ascend910_93.*")
+  add_subdirectory(csrc/hisparse)
+  target_compile_definitions(vllm_ascend_C PRIVATE
+    VLLM_ASCEND_ENABLE_HISPARSE_RESOLVER VLLM_ASCEND_HISPARSE_ARCH22)
+  target_link_libraries(vllm_ascend_C PRIVATE vllm_ascend_hisparse)
+elseif(SOC_VERSION MATCHES "ascend950")
   find_path(HISPARSE_SIMT_INCLUDE_DIR simt_api/asc_simt.h
     PATHS
       ${ASCEND_HOME_PATH}/asc/include

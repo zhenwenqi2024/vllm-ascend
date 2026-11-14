@@ -2854,6 +2854,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
 #ifdef VLLM_ASCEND_ENABLE_HISPARSE_RESOLVER
+#ifdef VLLM_ASCEND_HISPARSE_ARCH22
+    // group_table contains addresses of Runtime-owned tag rows. Mark the
+    // operation mutable so graph compilation retains the indirect writes.
+    ops.def("hisparse_invalidate_written(Tensor(a!) group_table, Tensor states, Tensor requests, "
+            "Tensor written, int state_count, int region) -> ()");
+    ops.impl("hisparse_invalidate_written", torch::kPrivateUse1, &vllm_ascend::hisparse::invalidate_written);
+    ops.impl("hisparse_invalidate_written", torch::kMeta, &vllm_ascend::hisparse::invalidate_written_meta);
+#endif
     ops.def("hisparse_resolve_residency(Tensor logical, Tensor? requests, Tensor? states, Tensor? source, Tensor? resident, "
             "Tensor hot_table, Tensor(a!) dgi, Tensor(a!) lru, Tensor(a!) output, Tensor(a!)? attention, "
             "Tensor(a!) resolved, Tensor(a!)? counts, Tensor(a!)? swap_host, Tensor(a!)? swap_device, "

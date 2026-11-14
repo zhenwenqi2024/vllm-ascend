@@ -27,6 +27,7 @@ from vllm_ascend.ops.triton.hisparse import (
 
 _SORT_MIN_DIRECT_TILES = 64 * 1024
 _SORT_BUFFER_LIMIT_BYTES = 768 * 1024
+_A3_INVALIDATE_MAX_WRITES = 64
 
 
 def _load_resolver():
@@ -389,6 +390,17 @@ class HiSparseNPUOps:
             return
         if region_stride == 0 or num_state_rows == 0 or groups == 0:
             return
+        # Registered only by the arch22 build. Keep A5 and large prefill on
+        # their existing paths; graph capture records the same batched op.
+        if (
+            num_tokens <= _A3_INVALIDATE_MAX_WRITES
+            and region_stride <= 32768
+            and hasattr(torch.ops._C_ascend, "hisparse_invalidate_written")
+        ):
+            torch.ops._C_ascend.hisparse_invalidate_written(
+                group_table, request_state_indices, req_id_per_token, written_slots, num_state_rows, region_stride
+            )
+            return
         tile = 256
         hot_tiles = triton.cdiv(region_stride, tile)
         table_tiles = groups * hot_tiles
@@ -402,7 +414,6 @@ class HiSparseNPUOps:
         if (
             direct_tiles >= 2 * search_probes + _SORT_MIN_DIRECT_TILES
             and sort_buffer_bytes <= _SORT_BUFFER_LIMIT_BYTES
-            and is_950()
         ):
             keys = torch.empty((num_tokens,), dtype=torch.int64, device=device)
             sorted_keys = torch.empty_like(keys)
@@ -426,6 +437,7 @@ class HiSparseNPUOps:
                 HOT=region_stride,
                 TILE=tile,
                 STEPS=search_steps,
+                UNROLL_SEARCH=is_950(),
                 multibuffer=False,
             )
             return

@@ -8,15 +8,104 @@
 #include <torch_npu/csrc/core/npu/NPUGuard.h>
 #include <array>
 #include <optional>
+#ifdef VLLM_ASCEND_HISPARSE_ARCH22
+#include <torch_npu/csrc/framework/OpCommand.h>
+#include <tiling/platform/platform_ascendc.h>
+#include <algorithm>
+#include <vector>
+#include <utility>
+
+extern "C" void launch_hisparse_resolve_residency(void**, uint64_t*, int, void*);
+extern "C" void launch_hisparse_invalidate_written(uint64_t, uint64_t, uint64_t, uint64_t,
+    int, int, int, int, int, bool, int, void*);
+#endif
 
 #include "../attention/hi_sparse_resolve_residency/op_kernel/resolver_scratch.h"
 
 namespace vllm_ascend::hisparse {
+#ifdef VLLM_ASCEND_HISPARSE_ARCH22
+void invalidate_written(const at::Tensor& groups, const at::Tensor& states,
+    const at::Tensor& requests, const at::Tensor& written, int64_t state_count, int64_t region) {
+    TORCH_CHECK(groups.scalar_type() == at::kLong && states.scalar_type() == at::kInt &&
+                requests.scalar_type() == at::kInt &&
+                (written.scalar_type() == at::kInt || written.scalar_type() == at::kLong),
+                "Invalid HiSparse invalidation dtypes");
+    TORCH_CHECK(requests.numel() == written.numel() && written.numel() <= 64,
+                "HiSparse batched invalidation supports at most 64 writes");
+    TORCH_CHECK(state_count >= 0 && state_count <= INT32_MAX && region >= 0 && region <= 32768 &&
+                states.numel() <= INT32_MAX && groups.numel() <= INT32_MAX / 16,
+                "Invalid HiSparse invalidation geometry");
+    c10_npu::NPUGuard guard(groups.device());
+    auto npu_stream = c10_npu::getCurrentNPUStream();
+    std::array<at::Tensor, 4> tensors = {groups, states, requests, written};
+    std::array<uint64_t, 4> pointers{};
+    std::vector<at::Tensor> owners;
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        const auto& tensor = tensors[i];
+        TORCH_CHECK(tensor.device() == groups.device() && tensor.dim() == 1 && tensor.is_contiguous(),
+                    "HiSparse invalidation requires contiguous vectors on one NPU");
+        pointers[i] = reinterpret_cast<uintptr_t>(tensor.data_ptr());
+        owners.emplace_back(tensor.detach());
+        c10_npu::NPUCachingAllocator::recordStream(tensor.storage().data_ptr(), npu_stream);
+    }
+    if (!groups.numel() || !written.numel() || !state_count || !region) return;
+    const int group_count = groups.numel(), request_count = states.numel(), tokens = written.numel();
+    const bool written64 = written.scalar_type() == at::kLong;
+    int64_t vector_cores = 0;
+    TORCH_CHECK(aclGetDeviceCapability(groups.device().index(), ACL_DEVICE_INFO_VECTOR_CORE_NUM,
+                                     &vector_cores) == ACL_SUCCESS && vector_cores > 0,
+                "HiSparse failed to query the vector core count");
+    const int blocks = std::min<int64_t>(group_count * ((region + 2047) / 2048), vector_cores);
+    auto stream = npu_stream.stream();
+    at_npu::native::OpCommand command;
+    command.Name("HiSparseInvalidateWritten");
+    command.SetCustomHandler([=, owners = std::move(owners)]() mutable -> int {
+        auto submission_owners = std::move(owners);
+        launch_hisparse_invalidate_written(pointers[0], pointers[1], pointers[2], pointers[3],
+            group_count, request_count, state_count, tokens, region, written64, blocks, stream);
+        return 0;
+    });
+    command.Run();
+}
+
+void invalidate_written_meta(const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, int64_t, int64_t) {}
+
+inline int64_t resolver_hash_size(int64_t hot, int64_t union_rows) {
+    TORCH_CHECK(union_rows > 0 && union_rows <= hot && hot <= 32768,
+                "HiSparse union must fit the hot cache and int16 LRU slots");
+    int64_t hash_size = 1;
+    while (hash_size <= union_rows) hash_size <<= 1;
+    static const uint64_t budget = [] {
+        auto* platform = platform_ascendc::PlatformAscendCManager::GetInstance(aclrtGetSocName());
+        TORCH_CHECK(platform != nullptr, "HiSparse failed to query the target UB capacity");
+        uint64_t ub_bytes = 0;
+        platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub_bytes);
+        constexpr uint64_t reserved_bytes = 16 * 1024;
+        TORCH_CHECK(ub_bytes > reserved_bytes, "HiSparse target UB capacity is too small");
+        return ub_bytes - reserved_bytes;
+    }();
+    // A3 retains the complete Hot tag row in UB; scalar hash updates never
+    // write GM until the complete union has passed the capacity check.
+    const uint64_t fixed_words = 2 * hot + 512;
+    const uint64_t minimum_bytes = (2 * (union_rows + 1) + fixed_words + 15) / 16 * 64 + 512;
+    TORCH_CHECK(minimum_bytes <= budget,
+                "HiSparse hot_size=", hot, ", max_union_rows=", union_rows,
+                " needs at least ", minimum_bytes, " UB bytes; the compiled target allows ", budget,
+                ". Lower device_buffer_size or speculative tokens.");
+    const uint64_t available_words = (budget - 512) / 64 * 16;
+    return std::min(hash_size, int64_t((available_words - fixed_words) / 2));
+}
+#endif
+
 at::Tensor tensor_or_undefined(const std::optional<at::Tensor>& tensor) {
     return tensor.value_or(at::Tensor());
 }
 
 inline void validate_resolver_scratch(int64_t hot, int64_t union_rows) {
+#ifdef VLLM_ASCEND_HISPARSE_ARCH22
+    (void)resolver_hash_size(hot, union_rows);
+#else
     TORCH_CHECK(union_rows > 0 && union_rows <= hot && hot <= 32768,
                 "HiSparse union must fit the hot cache and int16 LRU slots");
     const uint64_t minimum_bytes = resolver_scratch_bytes(hot, union_rows + 1);
@@ -24,6 +113,7 @@ inline void validate_resolver_scratch(int64_t hot, int64_t union_rows) {
                 "HiSparse hot_size=", hot, ", max_union_rows=", union_rows,
                 " needs at least ", minimum_bytes, " UB bytes; the compiled target allows ", kResolverUbBytes,
                 ". Lower device_buffer_size or speculative tokens.");
+#endif
 }
 
 void resolve_residency(
@@ -82,9 +172,18 @@ void resolve_residency(
         tensor_or_undefined(valid_rows)};
     c10_npu::NPUGuard guard(logical.device());
     auto npu_stream = c10_npu::getCurrentNPUStream();
+#ifdef VLLM_ASCEND_HISPARSE_ARCH22
+    std::array<void*, 19> pointers{};
+    std::vector<at::Tensor> owners;
+    owners.reserve(tensors.size());
+#endif
     for (size_t i = 0; i < tensors.size(); ++i) {
         const auto& tensor = tensors[i];
         if (!tensor.defined()) continue;
+#ifdef VLLM_ASCEND_HISPARSE_ARCH22
+        owners.emplace_back(tensor.detach());
+        pointers[i] = tensor.numel() ? tensor.data_ptr() : nullptr;
+#endif
         TORCH_CHECK(tensor.device() == logical.device(), "HiSparse resolver device mismatch");
         const auto dtype = i == 7 ? at::kShort : (i == 16 ? at::kLong : at::kInt);
         if (i == 15) {
@@ -138,6 +237,29 @@ void resolve_residency(
                 "HiSparse hot block table is too narrow");
     TORCH_CHECK(hot_table.size(0) >= (states ? states->numel() : dgi.size(0)),
                 "HiSparse hot block table does not cover request slots");
+#ifdef VLLM_ASCEND_HISPARSE_ARCH22
+    std::array<uint64_t, 25> sizes = {
+        uint64_t(rows), uint64_t(topk), uint64_t(hot), uint64_t(host_rows), uint64_t(logical.stride(0)),
+        uint64_t(states ? states->numel() : 0), uint64_t(dgi.size(0)),
+        uint64_t(source ? source->size(0) : 0), uint64_t(source ? source->size(1) : 0),
+        uint64_t(source ? source->stride(0) : 0), uint64_t(source_block_size),
+        uint64_t(resident ? resident->size(0) : 0), uint64_t(resident ? resident->size(1) : 0),
+        uint64_t(resident ? resident->stride(0) : 0), uint64_t(resident_block_size), uint64_t(resident_null_block),
+        uint64_t(hot_block_size), uint64_t(hot_table.stride(0)),
+        uint64_t(attention ? attention->stride(0) : topk), uint64_t(attention_block_stride),
+        uint64_t(counts ? counts->stride(0) : 1), uint64_t(union_rows), uint64_t(resolver_hash_size(hot, union_rows)),
+        uint64_t(attention_capacity), uint64_t(miss_mask && miss_mask->element_size() == 1)};
+    auto stream = npu_stream.stream();
+    at_npu::native::OpCommand command;
+    command.Name("HiSparseUnionResolve");
+    command.SetCustomHandler([pointers, sizes, stream, owners = std::move(owners)]() mutable -> int {
+        // Release queued tensor owners after submission, not on queue-slot reuse.
+        auto submission_owners = std::move(owners);
+        launch_hisparse_resolve_residency(pointers.data(), sizes.data(), int(sizes[0]), stream);
+        return 0;
+    });
+    command.Run();
+#else
     const int64_t logical_stride = logical.stride(0);
     const int64_t source_stride = source ? source->stride(0) : 0;
     const int64_t resident_stride = resident ? resident->stride(0) : 0;
@@ -154,6 +276,7 @@ void resolve_residency(
         resident_stride, hot_table_stride, attention_stride, counts_stride, byte_miss_mask,
         tensors[6], tensors[7], tensors[8], tensors[9], tensors[10],
         tensors[11], tensors[12], tensors[13], tensors[14], tensors[15], tensors[16], tensors[17]);
+#endif
 }
 
 // The operator mutates caller-owned tensors and returns no new tensors.
