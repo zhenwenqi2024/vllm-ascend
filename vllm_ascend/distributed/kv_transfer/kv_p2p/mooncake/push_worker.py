@@ -577,29 +577,38 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
                 local_offset, remote_offset, heads = partition
                 whole = isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)) or is_circular_kv_cache_spec(spec)
                 local = self.transfer_metadata
-                for cache_index, (local_addr, remote_addr) in enumerate(
-                    zip(local.kv_caches_base_addr[local_index], worker.kv_caches_base_addr[remote_index], strict=True)
+                if not self._append_packed_mla_addresses(
+                    batch, local_index, remote_index, local, pp, worker, src_list, dst_list, length_list
                 ):
-                    local_len = local.block_lens[local_index][cache_index]
-                    remote_len = pp.block_lens[remote_index][cache_index]
-                    if not whole:
-                        local_len //= local.block_shapes[local_index][cache_index][0]
-                        remote_len //= pp.block_shapes[remote_index][cache_index][0]
-                    if local_len != remote_len:
-                        raise ValueError("P/D cache slice lengths differ")
-                    for req in batch.requests:
-                        for local_block, remote_block in zip(req.local_block_ids, req.remote_block_ids, strict=True):
-                            src_list.append(
-                                local_addr
-                                + local_block * local.block_strides[local_index][cache_index]
-                                + local_offset * local_len
-                            )
-                            dst_list.append(
-                                remote_addr
-                                + remote_block * pp.block_strides[remote_index][cache_index]
-                                + remote_offset * remote_len
-                            )
-                            length_list.append(local_len * heads)
+                    for cache_index, (local_addr, remote_addr) in enumerate(
+                        zip(
+                            local.kv_caches_base_addr[local_index],
+                            worker.kv_caches_base_addr[remote_index],
+                            strict=True,
+                        )
+                    ):
+                        local_len = local.block_lens[local_index][cache_index]
+                        remote_len = pp.block_lens[remote_index][cache_index]
+                        if not whole:
+                            local_len //= local.block_shapes[local_index][cache_index][0]
+                            remote_len //= pp.block_shapes[remote_index][cache_index][0]
+                        if local_len != remote_len:
+                            raise ValueError("P/D cache slice lengths differ")
+                        for req in batch.requests:
+                            for local_block, remote_block in zip(
+                                req.local_block_ids, req.remote_block_ids, strict=True
+                            ):
+                                src_list.append(
+                                    local_addr
+                                    + local_block * local.block_strides[local_index][cache_index]
+                                    + local_offset * local_len
+                                )
+                                dst_list.append(
+                                    remote_addr
+                                    + remote_block * pp.block_strides[remote_index][cache_index]
+                                    + remote_offset * remote_len
+                                )
+                                length_list.append(local_len * heads)
             batch.event.synchronize()
             if src_list:
                 session = f"{worker.local_ip}:{worker.te_rpc_port}"
@@ -609,6 +618,11 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
         except Exception as exc:
             return str(exc) or type(exc).__name__
         return None
+
+    def _append_packed_mla_addresses(
+        self, batch, local_index, remote_index, local, pp, worker, src_list, dst_list, length_list
+    ) -> bool:
+        return False
 
     def _process_sending_requests(self, wait: bool = False, *, layer_hook: bool = False, force: bool = False) -> None:
         """Collect WRITE results and submit ready layers; never send DONE here."""

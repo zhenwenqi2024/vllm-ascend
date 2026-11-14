@@ -248,6 +248,13 @@ def test_producer_snapshots_new_and_cached_prefill_chunks(producer_scheduler):
     assert not scheduler.build_connector_meta(step(request, None, computed=48, scheduled=1)).push_send_requests
 
 
+def test_producer_uses_first_scheduled_allocation_after_empty_initial_snapshot(producer_scheduler):
+    request = prefill_request()
+    allocate(producer_scheduler, request, ([], []))
+    metadata = producer_scheduler.build_connector_meta(step(request, ([1], [11])))
+    assert metadata.push_send_requests[request.request_id].local_block_ids == ((1,), (11,))
+
+
 @pytest.mark.parametrize("num_speculative_blocks", [0, 2])
 def test_producer_mamba_excludes_speculative_tail(producer_scheduler, num_speculative_blocks):
     producer_scheduler.group_unique_specs[1] = [

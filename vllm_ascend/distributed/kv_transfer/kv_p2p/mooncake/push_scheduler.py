@@ -138,6 +138,9 @@ class MooncakePushConnectorScheduler(MooncakeBaseConnectorScheduler):
             num_computed_tokens = dict(zip(cached_reqs.req_ids, cached_reqs.num_computed_tokens))
             for req in scheduler_output.scheduled_new_reqs:
                 num_computed_tokens[req.req_id] = req.num_computed_tokens
+                if req.req_id in self._reqs_need_send_layerwise and req.block_ids is not None:
+                    request, _ = self._reqs_need_send_layerwise[req.req_id]
+                    self._reqs_need_send_layerwise[req.req_id] = request, tuple(list(group) for group in req.block_ids)
             for req_id, new_blocks in zip(cached_reqs.req_ids, cached_reqs.new_block_ids):
                 if req_id not in self._reqs_need_send_layerwise:
                     continue
