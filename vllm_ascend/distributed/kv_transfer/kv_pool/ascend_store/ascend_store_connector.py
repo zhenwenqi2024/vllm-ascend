@@ -34,6 +34,7 @@ from vllm.v1.request import Request
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     get_backend_class,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import require_hisparse_host_tcp
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import DSparkPrefixKeys
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_scheduler import (
     LayerwiseKVPoolScheduler,
@@ -138,6 +139,17 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.use_layerwise = extra_config.get("use_layerwise", False)
         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
         self.backend_name = extra_config.get("backend", "mooncake").lower()
+        has_hisparse = any(
+            getattr(group, "role", None) == "hisparse_source"
+            for group in getattr(kv_cache_config, "kv_cache_groups", ())
+        )
+        if has_hisparse:
+            if self.use_layerwise or self.backend_name != "memcache" or self.kv_role != "kv_both":
+                raise ValueError("HiSparse with AscendStore requires bulk MemCache transfers with kv_role=kv_both.")
+            if not extra_config.get("load_async", False):
+                # HiSparse publishes imported Host Source pages on receive completion.
+                raise ValueError("HiSparse with AscendStore requires load_async=true.")
+            require_hisparse_host_tcp()
         self.backend_class = get_backend_class(self.backend_name) if self.use_layerwise else None
         self.layerwise_data_plane = self.backend_class.layerwise_data_plane if self.backend_class is not None else None
         self.use_block_key_layerwise = self.use_layerwise and self.layerwise_data_plane == "block_key"
@@ -467,8 +479,6 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         done_sending, done_recving = self.get_finished(finished_req_ids)
         assert self.connector_worker is not None
         failed = self.connector_worker.get_failed_requests()
-        if self.connector_worker.load_async and not self.use_layerwise:
-            done_recving |= failed
         return KVConnectorTransferResults(
             finished_sending=done_sending, finished_recving=done_recving, failed_recving=failed
         )

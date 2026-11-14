@@ -16,28 +16,44 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base impor
     BatchResultShapeError,
     get_scheduler_device_id,
     parse_qos_from_extra_config,
+    require_aligned_batch_results,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.layerwise_keys import LayerwiseKeyBuilder
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import get_sharded_mamba_group_ids
 
+_MEMCACHE_PROTOCOL_KEY = "ock.mmc.local_service.protocol"
 
-def _is_device_sdma() -> bool:
+
+def _get_memcache_protocol() -> str | None:
     config_path = os.getenv("MMC_LOCAL_CONFIG_PATH")
     if not config_path:
         raise ValueError("The environment variable 'MMC_LOCAL_CONFIG_PATH' is not set.")
+    protocol = None
     with open(config_path, encoding="utf-8") as config_file:
         for line in config_file:
             line = line.strip()
             if not line or line.startswith(("#", ";")):
                 continue
             key, separator, value = line.partition("=")
-            if separator and key.strip() == "ock.mmc.local_service.protocol":
-                return value.strip() == "device_sdma"
-    return False
+            if separator and key.strip() == _MEMCACHE_PROTOCOL_KEY:
+                if protocol is not None:
+                    raise ValueError(f"MMC_LOCAL_CONFIG_PATH contains duplicate {_MEMCACHE_PROTOCOL_KEY} entries.")
+                protocol = value.strip()
+    return protocol
+
+
+def require_hisparse_host_tcp() -> None:
+    protocol = _get_memcache_protocol()
+    if protocol != "host_tcp":
+        raise ValueError(
+            f"HiSparse with AscendStore requires {_MEMCACHE_PROTOCOL_KEY}=host_tcp "
+            f"in MMC_LOCAL_CONFIG_PATH, got {protocol!r}."
+        )
 
 
 MEMCACHE_THREAD_START_WAIT_S = 0.1
 MEMCACHE_SSD_MEDIA_TYPE = 2
+_HISPARSE_HOST_GET_MAX_BYTES = 256 * 1024 * 1024
 
 
 def _validate_device_ub_qos() -> None:
@@ -192,12 +208,12 @@ class MemcacheBackend(Backend):
         _validate_device_ub_qos()
         self.device_id = torch.npu.current_device() if device_id is None else device_id
         self._init_bm = init_bm
-        self._lazy_init = lazy_init and _is_device_sdma()
+        self._lazy_init = lazy_init and _get_memcache_protocol() == "device_sdma"
 
         self.store: Any | None = None
         self._store_initialized = False
         self._store_init_lock = threading.Lock()
-        self._pending_buffers: tuple[list[int], list[int]] | None = None
+        self._pending_buffers: tuple[list[int], list[int], bool] | None = None
 
         if not self._lazy_init:
             self.store = self._setup_store()
@@ -270,9 +286,58 @@ class MemcacheBackend(Backend):
     def set_device(self):
         torch.npu.set_device(self.device_id)
 
-    def register_buffer(self, ptrs: list[int], sizes: list[int]):
-        self._pending_buffers = (list(ptrs), list(sizes))
+    def register_buffer(self, ptrs: list[int], sizes: list[int], *, check_result: bool = False):
+        if check_result and len(ptrs) != len(sizes):
+            raise ValueError("HiSparse MemCache buffer pointers and sizes must have the same length.")
+        self._pending_buffers = (list(ptrs), list(sizes), check_result)
         self._register_buffers_if_needed()
+
+    def _get_hisparse(
+        self,
+        keys: list[str],
+        addrs: list[list[int]],
+        sizes: list[list[int]],
+        host_keys: list[bool],
+    ) -> list[int]:
+        assert self.store is not None
+        results = [-1] * len(keys)
+
+        def get_batch(indices: list[int], direction: MmcDirect) -> None:
+            selected_keys = [keys[index] for index in indices]
+            batch_results = require_aligned_batch_results(
+                "HiSparse Memcache GET",
+                selected_keys,
+                self.store.batch_get_into_layers(
+                    selected_keys,
+                    [addrs[index] for index in indices],
+                    [sizes[index] for index in indices],
+                    direction.value,
+                ),
+            )
+            for index, result in zip(indices, batch_results, strict=True):
+                results[index] = result
+
+        device_indices = [index for index, is_host in enumerate(host_keys) if not is_host]
+        if device_indices:
+            get_batch(device_indices, MmcDirect.COPY_G2L)
+
+        # The SDK leases every object in a GET batch until its data copy
+        # finishes. Start a fresh lease for each bounded Host Source batch.
+        host_indices: list[int] = []
+        host_bytes = 0
+        for index, is_host in enumerate(host_keys):
+            if not is_host:
+                continue
+            key_bytes = sum(sizes[index])
+            if host_indices and host_bytes + key_bytes > _HISPARSE_HOST_GET_MAX_BYTES:
+                get_batch(host_indices, MmcDirect.COPY_G2H)
+                host_indices = []
+                host_bytes = 0
+            host_indices.append(index)
+            host_bytes += key_bytes
+        if host_indices:
+            get_batch(host_indices, MmcDirect.COPY_G2H)
+        return results
 
     def unregister_buffer(self, ptrs: list[int], sizes: list[int]):
         if len(ptrs) != len(sizes):
@@ -287,9 +352,30 @@ class MemcacheBackend(Backend):
         if self._pending_buffers is None or not self._store_initialized:
             return
         assert self.store is not None
-        ptrs, sizes = self._pending_buffers
-        for ptr, size in zip(ptrs, sizes):
-            self.store.register_buffer(ptr, size)
+        ptrs, sizes, check_result = self._pending_buffers
+        if not check_result:
+            for ptr, size in zip(ptrs, sizes):
+                self.store.register_buffer(ptr, size)
+            self._pending_buffers = None
+            return
+
+        registered: list[tuple[int, int]] = []
+        try:
+            for ptr, size in zip(ptrs, sizes, strict=True):
+                result = self.store.register_buffer(ptr, size)
+                if result != 0:
+                    raise RuntimeError(f"HiSparse MemCache buffer registration failed: size={size}, result={result}.")
+                registered.append((ptr, size))
+        except Exception:
+            for ptr, size in reversed(registered):
+                try:
+                    result = self.store.unregister_buffer(ptr, size)
+                    if result != 0:
+                        logger.error("HiSparse MemCache buffer rollback failed: size=%s, result=%s", size, result)
+                except Exception:
+                    logger.exception("HiSparse MemCache buffer rollback failed: size=%s", size)
+            self._pending_buffers = None
+            raise
         self._pending_buffers = None
 
     def exists(self, keys: list[str]) -> list[int]:
@@ -442,7 +528,14 @@ class MemcacheBackend(Backend):
         key: list[str],
         addr: list[list[int]],
         size: list[list[int]],
+        *,
+        host_keys: list[bool] | None = None,
     ):
+        if host_keys is not None and not (len(host_keys) == len(key) == len(addr) == len(size)):
+            logger.error(
+                "Invalid HiSparse MemCache GET metadata: expected one memory location, address and size per key"
+            )
+            return None
         if self._lazy_init and not self._store_initialized:
             logger.error(
                 "Failed to get %d keys out of %d. Store is not initialized; "
@@ -454,7 +547,11 @@ class MemcacheBackend(Backend):
             return
         assert self.store is not None
         try:
-            res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
+            res = (
+                self._get_hisparse(key, addr, size, host_keys)
+                if host_keys is not None
+                else self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
+            )
             failed_codes = [int(value) for value in res if value != 0]
             failed_count = len(failed_codes)
             if failed_count:
@@ -483,11 +580,19 @@ class MemcacheBackend(Backend):
         key: list[str],
         addr: list[list[int]],
         size: list[list[int]],
+        *,
+        host: bool = False,
     ) -> list[bool] | bool:
+        if host and not (len(key) == len(addr) == len(size)):
+            logger.error("Invalid HiSparse MemCache PUT metadata: expected one address and size per key")
+            return False
         self.ensure_initialized()
         assert self.store is not None
         try:
-            res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
+            direction = MmcDirect.COPY_H2G if host else MmcDirect.COPY_L2G
+            res = self.store.batch_put_from_layers(key, addr, size, direction.value)
+            if host:
+                res = require_aligned_batch_results("HiSparse Memcache PUT", key, res)
             failed_codes = [int(value) for value in res if value != 0]
             failed_count = len(failed_codes)
             if failed_count:
