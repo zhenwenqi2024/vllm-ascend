@@ -177,3 +177,31 @@ def test_memfabric_transfer_protocol_rejects_unknown_value():
 
     with pytest.raises(ValueError, match="Invalid MemFabric transfer_protocol"):
         manager.configure(role=MEMFABRIC_ROLE_DECODE, device_id=0, transfer_protocol="rocev2")
+
+
+def test_memfabric_push_reports_write_failure():
+    raw_engine = MagicMock()
+    raw_engine.get_rpc_port.return_value = 23456
+    raw_engine.initialize.return_value = 0
+    manager = GlobalMemfabricTE()
+    manager.configure(role=MEMFABRIC_ROLE_PREFILL, device_id=0)
+    with patch.dict(sys.modules, {"memfabric_hybrid": _fake_memfabric(raw_engine)}):
+        engine = manager.get_transfer_engine("127.0.0.1")
+
+    raw_engine.batch_transfer_sync_write.return_value = 0
+    assert engine.batch_transfer_sync_write("peer", [100], [200], [16]) == 0
+    raw_engine.batch_transfer_sync_write.assert_called_once_with("peer", [100], [200], [16])
+
+    raw_engine.batch_transfer_sync_write.return_value = 7
+    assert engine.batch_transfer_sync_write("peer", [100], [200], [16]) == -1
+
+
+def test_memfabric_decode_can_publish_push_destination_session():
+    raw_engine = MagicMock()
+    raw_engine.get_rpc_port.return_value = 23456
+    raw_engine.initialize.return_value = 0
+    manager = GlobalMemfabricTE()
+    manager.configure(role=MEMFABRIC_ROLE_DECODE, device_id=0, store_server_role=MEMFABRIC_ROLE_DECODE)
+    with patch.dict(sys.modules, {"memfabric_hybrid": _fake_memfabric(raw_engine)}):
+        manager.get_transfer_engine("127.0.0.1")
+    assert raw_engine.initialize.call_args.kwargs["store_server_role"] == MEMFABRIC_ROLE_DECODE

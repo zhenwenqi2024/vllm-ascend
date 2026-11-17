@@ -1,0 +1,4 @@
+pr: 7
+entries:
+  - category: feature
+    text: Added experimental MemFabric URMA Pull for HiSparse P/D, with main KV imported directly into Decode Host Source and Indexer KV on each NPU. Supported local TP configurations use one Offload shared Host pool.

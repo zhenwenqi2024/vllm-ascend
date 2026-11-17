@@ -2,7 +2,8 @@ import threading
 
 
 class GlobalTE:
-    def __init__(self):
+    def __init__(self, protocol: str = "ascend"):
+        self.protocol = protocol
         self.transfer_engine = None
         self._initialization_attempted = False
         self.is_register_buffer: bool = False
@@ -36,7 +37,7 @@ class GlobalTE:
                     self._initialization_attempted = True
                     engine = TransferEngine()
                     device_name = device_name if device_name is not None else ""
-                    ret_value = engine.initialize(hostname, "P2PHANDSHAKE", "ascend", device_name)
+                    ret_value = engine.initialize(hostname, "P2PHANDSHAKE", self.protocol, device_name)
                     if ret_value != 0:
                         raise RuntimeError(
                             f"TransferEngine initialization failed with ret_value: {ret_value}. "

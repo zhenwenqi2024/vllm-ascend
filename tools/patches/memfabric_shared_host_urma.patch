@@ -1,0 +1,159 @@
+MemFabric Hybrid shared Host mappings for URMA
+Source: https://gitcode.com/Ascend/memfabric_hybrid.git
+Base: 4c0b301537bed6606954084ba2376d99bf7bc543
+License: Mulan PSL v2 (same as the modified upstream files).
+Apply in that source checkout with git apply; this is a required SDK patch,
+not a patch to vLLM-Ascend. No SDMA transfer or intermediate Host pool is added.
+
+--- a/src/hybm/csrc/mm/hybm_host_shm_segment.h
++++ b/src/hybm/csrc/mm/hybm_host_shm_segment.h
+@@ -81,6 +81,9 @@
+         int32_t fd{-1};
+     };
+ 
++    Result MapDevice(void *address, uint64_t size, uint64_t &deviceVa) noexcept;
++    void UnmapDevice(uint64_t address) noexcept;
++    std::map<uint64_t, uint64_t> deviceMappings_;
+     void FreeMemory() noexcept;
+     std::string GetShmFilePath(uint32_t rankId) const noexcept;
+     std::string GetShmFilePath(uint32_t rankId, bool useHugetlbfs) const noexcept;
+--- a/src/hybm/csrc/mm/hybm_host_shm_segment.cpp
++++ b/src/hybm/csrc/mm/hybm_host_shm_segment.cpp
+@@ -172,6 +172,35 @@
+     return BM_OK;
+ }
+ 
++Result HybmHostShmSegment::MapDevice(void *address, uint64_t size, uint64_t &deviceVa) noexcept
++{
++    if (!(options_.dataOpType & HYBM_DOP_TYPE_MTE) || size == 0) {
++        return BM_OK;
++    }
++    void *dva = nullptr;
++    auto ret = DlHalApi::HalHostRegister(address, size, HOST_MEM_MAP_DEV, logicDeviceId_, &dva);
++    if (ret != BM_OK) {
++        BM_LOG_ERROR("SHM device mapping failed: " << ret << " address:" << address);
++        return ret;
++    }
++    deviceVa = reinterpret_cast<uint64_t>(dva);
++    deviceMappings_.emplace(reinterpret_cast<uint64_t>(address), size);
++    return BM_OK;
++}
++
++void HybmHostShmSegment::UnmapDevice(uint64_t address) noexcept
++{
++    auto it = deviceMappings_.find(address);
++    if (it == deviceMappings_.end()) {
++        return;
++    }
++    auto ret = DlHalApi::HalHostUnregisterEx(reinterpret_cast<void *>(address), logicDeviceId_, HOST_MEM_MAP_DEV);
++    if (ret != BM_OK) {
++        BM_LOG_ERROR("SHM device unmapping failed: " << ret << " address:" << VaToStr(address));
++    }
++    deviceMappings_.erase(it);
++}
++
+ Result HybmHostShmSegment::AllocLocalMemory(uint64_t size, std::shared_ptr<MemSlice> &slice) noexcept
+ {
+     if ((size % HYBM_LARGE_PAGE_SIZE) != 0UL || size + allocatedSize_ > options_.size) {
+@@ -186,10 +215,17 @@
+     slices_.emplace(slice->index_, slice);
+ 
+     uint64_t dva = 0;
++    auto mapResult = MapDevice(sliceAddr, size, dva);
++    if (mapResult != BM_OK) {
++        slices_.erase(slice->index_);
++        slice = nullptr;
++        return mapResult;
++    }
+     auto ret = HybmVaManager::GetInstance().AddVaInfo(
+         {gva, dva, reinterpret_cast<uint64_t>(sliceAddr), size, HYBM_MEM_TYPE_HOST}, dva == 0);
+     if (ret != BM_OK) {
+         BM_LOG_ERROR("AddVaInfo failed for slice(idx:" << slice->index_ << "), ret:" << ret);
++        UnmapDevice(reinterpret_cast<uint64_t>(sliceAddr));
+         slices_.erase(slice->index_);
+         slice = nullptr;
+         return ret;
+@@ -284,6 +320,9 @@
+ 
+ Result HybmHostShmSegment::Unmap() noexcept
+ {
++    while (!deviceMappings_.empty()) {
++        UnmapDevice(deviceMappings_.begin()->first);
++    }
+     for (auto gva : mappedGvaMem_) {
+         HybmVaManager::GetInstance().RemoveOneVaInfo(gva);
+     }
+@@ -386,6 +425,7 @@
+     if (pos == slices_.end() || pos->second.slice != slice) {
+         return BM_INVALID_PARAM;
+     }
++    UnmapDevice(slice->vAddress_);
+     HybmVaManager::GetInstance().RemoveOneVaInfo(slice->vAddress_, HVM_HVA);
+     slices_.erase(pos);
+     return BM_OK;
+@@ -623,9 +663,14 @@
+                                                          << " error:" << errno << " " << SafeStrError(errno));
+         return BM_ERROR;
+     }
++    uint64_t dva = 0;
++    auto mapResult = MapDevice(mapped, im.size, dva);
++    if (mapResult != BM_OK) {
++        return mapResult;
++    }
+     mappedGvaMem_.insert(remoteGva);
+     auto ret = HybmVaManager::GetInstance().AddVaInfo(
+-        {remoteGva, 0, reinterpret_cast<uint64_t>(remoteLva), im.size, HYBM_MEM_TYPE_HOST}, false,
++        {remoteGva, dva, reinterpret_cast<uint64_t>(remoteLva), im.size, HYBM_MEM_TYPE_HOST}, false,
+         AddressOwnership::Imported);
+     BM_LOG_INFO("MapImportedShm: ret:" << ret << " rankId=" << im.rankId << " addr=" << remoteGva << " size=" << im.size
+                                        << " useHugetlbfs=" << im.useHugetlbfs << " fd=" << fd);
+@@ -642,6 +687,7 @@
+     auto it = mappedGvaMem_.lower_bound(gvaBase);
+     auto st = it;
+     while (it != mappedGvaMem_.end() && *it < gvaBase + options_.maxSize) {
++        UnmapDevice(*it);
+         HybmVaManager::GetInstance().RemoveOneVaInfo(*it);
+         ++it;
+     }
+--- a/src/acc_offload/csrc/acc_offload_shared_dram_entry.cpp
++++ b/src/acc_offload/csrc/acc_offload_shared_dram_entry.cpp
+@@ -337,6 +337,9 @@
+     options_.bmType = HYBM_TYPE_HOST_INITIATE;
+     options_.memType = HYBM_MEM_TYPE_HOST;
+     options_.bmDataOpType = HYBM_DOP_TYPE_MTE;
++    if (config.flags & OFFLOAD_FLAG_GIANT_PAGE) {
++        options_.bmDataOpType = static_cast<hybm_data_op_type>(HYBM_DOP_TYPE_MTE | HYBM_DOP_TYPE_HOST_SHM);
++    }
+     options_.rankCount = config.worldSize;
+     options_.rankId = config.rankId;
+     options_.devId = config.deviceId;
+@@ -614,15 +617,20 @@
+ int32_t AccOffloadSharedDramEntry::GetDva(uint64_t hostPtr, uint64_t *dvaPtr)
+ {
+     std::lock_guard<std::mutex> lock(mutex_);
+-    if (dvaPtr == nullptr) {
+-        OFFLOAD_LOG_ERROR("device pointer output is null, hostPtr: " << hostPtr << ", entityId: " << entityId_);
+-        return OFFLOAD_ERROR;
+-    }
+-    if (ValidateHostPointer(hostPtr) != OFFLOAD_OK) {
+-        return OFFLOAD_ERROR;
+-    }
+-
+-    *dvaPtr = hostPtr;
++    if (!inited_ || dvaPtr == nullptr || hostGva_ == nullptr) {
++        OFFLOAD_LOG_ERROR("shared mapping is not initialized or output is null");
++        return OFFLOAD_ERROR;
++    }
++    const auto base = reinterpret_cast<uint64_t>(hostGva_);
++    if (hostPtr < base || hostPtr - base >= options_.maxDRAMSize * options_.rankCount) {
++        OFFLOAD_LOG_ERROR("pointer outside shared pool: " << hostPtr);
++        return OFFLOAD_ERROR;
++    }
++    auto ret = hybm_gva_to_va(hostPtr, HYBM_MEM_TYPE_DEVICE, dvaPtr);
++    if (ret != 0 || *dvaPtr == 0) {
++        OFFLOAD_LOG_ERROR("shared device mapping lookup failed: " << ret);
++        return OFFLOAD_ERROR;
++    }
+     return OFFLOAD_OK;
+ }
+ 

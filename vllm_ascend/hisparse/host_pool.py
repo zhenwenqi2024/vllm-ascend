@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Own pinned HiSparse Host storage and explicit ACL registration.
+"""Own pinned HiSparse Host storage and explicit AIV mapping.
 
-Core registers an aligned pageable allocation through ``pin_tensor``. AIV
-mapping alone does not make that storage a valid asynchronous DMA destination
-on Ascend. Reuse PTA's pinned allocator and Core's existing release ownership.
-Remove the allocation adapter when Core exposes a backend Host-allocation hook.
+The PD path allocates Host Source from MemFabric for direct local Pull destinations.
+Core retains the mapping until its drained shutdown.
 """
 
 from __future__ import annotations
@@ -21,18 +19,128 @@ from vllm.triton_utils import triton
 _ACL_HOST_REGISTER_MAPPED = 0
 _ACL_HAC_AIV = 3
 
+# shortcut: TransferEngine has process-lifetime MRs; retain shared owners until worker exit.
+_shared_owners: list[torch.Tensor] = []
+
+
+def uses_memfabric(vllm_config) -> bool:
+    transfer = vllm_config.kv_transfer_config if vllm_config else None
+    if transfer is None:
+        return False
+    connectors = (
+        (transfer.kv_connector_extra_config or {}).get("connectors", [])
+        if transfer.kv_connector == "MultiConnector"
+        else [{"kv_connector": transfer.kv_connector, "kv_connector_extra_config": transfer.kv_connector_extra_config}]
+    )
+    return any(
+        child.get("kv_connector") in ("MooncakeConnectorV2", "MooncakePullConnector")
+        and (child.get("kv_connector_extra_config") or {}).get("mooncake_transport") == "memfabric"
+        for child in connectors
+    )
+
+
+class MemFabricSharedHostRegion:
+    """One Offload SHARED contribution, exposed through Core's region contract."""
+
+    def __init__(self, tensor_sizes: list[int]) -> None:
+        from memfabric_hybrid import offload
+        from vllm.distributed import get_tp_group
+        from vllm.utils.network_utils import get_open_port
+        from vllm.v1.hisparse.runtime import check_hisparse_host_memory
+
+        self._size = sum(tensor_sizes)
+        if self._size <= 0 or any(size <= 0 for size in tensor_sizes):
+            raise ValueError("Shared HiSparse Host tensors must be nonempty")
+        self._offset = 0
+        self._closed = False
+        group = get_tp_group()
+        leader = group.rank_in_group == 0
+        pool_size = triton.cdiv(self._size, 1024**3) * 1024**3
+        port = group.broadcast_object(get_open_port() if leader else None, src=0)
+        config = offload.OffloadConfig()
+        config.device_id = torch.npu.current_device()
+        config.reserve_size = pool_size
+        config.alloc_size = pool_size if leader else 0
+        config.world_size = group.world_size
+        config.rank_id = group.rank_in_group
+        config.scene = offload.Scene.SHARED
+        config.flags = offload.OFFLOAD_FLAG_GIANT_PAGE
+        config.store_url = f"tcp://127.0.0.1:{port}"
+        # The SDK owns both the shared storage and its per-device mappings.
+        if offload.initialize(config) != 0:
+            raise RuntimeError("MemFabric shared HiSparse Host pool initialization failed")
+        group.barrier()
+        result = None
+        owner = None
+        if leader:
+            try:
+                check_hisparse_host_memory(pool_size)
+                owner = offload.empty([pool_size], dtype=torch.int8, pin_memory=True)
+                if owner.numel() != pool_size or not owner.is_contiguous():
+                    raise RuntimeError("MemFabric returned an invalid shared Host allocation")
+                mapping = MappedHostTensor(owner, memfabric=True)
+                result = (owner.data_ptr(), mapping.device_ptr, pool_size, None)
+            except Exception as error:
+                result = (None, None, pool_size, str(error))
+        address, device_ptr, registered_size, error = group.broadcast_object(result, src=0)
+        if error is not None:
+            raise RuntimeError(f"MemFabric shared Host allocation failed: {error}")
+        if not address or address % mmap.PAGESIZE:
+            raise RuntimeError("MemFabric shared Host address is null or not page aligned")
+        if registered_size != pool_size or not device_ptr:
+            raise RuntimeError("MemFabric shared Host mapping differs from the initialized pool")
+        if not leader:
+            # Metadata-only view: SDK import supplies device access, not a follower CPU mapping.
+            buffer = (ctypes.c_ubyte * pool_size).from_address(address)
+            owner = torch.frombuffer(buffer, dtype=torch.int8)
+            # Legacy VMM imports expose the common VA; mapped Host pools need a local DVA lookup.
+            mapping = MappedHostTensor(
+                owner, memfabric=True, shared_device_ptr=device_ptr if device_ptr == address else None
+            )
+        self.base_tensor = owner
+        self.base_tensor._hisparse_registration = mapping
+        _shared_owners.append(owner)
+
+    def create_next_canonical_view(self, size: int) -> torch.Tensor:
+        end = self._offset + size
+        if self._closed or size <= 0 or end > self._size:
+            raise ValueError("HiSparse shared Host view exceeds its planned allocation")
+        tensor = self.base_tensor[self._offset : end]
+        self._offset = end
+        return tensor
+
+    def cleanup(self) -> None:
+        # Core drains streams and closes the mapping before calling this method.
+        self._closed = True
+
 
 class MappedHostTensor:
-    """Own an ACL mapping and retain the CPU allocation until explicit close.
+    """Retain a CPU allocation with its ACL or MemFabric device mapping.
 
     Close only after all streams and graphs using this mapping have completed
     and been destroyed. No destructor unmaps memory behind asynchronous work.
     """
 
-    def __init__(self, tensor: torch.Tensor) -> None:
+    def __init__(self, tensor: torch.Tensor, *, memfabric: bool = False, shared_device_ptr: int | None = None) -> None:
         if tensor.device.type != "cpu" or not tensor.is_contiguous():
             raise ValueError("HiSparse host mapping requires a contiguous CPU tensor")
         self.tensor = tensor
+        self.host_address = tensor.data_ptr()
+        self.nbytes = tensor.numel() * tensor.element_size()
+        if not self.nbytes:
+            raise ValueError("Cannot register an empty HiSparse host allocation")
+        if shared_device_ptr is not None and (not memfabric or shared_device_ptr != self.host_address):
+            raise ValueError("Imported SHARED mappings require identical MemFabric Host/device addresses")
+        self._memfabric = memfabric
+        if memfabric:
+            from memfabric_hybrid import offload
+
+            self.device = torch.device("npu", torch.npu.current_device())
+            self.device_ptr = offload.get_dva(self.host_address) if shared_device_ptr is None else shared_device_ptr
+            if not self.device_ptr:
+                raise RuntimeError("MemFabric did not expose a device address for HiSparse Host Source")
+            self.closed = False
+            return
         self._lib = ctypes.CDLL("libascendcl.so")
         self._lib.aclrtHostRegister.argtypes = [
             ctypes.c_void_p,
@@ -56,10 +164,6 @@ class MappedHostTensor:
         # The upstream host-pool allocator supplies an aligned subview of a
         # larger backing allocation. Register that range, not its unaligned
         # storage base; retained tensor ownership still retains the backing.
-        self.host_address = tensor.data_ptr()
-        self.nbytes = tensor.numel() * tensor.element_size()
-        if not self.nbytes:
-            raise ValueError("Cannot register an empty HiSparse host allocation")
         mapped = ctypes.c_void_p()
         status = self._lib.aclrtHostRegister(
             self.host_address, self.nbytes, _ACL_HOST_REGISTER_MAPPED, ctypes.byref(mapped)
@@ -84,25 +188,44 @@ class MappedHostTensor:
 
     def close(self) -> None:
         if not self.closed:
-            status = self._lib.aclrtHostUnregister(self.host_address)
-            if status:
-                raise RuntimeError(f"aclrtHostUnregister for HiSparse failed: {status}")
+            if not self._memfabric:
+                status = self._lib.aclrtHostUnregister(self.host_address)
+                if status:
+                    raise RuntimeError(f"aclrtHostUnregister for HiSparse failed: {status}")
             self.closed = True
 
 
-def allocate_mapped_host(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+def allocate_mapped_host(shape: tuple[int, ...], dtype: torch.dtype, *, memfabric: bool = False) -> torch.Tensor:
     """Allocate page-locked, aligned storage for both DMA and AIV access."""
     count = math.prod(shape)
     nbytes = count * torch.empty((), dtype=dtype).element_size()
     if nbytes <= 0:
         raise ValueError("HiSparse host allocation must be nonempty")
     allocated_bytes = triton.cdiv(nbytes, mmap.PAGESIZE) * mmap.PAGESIZE
-    # Mapping permits AIV access; DMA also requires a page-locked allocation.
-    # Align a view of PTA's pinned allocation without creating a second pool.
-    owner = torch.empty(allocated_bytes + mmap.PAGESIZE - 1, dtype=torch.uint8, pin_memory=True)
+    # Mapping permits AIV access; the owner remains page-locked for DMA.
+    allocator = torch.empty
+    owner_bytes = allocated_bytes + mmap.PAGESIZE - 1
+    if memfabric:
+        from memfabric_hybrid import offload
+
+        config = offload.OffloadConfig()
+        config.device_id = torch.npu.current_device()
+        pool_size = triton.cdiv(owner_bytes, 1024**3) * 1024**3
+        config.reserve_size = pool_size
+        config.alloc_size = pool_size
+        config.world_size = 1
+        config.rank_id = 0
+        config.scene = offload.Scene.LOCAL
+        config.flags = offload.OFFLOAD_FLAG_GIANT_PAGE
+        if offload.initialize(config) != 0:
+            raise RuntimeError("MemFabric HiSparse Host pool initialization failed")
+        allocator = offload.empty
+        # URMA registration must match the existing Offload allocation, including its padding.
+        owner_bytes = pool_size
+    owner = allocator([owner_bytes], dtype=torch.uint8, pin_memory=True)
     offset = (-owner.data_ptr()) % mmap.PAGESIZE
     raw = owner[offset : offset + allocated_bytes]
-    mapping = MappedHostTensor(raw)
+    mapping = MappedHostTensor(raw, memfabric=memfabric)
     tensor = raw[:nbytes].view(dtype).view(shape)
     # Both aliases retain the pinned allocation. Runtime owns the registration
     # through this base tensor until its explicit, drained shutdown.
@@ -124,7 +247,10 @@ def install() -> None:
     def allocate(size):
         backend = get_hisparse_backend()
         if isinstance(backend, AscendHiSparseBackend):
-            payload = allocate_mapped_host((size,), torch.int8)
+            from vllm.config import get_current_vllm_config_or_none
+
+            config = get_current_vllm_config_or_none()
+            payload = allocate_mapped_host((size,), torch.int8, memfabric=uses_memfabric(config))
             registration = payload._hisparse_registration
             registered = registration.tensor.view(torch.int8)
             registered._hisparse_registration = registration
@@ -133,3 +259,20 @@ def install() -> None:
 
     allocate.__dict__["_ascend_pinned_private_pool"] = True
     runtime.allocate_pinned_host_pool = allocate
+    original_shared = runtime.allocate_hisparse_host_pools
+
+    @wraps(original_shared)
+    def allocate_pools(vllm_config, tensor_sizes, num_blocks, host_block_stride, *, use_shared_host_pool):
+        if use_shared_host_pool and isinstance(get_hisparse_backend(), AscendHiSparseBackend):
+            if not uses_memfabric(vllm_config):
+                raise ValueError(
+                    "Ascend shared HiSparse Host pools require MooncakeConnectorV2 with memfabric transport"
+                )
+            region = MemFabricSharedHostRegion(tensor_sizes)
+            pools = [region.create_next_canonical_view(size) for size in tensor_sizes]
+            return pools, [region.base_tensor], region
+        return original_shared(
+            vllm_config, tensor_sizes, num_blocks, host_block_stride, use_shared_host_pool=use_shared_host_pool
+        )
+
+    runtime.allocate_hisparse_host_pools = allocate_pools

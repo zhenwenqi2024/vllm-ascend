@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Minimal two-node MemFabric pull-read diagnostic.
+"""Minimal two-node MemFabric transfer diagnostic.
 
 This script starts no vLLM service. The Prefill process owns a deterministic
 NPU buffer and publishes only its MemFabric session and address over a tiny TCP
-control channel. The Decode process creates a local destination, pulls the bytes
-with ``batch_transfer_sync_read``, and verifies them exactly. Only the remote
-Prefill source is registered, matching the production pull-read path.
+control channel. The Decode process creates a local destination and verifies
+the bytes exactly. The default transfer uses ``batch_transfer_sync_read``;
+``--direction push`` uses ``batch_transfer_sync_write`` from Prefill. Only the
+Prefill source is explicitly registered with the transfer engine.
 
 Run Prefill first::
 
@@ -19,8 +20,9 @@ Then run Decode on the peer machine::
         --device-id 0
 
 The default destination is an aligned ``memfabric_hybrid.offload`` pinned CPU
-buffer, matching SparseKVOffloadManager. Use ``--dst-memory npu`` as an HBM to
-HBM control test.
+buffer. Add ``--direction push --map-aiv`` on both sides to probe direct P Push
+into a HiSparse-style mapped Host destination, or ``--dst-memory npu`` to probe
+Indexer-style HBM transfer. Both sides must select the same direction.
 """
 
 from __future__ import annotations
@@ -97,6 +99,12 @@ def _parse_args() -> argparse.Namespace:
         default="offload",
         help="Decode destination type; offload matches SparseKVOffloadManager.",
     )
+    parser.add_argument("--direction", choices=("pull", "push"), default="pull")
+    parser.add_argument(
+        "--map-aiv",
+        action="store_true",
+        help="Map the offload destination for HiSparse AIV access before transfer.",
+    )
     parser.add_argument(
         "--dram-pool-gb",
         type=_positive_int,
@@ -116,6 +124,10 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--control-port must be in [1, 65535]")
     if args.role == "decode" and args.prefill_ip is None:
         parser.error("--prefill-ip is required for Decode")
+    if args.map_aiv and args.dst_memory != "offload":
+        parser.error("--map-aiv requires --dst-memory offload")
+    if args.map_aiv and args.num_bytes % 4096:
+        parser.error("--map-aiv requires --num-bytes to be 4 KiB aligned")
     return args
 
 
@@ -138,7 +150,14 @@ def _sha256(tensor) -> str:
     return hashlib.sha256(tensor.contiguous().numpy().tobytes()).hexdigest()
 
 
-def _new_transfer_engine(role: str, local_ip: str, device_id: int):
+def _new_transfer_engine(
+    role: str,
+    local_ip: str,
+    device_id: int,
+    *,
+    push: bool = False,
+    store_url: str | None = None,
+):
     from vllm_ascend.distributed.kv_transfer.utils.memfabric_transfer_engine import (
         MEMFABRIC_ROLE_DECODE,
         MEMFABRIC_ROLE_PREFILL,
@@ -147,7 +166,12 @@ def _new_transfer_engine(role: str, local_ip: str, device_id: int):
 
     memfabric_role = MEMFABRIC_ROLE_PREFILL if role == "prefill" else MEMFABRIC_ROLE_DECODE
     manager = GlobalMemfabricTE()
-    manager.configure(role=memfabric_role, device_id=device_id)
+    manager.configure(
+        role=memfabric_role,
+        device_id=device_id,
+        store_server_role=MEMFABRIC_ROLE_DECODE if push else MEMFABRIC_ROLE_PREFILL,
+        store_url=store_url,
+    )
     engine = manager.get_transfer_engine(local_ip)
     return manager, engine
 
@@ -209,9 +233,11 @@ def _allocate_offload_destination(torch, device_id: int, num_bytes: int, pool_gb
 
     config = offload.OffloadConfig()
     config.device_id = device_id
-    config.size = pool_gb * GIB
+    config.reserve_size = pool_gb * GIB
+    config.alloc_size = pool_gb * GIB
     config.world_size = 1
     config.rank_id = 0
+    config.scene = offload.Scene.LOCAL
     offload.initialize(config)
 
     backing = offload.empty(
@@ -249,10 +275,12 @@ def _run_prefill(args: argparse.Namespace) -> None:
     source = expected.to(f"npu:{args.device_id}")
     torch.npu.synchronize()
 
-    manager, engine = _new_transfer_engine("prefill", args.local_ip, args.device_id)
-    manager.register_buffer([source.data_ptr()], [args.num_bytes])
+    manager = engine = None
+    if args.direction == "pull":
+        manager, engine = _new_transfer_engine("prefill", args.local_ip, args.device_id)
+        manager.register_buffer([source.data_ptr()], [args.num_bytes])
     metadata = {
-        "session": manager.unique_id,
+        "session": manager.unique_id if manager is not None else "",
         "source_ptr": source.data_ptr(),
         "num_bytes": args.num_bytes,
         "pattern_period": PATTERN_PERIOD,
@@ -266,7 +294,7 @@ def _run_prefill(args: argparse.Namespace) -> None:
             server.listen(1)
             server.settimeout(args.timeout)
             print(
-                f"[P] ready: session={manager.unique_id}, source_hbm={hex(source.data_ptr())}, "
+                f"[P] ready: session={metadata['session']}, source_hbm={hex(source.data_ptr())}, "
                 f"bytes={args.num_bytes}, control={args.local_ip}:{args.control_port}",
                 flush=True,
             )
@@ -278,6 +306,25 @@ def _run_prefill(args: argparse.Namespace) -> None:
                     flush=True,
                 )
                 _send_json(conn, metadata)
+                if args.direction == "push":
+                    destination = _recv_json(conn)
+                    manager, engine = _new_transfer_engine(
+                        "prefill",
+                        args.local_ip,
+                        args.device_id,
+                        push=True,
+                        store_url=f"tcp://{destination['session']}",
+                    )
+                    manager.register_buffer([source.data_ptr()], [args.num_bytes])
+                    ret = engine.batch_transfer_sync_write(
+                        destination["session"],
+                        [source.data_ptr()],
+                        [int(destination["destination_ptr"])],
+                        [args.num_bytes],
+                    )
+                    if ret != 0:
+                        raise RuntimeError(f"batch_transfer_sync_write returned {ret}")
+                    _send_json(conn, {"written": True})
                 result = _recv_json(conn)
     finally:
         _shutdown_transfer_engine(engine)
@@ -300,6 +347,7 @@ def _run_decode(args: argparse.Namespace) -> None:
         offload_module = None
         backing = None
         destination = None
+        mapping = None
         result = None
         operation_error = None
         try:
@@ -332,24 +380,44 @@ def _run_decode(args: argparse.Namespace) -> None:
                 backing = destination
                 torch.npu.synchronize()
 
+            if args.map_aiv:
+                from vllm_ascend.hisparse.host_pool import MappedHostTensor
+
+                mapping = MappedHostTensor(destination, memfabric=True)
+
             # Match the production D-side order: SparseKVOffloadManager owns
             # the CPU pool before the connector initializes its transfer
             # engine. A pull destination is local and is not registered.
-            _, engine = _new_transfer_engine("decode", args.local_ip, args.device_id)
+            manager, engine = _new_transfer_engine(
+                "decode", args.local_ip, args.device_id, push=args.direction == "push"
+            )
+            if args.direction == "push":
+                manager.register_buffer([destination.data_ptr()], [num_bytes])
             print(
                 f"[D] read: peer_session={metadata['session']}, "
                 f"local_dst_{args.dst_memory}={hex(destination.data_ptr())}, "
                 f"peer_src_hbm={hex(int(metadata['source_ptr']))}, bytes={num_bytes}",
                 flush=True,
             )
-            ret = engine.batch_transfer_sync_read(
-                metadata["session"],
-                [destination.data_ptr()],
-                [int(metadata["source_ptr"])],
-                [num_bytes],
-            )
-            if ret != 0:
-                raise RuntimeError(f"batch_transfer_sync_read returned {ret}")
+            if args.direction == "push":
+                _send_json(
+                    conn,
+                    {
+                        "session": f"{args.local_ip}:{engine.get_rpc_port()}",
+                        "destination_ptr": destination.data_ptr(),
+                    },
+                )
+                if not _recv_json(conn).get("written"):
+                    raise RuntimeError("Prefill did not complete the Push")
+            else:
+                ret = engine.batch_transfer_sync_read(
+                    metadata["session"],
+                    [destination.data_ptr()],
+                    [int(metadata["source_ptr"])],
+                    [num_bytes],
+                )
+                if ret != 0:
+                    raise RuntimeError(f"batch_transfer_sync_read returned {ret}")
             torch.npu.synchronize()
 
             ok, detail = _compare(torch, destination, expected)
@@ -371,6 +439,11 @@ def _run_decode(args: argparse.Namespace) -> None:
                 _shutdown_transfer_engine(engine)
             except Exception as error:
                 cleanup_errors.append(str(error))
+        if mapping is not None:
+            try:
+                mapping.close()
+            except Exception as error:
+                cleanup_errors.append(f"AIV mapping close: {type(error).__name__}: {error}")
         del destination
         del backing
         if offload_module is not None:

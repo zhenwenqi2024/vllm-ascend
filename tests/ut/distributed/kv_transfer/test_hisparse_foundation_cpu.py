@@ -135,6 +135,140 @@ def test_failed_unregister_retains_host_owner_for_safe_retry(monkeypatch):
     assert events == ["close", "close"]
 
 
+def test_hisparse_memfabric_allocation_uses_single_mapped_host_pool(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    allocated = []
+    configs = []
+    offload = SimpleNamespace(
+        OffloadConfig=SimpleNamespace,
+        Scene=SimpleNamespace(LOCAL="local"),
+        OFFLOAD_FLAG_GIANT_PAGE=4096,
+        initialize=lambda config: configs.append(config) or 0,
+        empty=lambda shape, **kwargs: allocated.append(shape[0]) or torch.empty(shape, dtype=kwargs["dtype"]),
+        get_dva=lambda ptr: ptr,
+    )
+    monkeypatch.setitem(sys.modules, "memfabric_hybrid", SimpleNamespace(offload=offload))
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(current_device=lambda: 0), raising=False)
+    monkeypatch.setattr(host_pool, "MappedHostTensor", lambda tensor, **kwargs: SimpleNamespace(tensor=tensor))
+
+    result = host_pool.allocate_mapped_host((4096,), torch.uint8, memfabric=True)
+
+    assert len(allocated) == 1
+    assert getattr(configs[0], "flags", None) == offload.OFFLOAD_FLAG_GIANT_PAGE
+    assert allocated[0] == configs[0].alloc_size == configs[0].reserve_size == 1024**3
+    assert result.data_ptr() % 4096 == 0
+    assert result._hisparse_registration.tensor.data_ptr() <= result.data_ptr()
+
+
+@pytest.fixture
+def shared_offload_sdk(monkeypatch):
+    import sys
+
+    import vllm.distributed as distributed
+    from vllm.v1.hisparse import runtime
+
+    configs, messages, allocations, dva_queries = [], [], [], []
+    group = NS(rank_in_group=0, world_size=2, barrier=lambda: None)
+
+    def broadcast(value, src):
+        if group.rank_in_group == 0:
+            messages.append(value)
+            return value
+        return messages.pop(0)
+
+    def allocate(shape, **kwargs):
+        allocations.append(shape[0])
+        owner = torch.empty(shape[0] + 4096, dtype=kwargs["dtype"])
+        offset = -owner.data_ptr() % 4096
+        return owner[offset : offset + shape[0]]
+
+    def get_dva(ptr):
+        dva_queries.append(group.rank_in_group)
+        if group.rank_in_group != 0:
+            raise RuntimeError("host pointer outside local contribution")
+        return ptr
+
+    group.broadcast_object = broadcast
+    sdk = NS(
+        OffloadConfig=NS,
+        Scene=NS(SHARED="shared"),
+        OFFLOAD_FLAG_GIANT_PAGE=4096,
+        initialize=lambda config: configs.append(config) or 0,
+        empty=allocate,
+        get_dva=get_dva,
+    )
+    monkeypatch.setitem(sys.modules, "memfabric_hybrid", NS(offload=sdk))
+    monkeypatch.setattr(distributed, "get_tp_group", lambda: group)
+    monkeypatch.setattr(runtime, "check_hisparse_host_memory", lambda size: None)
+    monkeypatch.setattr(torch, "npu", NS(current_device=lambda: group.rank_in_group), raising=False)
+    monkeypatch.setattr(host_pool, "_shared_owners", [])
+    return sdk, group, configs, allocations, dva_queries
+
+
+def test_shared_offload_contributes_once_and_exposes_real_zero_copy_views(shared_offload_sdk):
+    _, group, configs, allocations, dva_queries = shared_offload_sdk
+    leader = host_pool.MemFabricSharedHostRegion([32, 64])
+    group.rank_in_group = 1
+    follower = host_pool.MemFabricSharedHostRegion([32, 64])
+    assert allocations == [1024**3]
+    assert [config.alloc_size for config in configs] == [1024**3, 0]
+    assert all(config.flags == 4096 for config in configs)
+    assert leader.base_tensor.data_ptr() == follower.base_tensor.data_ptr()
+    assert dva_queries == [0]
+    first = leader.create_next_canonical_view(32)
+    second = leader.create_next_canonical_view(64)
+    second.fill_(19)
+    torch.testing.assert_close(follower.base_tensor[32:96], second)
+    assert second.data_ptr() == first.data_ptr() + 32
+    with pytest.raises(ValueError, match="planned allocation"):
+        leader.create_next_canonical_view(1)
+    leader.cleanup()
+    leader.cleanup()
+
+
+def test_shared_offload_resolves_distinct_device_mapping_per_rank(shared_offload_sdk):
+    sdk, group, _, allocations, _ = shared_offload_sdk
+    sdk.get_dva = lambda ptr: ptr + (group.rank_in_group + 1) * 4096
+    leader = host_pool.MemFabricSharedHostRegion([32])
+    group.rank_in_group = 1
+    follower = host_pool.MemFabricSharedHostRegion([32])
+    assert allocations == [1024**3]
+    for region, offset in [(leader, 4096), (follower, 8192)]:
+        mapping = region.base_tensor._hisparse_registration
+        assert mapping.device_ptr == mapping.host_address + offset
+        assert mapping.address_of(region.create_next_canonical_view(32)) == mapping.device_ptr
+
+
+def test_shared_offload_allocation_error_reaches_followers(shared_offload_sdk):
+    sdk, group, _, _, _ = shared_offload_sdk
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("allocation failed")
+
+    sdk.empty = fail
+    with pytest.raises(RuntimeError, match="allocation failed"):
+        host_pool.MemFabricSharedHostRegion([32])
+    group.rank_in_group = 1
+    with pytest.raises(RuntimeError, match="allocation failed"):
+        host_pool.MemFabricSharedHostRegion([32])
+
+
+def test_shared_offload_mapping_error_reaches_followers(shared_offload_sdk):
+    sdk, group, _, _, _ = shared_offload_sdk
+
+    def fail(ptr):
+        raise RuntimeError("device mapping unavailable")
+
+    sdk.get_dva = fail
+    with pytest.raises(RuntimeError, match="device mapping unavailable"):
+        host_pool.MemFabricSharedHostRegion([32])
+    group.rank_in_group = 1
+    with pytest.raises(RuntimeError, match="device mapping unavailable"):
+        host_pool.MemFabricSharedHostRegion([32])
+
+
 def test_private_host_allocator_keeps_other_backends_on_core_path(monkeypatch):
     from vllm.v1.hisparse import backend as core_backend
     from vllm.v1.hisparse import runtime
@@ -150,6 +284,7 @@ def test_private_host_allocator_keeps_other_backends_on_core_path(monkeypatch):
     monkeypatch.setattr(core_backend, "get_hisparse_backend", lambda: backend)
     # Restore the process-wide binding when this test exits.
     monkeypatch.setattr(runtime, "allocate_pinned_host_pool", runtime.allocate_pinned_host_pool)
+    monkeypatch.setattr(runtime, "allocate_hisparse_host_pools", runtime.allocate_hisparse_host_pools)
     install()
     installed = runtime.allocate_pinned_host_pool
     install()
@@ -159,6 +294,50 @@ def test_private_host_allocator_keeps_other_backends_on_core_path(monkeypatch):
     assert payload.numel() == 1001 and registered.data_ptr() % 4096 == 0
     payload.fill_(17)
     torch.testing.assert_close(registered[:1001], payload)
+
+
+@pytest.mark.parametrize(
+    "connector,transport,shared",
+    [
+        ("MooncakeConnectorV2", "memfabric", True),
+        ("MooncakeConnectorV2", "ascend", False),
+        ("HiSparseConnector", "memfabric", False),
+    ],
+)
+def test_shared_host_policy_requires_memfabric_pd(connector, transport, shared):
+    config = NS(
+        kv_transfer_config=NS(kv_connector=connector, kv_connector_extra_config={"mooncake_transport": transport})
+    )
+    assert AscendHiSparseBackend().can_share_host_pool(config) is shared
+
+
+def test_native_ipc_event_stream_bridge(monkeypatch):
+    records = []
+
+    class Stream:
+        def __init__(self, **kwargs):
+            self.identity = kwargs
+
+    class Event:
+        def __init__(self, interprocess):
+            self.interprocess = interprocess
+
+        def record(self, stream):
+            assert isinstance(stream, Stream)
+            records.append(("record", stream.identity))
+
+        def wait(self, stream):
+            assert isinstance(stream, Stream)
+            records.append(("wait", stream.identity))
+
+    monkeypatch.setattr(torch, "npu", NS(Stream=Stream, Event=Event), raising=False)
+    backend = AscendHiSparseBackend()
+    event = backend.create_ipc_event()
+    stream = NS(stream_id=3, device_index=1, device_type=20)
+    backend.record_event(event, stream)
+    backend.wait_event(stream, event)
+    assert event.interprocess
+    assert records == [("record", vars(stream)), ("wait", vars(stream))]
 
 
 def test_mapped_addresses_retain_offsets_and_reject_expired_or_external_views():

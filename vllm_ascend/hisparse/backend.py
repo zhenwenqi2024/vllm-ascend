@@ -31,7 +31,7 @@ def _install_worker_dma_hooks() -> None:
     def init(worker):
         original_init(worker)
         if isinstance(worker.backend, AscendHiSparseBackend):
-            if worker.is_host_writer and worker.shared_host_region is None:
+            if worker.is_host_writer:
                 # Core allocates int64 staging; the bound Ascend slot producer uses int32.
                 # Cache binding is complete here and precedes graph capture.
                 staging = worker._slot_mapping_staging
@@ -107,7 +107,7 @@ def prepare_hisparse_workspaces(forward_context: dict[str, Any]) -> None:
 
 
 class AscendHiSparseBackend(HiSparseBackend):
-    # Keep private pools until NPU IPC events interoperate with Core's generic streams.
+    supports_shared_host_pool = True
     stats_dtype = torch.int64
     # Verified for row and page D2H on the installed A5 runtime. Use this
     # conservative bound so the driver never receives an oversized batch.
@@ -116,11 +116,45 @@ class AscendHiSparseBackend(HiSparseBackend):
     def __init__(self) -> None:
         self._failed_dma_batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
+    def can_share_host_pool(self, vllm_config) -> bool:
+        from vllm_ascend.hisparse.host_pool import uses_memfabric
+
+        return uses_memfabric(vllm_config)
+
+    def create_ipc_event(self):
+        return torch.npu.Event(interprocess=True)
+
+    def export_event(self, event):
+        return event.ipc_handle()
+
+    def import_event(self, device, handle):
+        return torch.npu.Event.from_ipc_handle(device, handle)
+
+    @staticmethod
+    def _native_stream(stream):
+        return torch.npu.Stream(
+            stream_id=stream.stream_id, device_index=stream.device_index, device_type=stream.device_type
+        )
+
+    def record_event(self, event, stream) -> None:
+        if isinstance(event, torch.npu.Event):
+            event.record(self._native_stream(stream))
+        else:
+            event.record(stream)
+
+    def wait_event(self, stream, event) -> None:
+        if isinstance(event, torch.npu.Event):
+            event.wait(self._native_stream(stream))
+        else:
+            stream.wait_event(event)
+
     def check_available(self) -> None:
         from vllm_ascend.hisparse.cache_ops import _load_resolver
         from vllm_ascend.hisparse.host_pool import install
         from vllm_ascend.utils import bootstrap_custom_op_env
 
+        if not hasattr(HiSparseBackend, "can_share_host_pool") or not hasattr(HiSparseBackend, "wait_event"):
+            raise RuntimeError("Ascend HiSparse requires Core shared-pool policy and Host-event backend hooks")
         install()
         if not hasattr(torch.ops._C_ascend, "swap_blocks_batch"):
             # A5 disables the global custom-op selection policy. HiSparse still
